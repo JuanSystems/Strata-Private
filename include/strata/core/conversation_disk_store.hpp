@@ -75,7 +75,11 @@ public:
     // ---- Restore path (the new conversations.best() falls back to this) ----
     // Same contract as ConversationCache::best(): the longest prefix among the manifest's
     // entries. O(manifest size) in RAM — does not touch the disk payload.
-    ConversationCache::Match best(const std::vector<int32_t>& prompt,
+    // Templated on the prompt's token type, mirroring ConversationCache::best(): the engine
+    // holds ids as std::vector<long> on Linux x86_64, and a fixed int32_t signature would force
+    // a copy at the call site.
+    template<class Token>
+    ConversationCache::Match best(const std::vector<Token>& prompt,
                                    const std::vector<ConversationImageKey>& images, bool cvec) const;
 
     // Reads, validates (session_file_read's full check: header, identity, bounded parse, hash),
@@ -169,9 +173,12 @@ void attach_spill(ConversationCache& cache, ConversationDiskStore* store,
 ///
 /// `parked` is the RAM cache's best() result; `disk` is the spill store (may be nullptr or
 /// disabled — returns nullopt in that case). `limits` carries the engine's RAM preflight.
+/// Templated on the prompt's token type to mirror ConversationCache::best(): the engine holds
+/// ids as std::vector<long> on Linux x86_64.
+template<class Token>
 std::optional<SavedConversation> restore_from_disk_or_ram(
     const ConversationCache::Match& parked, const ConversationDiskStore* disk,
-    const std::vector<int32_t>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+    const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
     int64_t resume, int64_t slot_tokens, const SessionFileIdentity& identity,
     const SessionReadLimits& limits = {});
 
@@ -193,5 +200,66 @@ size_t spill_clear(ConversationDiskStore* disk);
 /// restarts; this deletes every conv-*.bin and leftover .tmp from a prior interrupted write.
 /// No-op when disk is nullptr.
 void spill_purge_on_startup(ConversationDiskStore* disk);
+
+// ── Template implementations ──────────────────────────────────────────────────────────────
+// Templates cannot live in conversation_disk_store.cpp; their definitions must be visible at
+// the call site (the engine instantiates them with std::vector<long>, the tests with
+// std::vector<int32_t>). Both delegate to non-template helpers in the .cpp that take
+// std::vector<int32_t> after a cheap conversion, so the disk payload stays in the .cpp.
+
+namespace detail {
+
+// Non-template helper used by the template best(): builds a ConversationCheckpoint view from
+// the manifest entry and calls conversation_prefix(). Defined in conversation_disk_store.cpp.
+int64_t best_match_tokens(const std::vector<int32_t>& entry_ids,
+                          const std::vector<ConversationImageKey>& entry_imgs,
+                          const std::vector<int32_t>& prompt,
+                          const std::vector<ConversationImageKey>& prompt_imgs);
+
+} // namespace detail
+
+template<class Token>
+ConversationCache::Match ConversationDiskStore::best(const std::vector<Token>& prompt,
+                                                     const std::vector<ConversationImageKey>& images,
+                                                     bool cvec) const {
+    ConversationCache::Match best;
+    if (!enabled() || prompt.empty()) return best;
+    // Convert the prompt to int32_t once: the engine holds ids as `long` on Linux x86_64, but
+    // tokens are always <= INT32_MAX (a 32-bit model vocab fits in int32_t). The conversion is
+    // a single pass and avoids forcing the caller to copy.
+    std::vector<int32_t> prompt32;
+    prompt32.reserve(prompt.size());
+    for (const auto& t : prompt) prompt32.push_back(static_cast<int32_t>(t));
+    for (size_t i = entries_.size(); i-- > 0;) {
+        const auto& e = entries_[i];
+        if (e.cvec != cvec) continue;
+        const int64_t n = detail::best_match_tokens(e.ids, e.imgs, prompt32, images);
+        if (n > best.tokens) {
+            best.tokens = n;
+            best.serial = e.serial;
+            best.index = i;
+            best.live = true;
+        }
+    }
+    return best;
+}
+
+template<class Token>
+std::optional<SavedConversation> restore_from_disk_or_ram(
+    const ConversationCache::Match& parked, const ConversationDiskStore* disk,
+    const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+    int64_t resume, int64_t slot_tokens, const SessionFileIdentity& identity,
+    const SessionReadLimits& limits) {
+    const int64_t ram_floor = std::max<int64_t>(resume, slot_tokens);
+    if (parked.tokens > ram_floor) return std::nullopt;   // RAM wins; engine takes from cache
+    if (disk == nullptr || !disk->enabled()) return std::nullopt;
+    // Convert prompt to int32_t for the disk store's best() (which iterates the manifest in RAM).
+    std::vector<int32_t> prompt32;
+    prompt32.reserve(prompt.size());
+    for (const auto& t : prompt) prompt32.push_back(static_cast<int32_t>(t));
+    auto disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);
+    if (disk_match.tokens <= ram_floor) return std::nullopt;
+    return const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits);
+}
 
 } // namespace strata::core

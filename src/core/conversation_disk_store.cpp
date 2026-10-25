@@ -137,32 +137,20 @@ bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
     return true;
 }
 
-ConversationCache::Match ConversationDiskStore::best(const std::vector<int32_t>& prompt,
-                                                      const std::vector<ConversationImageKey>& images,
-                                                      bool cvec) const {
-    ConversationCache::Match best;
-    if (!enabled() || prompt.empty()) return best;
-    // Ties prefer the most recently parked branch (mirror ConversationCache::best).
-    for (size_t i = entries_.size(); i-- > 0;) {
-        const auto& e = entries_[i];
-        if (e.cvec != cvec) continue;
-        // The spilled file carries the live state and (after session_checkpoints_to_save)
-        // the deepest checkpoint. The manifest only stores the live prefix cheaply, so we
-        // match against the live state — same as the cache's first consider() call.
-        // (A checkpoint-prefix match is a Phase 2 nicety; today's RAM best() often hits live.)
-        ConversationCheckpoint live_view;
-        live_view.ids = e.ids;
-        live_view.imgs = e.imgs;
-        const int64_t n = conversation_prefix(live_view, prompt, images);
-        if (n > best.tokens) {
-            best.tokens = n;
-            best.serial = e.serial;
-            best.index = i;       // disk manifest index, not cache index — caller must check origin
-            best.live = true;
-        }
-    }
-    return best;
+// Non-template helper for the templated ConversationDiskStore::best<Token>(): builds a
+// ConversationCheckpoint view from the manifest entry and calls conversation_prefix(). The
+// template (in the header) converts the prompt to int32_t once, then calls this for each entry.
+namespace detail {
+int64_t best_match_tokens(const std::vector<int32_t>& entry_ids,
+                          const std::vector<ConversationImageKey>& entry_imgs,
+                          const std::vector<int32_t>& prompt,
+                          const std::vector<ConversationImageKey>& prompt_imgs) {
+    ConversationCheckpoint live_view;
+    live_view.ids = entry_ids;
+    live_view.imgs = entry_imgs;
+    return conversation_prefix(live_view, prompt, prompt_imgs);
 }
+} // namespace detail
 
 std::optional<SavedConversation> ConversationDiskStore::take(const ConversationCache::Match& m,
                                                               const SessionFileIdentity& id,
@@ -311,22 +299,8 @@ void attach_spill(ConversationCache& cache, ConversationDiskStore* store,
     cache.set_spill_store(store, identity);
 }
 
-std::optional<SavedConversation> restore_from_disk_or_ram(
-    const ConversationCache::Match& parked, const ConversationDiskStore* disk,
-    const std::vector<int32_t>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
-    int64_t resume, int64_t slot_tokens, const SessionFileIdentity& identity,
-    const SessionReadLimits& limits) {
-    // The RAM cache already has a usable prefix: keep today's path (the caller takes from RAM).
-    // The disk is only consulted when RAM has no match worth more than what the live session
-    // already holds (max(resume, slot_tokens)).
-    const int64_t ram_floor = std::max<int64_t>(resume, slot_tokens);
-    if (parked.tokens > ram_floor) return std::nullopt;   // RAM wins; engine takes from cache
-    if (disk == nullptr || !disk->enabled()) return std::nullopt;
-    // Ask the disk store for its best prefix. Take removes the entry (and the file) on success.
-    const auto disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt, images, cvec);
-    if (disk_match.tokens <= ram_floor) return std::nullopt;   // disk has no improvement either
-    return const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits);
-}
+// restore_from_disk_or_ram is templated and lives in the header (templates cannot have their
+// definition in a .cpp). It delegates to the templated ConversationDiskStore::best<Token>().
 
 size_t spill_drop_superseded(ConversationDiskStore* disk,
                              const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,

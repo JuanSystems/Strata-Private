@@ -343,7 +343,7 @@ int main() {
         spill_purge_on_startup(store.get());   // must not crash
         // restore_from_disk_or_ram returns nullopt:
         const ConversationCache::Match no_match{};
-        auto r = restore_from_disk_or_ram(no_match, store.get(), {1, 2, 3}, {}, false, 0, 0, id);
+        auto r = restore_from_disk_or_ram(no_match, store.get(), std::vector<int32_t>{1, 2, 3}, {}, false, 0, 0, id);
         check(!r.has_value(), "restore_from_disk_or_ram returns nullopt on disabled store");
     }
 
@@ -357,7 +357,7 @@ int main() {
               "spill_drop_superseded(nullptr) is a no-op");
         spill_purge_on_startup(null_store);   // must not crash
         const ConversationCache::Match no_match{};
-        auto r = restore_from_disk_or_ram(no_match, null_store, {1, 2, 3}, {}, false, 0, 0, id);
+        auto r = restore_from_disk_or_ram(no_match, null_store, std::vector<int32_t>{1, 2, 3}, {}, false, 0, 0, id);
         check(!r.has_value(), "restore_from_disk_or_ram(nullptr) returns nullopt");
         ConversationCache cache(1ull << 20, 1, 0);   // 1 slot: the second put evicts the first
         attach_spill(cache, nullptr, &id);   // must not crash, must not attach
