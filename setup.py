@@ -2981,8 +2981,17 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None) 
     `repair` (a downloaded file's own re-reader, see repair_download): the wrong file is first compared with the server
     piece by piece and only the damaged pieces are written again, then it is checked a second time."""
     m = s.with_name(s.name + ".done")
-    if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
-        return
+    if m.exists():
+        _mark = m.read_text(encoding="utf-8", errors="replace")
+        if f"sha256 {sha}" in _mark:
+            return
+        # A GGUF whose expert tensors were hole-punched (tools/strata_extract_experts_bin.py) reads its punched
+        # ranges as zeros, so its SHA-256 cannot match the published one any more.  The mark says the file was
+        # punched and how big it should still be; accept it without re-hashing 111 GB, but only when the apparent
+        # size matches - a truncated shard must still be caught.  The size is checked here, BEFORE _hash_file.
+        if "trimmed:" in _mark and s.exists() and s.stat().st_size == size:
+            say(f"  {s.name}: GGUF punched (trimmed), accepted without re-hashing")
+            return
     have = s.stat().st_size if s.exists() else -1
     if have != size:
         if own:                                        # --gguf-dir: the person's own file is never deleted by setup
@@ -9242,9 +9251,14 @@ def main() -> int:
         not prepared_done(model, models_dir) else 0.0
     margin = 2 if mtp_have else 8                      # working room: a guess, not bytes that will be written
     mtp_fetch = 5.2 if (not mtp_have and not ready and a.mtp != "off") else 0.0      # the draft layer's tensors step 6 fetches (strata_control.discovery.MTP_FETCH_GB)
+    # A user with a tight disk can run the low-RAM mode without the ~35 GB experts.bin: the engine reads the
+    # experts from the GGUF shards in place (expert_source.cpp:1422 and :5694 detect the missing file).  The gate
+    # is evaluated here, before `real` is summed, so the space check does not fail on bytes that will not be written.
+    _no_ebin = os.environ.get("STRATA_NO_EXPERTS_BIN") == "1"
     real = to_fetch + prep_gb + mtp_fetch + \
         (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0) + \
-        (MODELS[model]["arena_gb"] + 1 if low_ram and not q2_avx and not pack_bin else 0)
+        (0 if _no_ebin else
+         (MODELS[model]["arena_gb"] + 1 if low_ram and not q2_avx and not pack_bin else 0))
     need = real + margin
     free_now = free_gb(models_dir)
     if free_now < real:
@@ -9369,10 +9383,16 @@ def main() -> int:
         # (UD-Q4_K_XL: --compat-bf16 - its Q8_0 hyper-connection projections become BF16, the form the engine reads)
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              *fam.get("pack_args", [])], env=env)
-    if low_ram and not ready and not (pack / "experts.bin").exists():
+    if low_ram and not ready and not (pack / "experts.bin").exists() and \
+            os.environ.get("STRATA_NO_EXPERTS_BIN") != "1":
         say(f"  Writing the experts into one file for the low-RAM mode (one time, {MODELS[model]['arena_gb']:.0f} GB) ...")
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack),
              "--experts-bin", *fam.get("pack_args", [])], env=env)       # #3193: Gyro needs --compat-bf16 here too
+    elif low_ram and not ready and not (pack / "experts.bin").exists() and \
+            os.environ.get("STRATA_NO_EXPERTS_BIN") == "1":
+        say(f"  STRATA_NO_EXPERTS_BIN=1: not writing experts.bin "
+            f"(~{MODELS[model]['arena_gb']:.0f} GB saved on disk); the engine reads the experts from the GGUF "
+            "shards in place (engine 0.1.31+, the GGUF-in-place low-RAM mode)")
     ok(f"model prepared: {pack}")
     mtp = ready_paths(model, models_dir)["mtp"] if prepared else \
         (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
@@ -9436,8 +9456,23 @@ def main() -> int:
         args += ["--resident-budget-gib", str(rb)]
         ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
            "experts.bin on the SSD as needed")
-    elif low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
-        args += ["--resident-experts" if resident else "--mmap-experts"]
+    elif low_ram:   # the experts from the pack's experts.bin, or from the GGUF shards when it was not written
+        if os.environ.get("STRATA_NO_EXPERTS_BIN") == "1":
+            # The engine supports both variants without experts.bin: --resident-experts copies into RAM the experts
+            # the GPU does not hold, reading them from the GGUF; --mmap-experts leaves them to the OS page cache.
+            # STRATA_RESIDENT_VARIANT is an expert escape hatch only: 1 forces resident, absent/0 keeps the choice
+            # the setup already made from the RAM/VRAM numbers.
+            _force_res = os.environ.get("STRATA_RESIDENT_VARIANT") == "1"
+            if _force_res or resident:
+                args += ["--resident-experts"]
+                ok("low-RAM mode without experts.bin: the engine copies into RAM (from the GGUF) the experts "
+                   "the GPU does not hold")
+            else:
+                args += ["--mmap-experts"]
+                ok("low-RAM mode without experts.bin: the engine reads the experts from the GGUF shards in place "
+                   "(OS page cache keeps the hot ones in RAM)")
+        else:
+            args += ["--resident-experts" if resident else "--mmap-experts"]
     disk = None if is_wsl() else rotational_disk(ple)  # #605 (WSL's virtual disk says rotational)
     if disk:
         tensor = None if ready else next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)

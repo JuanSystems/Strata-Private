@@ -110,6 +110,9 @@ time, one on each make, is not supported yet. When the other make has the bigger
 
 ## Limits
 
+* On a tight disk, `STRATA_NO_EXPERTS_BIN=1` skips the `experts.bin` copy of the low-RAM mode (about 35 GB on
+  IQ2_XS): the engine reads the experts from the model's GGUF files instead. Linux and Windows. With
+  `STRATA_RESIDENT_VARIANT=1` it also forces the resident variant instead of the automatic choice.
 * The model download uses `setup.py` in its control mode (no pip, no engine fetch, no compiler), as the desktop app does; it needs internet and room for the files.
 * `strata update`'s test start of an engine runs `<engine> --version`; the SYCL (Intel) package's engine does not answer that flag (exit 2), so on an Intel box the engine package has to be copied into the
   components folder until that is fixed.
