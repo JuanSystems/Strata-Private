@@ -1963,8 +1963,11 @@ if(STRATA_NATIVE_EXPERTS)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
-    # GGML's CUDA error reporting calls cuGetErrorString from the driver API.
-    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    # GGML's CUDA error reporting calls cuGetErrorString from the driver API, and its cuBLAS
+    # wrapper calls cublasGetStatusString. Link both PUBLIC so every test/bench that links
+    # strata_mmq inherits them transitively (the previous fix added them per-target — this
+    # removes that maintenance burden and prevents the same bug from recurring).
+    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
     if(TARGET CUDA::cuda_driver)   # not in the HIP (gfx906) build, whose CUDA::cudart is a stand-in
       target_link_libraries(strata_mmq PUBLIC CUDA::cuda_driver)
     endif()
@@ -2043,13 +2046,13 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     # the NVFP4 expert products (w4a8 / w4a4, STRATA_PREFILL_NVFP4) against a double-precision reference
     add_executable(mmq_nvfp4_parity src/prefill/mmq_nvfp4_parity.cpp)
-    target_link_libraries(mmq_nvfp4_parity PRIVATE strata_mmq ggml-base CUDA::cudart)
+    target_link_libraries(mmq_nvfp4_parity PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
     if(NOT MSVC)   # its FP16 rounding helper uses the F16C intrinsics (GCC/Clang need the target flag)
       target_compile_options(mmq_nvfp4_parity PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mf16c>)
     endif()
     # the routed-expert products (MMQ) timed at the prompt path's shapes (16 experts a launch)
     add_executable(mmq_expert_bench src/prefill/mmq_expert_bench.cpp)
-    target_link_libraries(mmq_expert_bench PRIVATE strata_mmq ggml-base CUDA::cudart)
+    target_link_libraries(mmq_expert_bench PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
