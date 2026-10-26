@@ -165,6 +165,13 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
     src/core/conversation_spill_integration_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_spill_integration_test PRIVATE include)
   add_test(NAME conversation_spill_integration_test COMMAND conversation_spill_integration_test)
+  # RAM-full spill test: validates punta 2 — when conversation_memory_admit refuses (RAM
+  # floor would be violated), the captured image is spilled directly to disk instead of
+  # being dropped. Mirrors the engine's park_current_body path when admit() returns false.
+  add_executable(conversation_spill_ram_full_test
+    src/core/conversation_spill_ram_full_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp)
+  target_include_directories(conversation_spill_ram_full_test PRIVATE include)
+  add_test(NAME conversation_spill_ram_full_test COMMAND conversation_spill_ram_full_test)
 endif()
 
 if(STRATA_HIP_GFX906)

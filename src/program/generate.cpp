@@ -9665,21 +9665,27 @@ int main(int argc, char** argv) {
                        conversations.evict_oldest())
                     ++evicted;
                 if (!admit()) {
-                    // ── Punta 2 (Phase 2 — streaming spill VRAM→disco): when the physical-RAM gate
-                    // refuses the snapshot, the ideal path is to stream the live K/V straight from
-                    // the device pools to a spill file via SessionKvSource (no host capture), so the
-                    // conversation survives even when RAM cannot host it. This requires building
-                    // SessionKvSource readers from the device pools, which depends on the runtime
-                    // state (kvg_state, ss, mtp.kv_state) — not testable without a GPU. Phase 2 will
-                    // add disk_store.put_streaming(meta, kv_sources, id) here. For Phase 1, the
-                    // conversation is lost as today (the evict_oldest path above already spilled what
-                    // it could to make room; this is the "RAM AND disk both refused" case the plan
-                    // documents as the only failure that drops a conversation).
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
-                                 evicted, conversations.size(),
-                                 disk_store_ptr ? "; Phase 2 will stream this to disk" : "");
-                    return true;
+                    // ── Punta 2 (Phase 2: spill when RAM cannot host the snapshot at all). The
+                    // physical-RAM gate refused the snapshot BEFORE capture: even after evicting
+                    // every parked conversation, the available RAM is below the floor + the snapshot
+                    // size. Today this drops the conversation; with the spill enabled we let the
+                    // capture-and-spill path below handle it (the second admit check after capture
+                    // will route the image to disk). The capture itself may OOM (the try/catch in
+                    // park_current catches bad_alloc and skips), but if it succeeds the disk store
+                    // keeps the conversation for the next turn's restore_from_disk_or_ram().
+                    if (disk_store_ptr == nullptr || !spill_attached) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked%s)\n",
+                                     additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
+                                     evicted, conversations.size(),
+                                     disk_store_ptr ? "; spill not yet attached" : "");
+                        return true;
+                    }
+                    std::fprintf(stderr, "strata serve: conversation cache: RAM admission refused "
+                                         "(need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked) "
+                                         "→ spilling the captured image to disk instead of dropping it\n",
+                                 additional >> 20, (long long) o.conversation_cache_min_free_mib,
+                                 ram_note(mem).c_str(), evicted, conversations.size());
+                    // Fall through: the capture-and-spill path below handles writing to disk.
                 }
                 if (evicted)
                     std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked conversation%s to admit this snapshot (%zu MiB plus %lld MiB floor)\n",
@@ -9703,8 +9709,39 @@ int main(int argc, char** argv) {
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
-                                 (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
+                    // ── Punta 2 (Phase 2: spill the captured image directly to disk). The capture
+                    // succeeded (image holds the full SavedConversation in host RAM), but the floor
+                    // check refuses to keep it in the cache. Instead of dropping the conversation —
+                    // which would force the next turn to re-compute ~72K tokens (~210 s) — write the
+                    // image to the disk store. The next turn's restore_from_disk_or_ram() will pick
+                    // it up in ~1-2 s. The image is moved into the disk store; its RAM is freed by
+                    // the disk write's stream (the v1 format writes 16 MiB chunks then releases
+                    // each segment). No-op when the spill is disabled (disk_store_ptr == nullptr);
+                    // in that case the conversation is lost as today.
+                    if (disk_store_ptr != nullptr && spill_attached) {
+                        const auto spill_t0 = Clock::now();
+                        const uint64_t spill_serial = static_cast<uint64_t>(-1);   // sentinel: not from cache evict
+                        // The disk store's put() is fail-soft: returns false on a full disk or I/O
+                        // error, and the image is then lost (today's behavior).
+                        strata::core::SavedConversation spill_image = std::move(image);
+                        const size_t spill_tokens = spill_image.live.ids.size();
+                        const size_t spill_bytes = spill_image.bytes();
+                        if (disk_store_ptr->put(std::move(spill_image), spill_serial, spill_identity)) {
+                            const double spill_ms = std::chrono::duration<double, std::milli>(
+                                Clock::now() - spill_t0).count();
+                            std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB) "
+                                                 "to disk in %.1f ms (RAM floor refused; the next turn restores it)\n",
+                                         spill_tokens, spill_bytes / (1024.0 * 1024.0), spill_ms);
+                        } else {
+                            std::fprintf(stderr, "strata serve: conversation cache: lost %zu tokens "
+                                                 "(RAM floor and disk both refused; spill write failed)\n",
+                                         spill_tokens);
+                        }
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s%s)\n",
+                                     (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str(),
+                                     disk_store_ptr ? "; spill not yet attached" : "; spill disabled");
+                    }
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
