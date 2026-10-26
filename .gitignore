@@ -86,3 +86,4 @@ node_modules/
 /apps/host/docs/evidence/
 /apps/host/docs/checkpoints/
 /plans
+.stfolder/
