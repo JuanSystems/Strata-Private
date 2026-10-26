@@ -788,15 +788,36 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   strata_utf8_manifest(strata)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  # strata links strata_prefill (which PUBLIC-links strata_mmq, which PUBLIC-links CUDA::cuda_driver),
-  # but in some CMake / nvcc combinations the transitive link does not propagate all the way to the
-  # final executable, leaving cuGetErrorString (driver API) and cublasGetStatusString (cuBLAS)
-  # undefined. Link them directly here as well — the linker ignores duplicates, and this makes the
-  # build robust against CMake's transitive-link quirks across versions.
+  # strata's final link needs the CUDA driver API (cuGetErrorString) and cuBLAS
+  # (cublasGetStatusString), both used inside strata_mmq. The transitive PUBLIC propagation
+  # through strata_prefill → strata_mmq does not always reach the final executable in every
+  # CMake/nvcc combination, AND on some systems (e.g. Kaggle) find_package(CUDAToolkit)
+  # succeeds but does NOT create the CUDA::cuda_driver imported target (the driver stubs are
+  # missing from the toolkit install). Link them directly here, falling back to find_library
+  # for libcuda.so so the build works regardless.
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target}
                                    ${_strata_gpu_blas_target})
   if(TARGET CUDA::cuda_driver)
     target_link_libraries(strata PRIVATE CUDA::cuda_driver)
+  else()
+    # Fallback: find libcuda.so directly (the NVIDIA driver library, not part of the toolkit).
+    # On Linux it lives in /usr/lib/x86_64-linux-gnu/ or /usr/lib64/. The stub at
+    # <toolkit>/lib64/stubs/libcuda.so is another fallback.
+    find_library(STRATA_LIBCUDA NAMES cuda
+                  HINTS ${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_ROOT}/lib64
+                  PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
+                  PATH_SUFFIXES stubs lib64 lib
+                  NO_DEFAULT_PATH)
+    find_library(STRATA_LIBCUDA_FALLBACK NAMES cuda)   # last resort: system search paths
+    if(STRATA_LIBCUDA)
+      target_link_libraries(strata PRIVATE ${STRATA_LIBCUDA})
+      message(STATUS "strata: linked libcuda directly at ${STRATA_LIBCUDA} (CUDA::cuda_driver target not found)")
+    elseif(STRATA_LIBCUDA_FALLBACK)
+      target_link_libraries(strata PRIVATE ${STRATA_LIBCUDA_FALLBACK})
+      message(STATUS "strata: linked libcuda (system search) at ${STRATA_LIBCUDA_FALLBACK}")
+    else()
+      message(WARNING "strata: could not find libcuda.so; cuGetErrorString will be undefined at link time")
+    endif()
   endif()
   if(WIN32 AND STRATA_ENABLE_HIP)
     # 0.2.1.2: the ROCm math libraries live in <package>\rocm\bin, which is on PATH only when the launcher starts the engine; load them on first
@@ -1981,11 +2002,27 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     # GGML's CUDA error reporting calls cuGetErrorString from the driver API, and its cuBLAS
     # wrapper calls cublasGetStatusString. Link both PUBLIC so every test/bench that links
-    # strata_mmq inherits them transitively (the previous fix added them per-target — this
-    # removes that maintenance burden and prevents the same bug from recurring).
+    # strata_mmq inherits them transitively. On systems where find_package(CUDAToolkit)
+    # does NOT create the CUDA::cuda_driver imported target (e.g. Kaggle, where the toolkit
+    # install lacks the driver stubs), fall back to find_library for libcuda.so directly.
     target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
     if(TARGET CUDA::cuda_driver)   # not in the HIP (gfx906) build, whose CUDA::cudart is a stand-in
       target_link_libraries(strata_mmq PUBLIC CUDA::cuda_driver)
+    else()
+      find_library(STRATA_LIBCUDA_MMQ NAMES cuda
+                    HINTS ${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_ROOT}/lib64
+                    PATHS /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib
+                    PATH_SUFFIXES stubs lib64 lib
+                    NO_DEFAULT_PATH)
+      if(NOT STRATA_LIBCUDA_MMQ)
+        find_library(STRATA_LIBCUDA_MMQ NAMES cuda)   # last resort: system search paths
+      endif()
+      if(STRATA_LIBCUDA_MMQ)
+        target_link_libraries(strata_mmq PUBLIC ${STRATA_LIBCUDA_MMQ})
+        message(STATUS "strata_mmq: linked libcuda directly at ${STRATA_LIBCUDA_MMQ} (CUDA::cuda_driver target not found)")
+      else()
+        message(WARNING "strata_mmq: could not find libcuda.so; cuGetErrorString will be undefined at link time")
+      endif()
     endif()
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
