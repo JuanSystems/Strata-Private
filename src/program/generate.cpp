@@ -9538,56 +9538,14 @@ int main(int argc, char** argv) {
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
-            // ── Spill path: even when the RAM conversation cache is OFF (e.g. on a low-RAM host
-            // where auto-sizing refused), we still want to spill the conversation to disk so the
-            // next turn restores it instead of re-computing ~72K tokens. The spill does not depend
-            // on the RAM cache being enabled — it captures the image and writes it directly to the
-            // disk store. The guard below skips the RAM-cache-specific code (make_room, evict_oldest)
-            // but still runs the spill when disk_store_ptr is attached and the live session is valid.
-            // This is the path that fixes the bug where Kaggle (low free RAM) had the spill enabled
-            // but the disk store stayed empty because park_current_body returned early.
-            if (disk_store_ptr != nullptr && spill_attached && live_ok && !live.empty()) {
-                // If the RAM cache is enabled, the regular path below handles both parking and spill
-                // (evict_oldest spills when the cache is full, and the admit-fail path spills when
-                // RAM floor is violated). Skip this direct-spill path to avoid double-spilling.
-                if (!conversations.enabled()) {
-                    // The conversation cache is OFF (auto-sizing refused for low RAM). Capture the
-                    // image and spill it directly to disk — the next turn restores it.
-                    const auto t0 = Clock::now();
-                    try {
-                        // The split-merge machinery below (cs = conversation_checkpoints_split)
-                        // runs only when there are stages AND the cache path continues; for the
-                        // spill we use the simpler `checks` list (the live state's checkpoint chain)
-                        // which is what ConversationView expects. The capture is the same as the
-                        // RAM-cache path: it copies K/V + running state into host vectors.
-                        const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
-                        strata::core::SavedConversation image;
-                        size_t reused_bytes = 0;
-                        // Reuse is empty here (no cache to retain from), so capture is fresh.
-                        strata::core::ConversationKvReuse reuse;
-                        if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                                std::move(reuse), &reused_bytes)) return false;
-                        const size_t spill_tokens = image.live.ids.size();
-                        const size_t spill_bytes = image.bytes();
-                        const uint64_t spill_serial = static_cast<uint64_t>(-1);   // sentinel: not from cache
-                        if (disk_store_ptr->put(std::move(image), spill_serial, spill_identity)) {
-                            const double spill_ms = std::chrono::duration<double, std::milli>(
-                                Clock::now() - t0).count();
-                            std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB) "
-                                                 "to disk in %.1f ms (RAM cache off; the next turn restores it)\n",
-                                         spill_tokens, spill_bytes / (1024.0 * 1024.0), spill_ms);
-                        } else {
-                            std::fprintf(stderr, "strata serve: conversation cache: lost %zu tokens "
-                                                 "(RAM cache off and disk spill write failed)\n", spill_tokens);
-                        }
-                    } catch (const std::bad_alloc&) {
-                        std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill "
-                                             "(RAM cache off); the conversation is lost\n");
-                    }
-                    return true;
-                }
-            }
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // ── Spill path: even when the RAM conversation cache is OFF (auto-sizing refused for
+            // low RAM), we still spill the conversation to disk so the next turn restores it. The
+            // spill does not depend on the RAM cache. When the cache is off AND the spill is on,
+            // we skip the cache-specific guards below (min_tokens, drop_superseded, make_room) and
+            // go straight to the capture-and-spill block after draft0/view are declared.
+            const bool spill_when_cache_off = !conversations.enabled() && disk_store_ptr != nullptr
+                                              && spill_attached && live_ok && !live.empty();
+            if (!spill_when_cache_off && (!conversations.enabled() || !live_ok || live.empty())) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -9633,6 +9591,38 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
+            // ── Direct spill when the RAM cache is OFF (the spill_when_cache_off flag was set at the
+            // top of park_current_body). Capture the image and write it to the disk store directly,
+            // skipping all the RAM-cache-specific code below (min_tokens, make_room, evict_oldest).
+            // The next turn's restore_from_disk_or_ram() picks it up in ~1-2 s. This fixes the bug
+            // where Kaggle (low free RAM) had the spill enabled but the disk store stayed empty.
+            if (spill_when_cache_off) {
+                const auto spill_t0 = Clock::now();
+                try {
+                    strata::core::SavedConversation image;
+                    size_t reused_bytes = 0;
+                    strata::core::ConversationKvReuse empty_reuse;   // no cache → no retained K/V
+                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                            std::move(empty_reuse), &reused_bytes)) return false;
+                    const size_t spill_tokens = image.live.ids.size();
+                    const size_t spill_bytes = image.bytes();
+                    const uint64_t spill_serial = static_cast<uint64_t>(-1);   // sentinel: not from cache evict
+                    if (disk_store_ptr->put(std::move(image), spill_serial, spill_identity)) {
+                        const double spill_ms = std::chrono::duration<double, std::milli>(
+                            Clock::now() - spill_t0).count();
+                        std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB) "
+                                             "to disk in %.1f ms (RAM cache off; the next turn restores it)\n",
+                                     spill_tokens, spill_bytes / (1024.0 * 1024.0), spill_ms);
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation cache: lost %zu tokens "
+                                             "(RAM cache off and disk spill write failed)\n", spill_tokens);
+                    }
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill "
+                                         "(RAM cache off); the conversation is lost\n");
+                }
+                return true;
+            }
             auto reuse = conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
