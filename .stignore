@@ -1,2 +1,5 @@
 **.log
-.git/
+(?d).git
+(?d).git/**
+build-spill\
+.sync-conflict-20261026-160820-SYCOBEM.gitignore
