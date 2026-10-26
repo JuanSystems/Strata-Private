@@ -3124,22 +3124,6 @@ def engine_args(cfg: dict) -> list[str]:
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
-    # Conversation spill to disk (Phase 1 of the cache-loss fix). When the RAM cache evicts a
-    # conversation, the engine writes it to a file in spill_path (default: the model's data_dir/
-    # strata-spill/) instead of dropping it; the next turn restores it in ~1-2 s instead of
-    # re-processing 72K tokens (~210 s). budget_gib 0 disables the spill (A/B safe). The
-    # "not in args" guards let user_args.merge() (applied above, line 3084) keep a user-set path
-    # or budget. Mirrors the vram_elastic / vision / layer_split pattern.
-    spill = cfg.get("conversation_spill")
-    if isinstance(spill, dict):
-        if isinstance(spill.get("budget_gib"), int) and not isinstance(spill["budget_gib"], bool) \
-                and "--conversation-spill-gib" not in args:
-            args += ["--conversation-spill-gib", str(spill["budget_gib"])]
-        if isinstance(spill.get("path"), str) and spill["path"] and "--conversation-spill-path" not in args:
-            args += ["--conversation-spill-path", spill["path"]]
-        if isinstance(spill.get("min_tokens"), int) and not isinstance(spill["min_tokens"], bool) \
-                and spill["min_tokens"] > 0 and "--conversation-spill-min-tokens" not in args:
-            args += ["--conversation-spill-min-tokens", str(spill["min_tokens"])]
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)
@@ -4021,47 +4005,6 @@ class Service:
                 if active:
                     self.client_disconnect_cancels += 1
 
-    def cancel_running(self, timeout_s: float | None = None) -> dict:
-        """POST /v1/cancel: cancel the in-flight request cleanly (without closing the client's
-        socket). Sets every active cancel event (there is normally one per request; with --batch
-        there may be more); the engine's _control thread sends STOP on stdin, the engine replies
-        DONE cancel=True, and the conversation is preserved (parked to RAM or spilled to disk).
-
-        Returns {"status": "cancelled", "cancels": N, "elapsed_ms": ...} when at least one request
-        was active; {"status": "idle"} when no request was in flight (idempotent: two POSTs in a
-        row never error). timeout_s (default: the engine's stop_wait_s) bounds how long this call
-        waits for the engine to acknowledge the STOP; on timeout the cancels are still set (the
-        engine will see them on its next loop) and the response says "timed_out".
-        """
-        if timeout_s is None:
-            timeout_s = getattr(self, "stop_wait_s", 30.0)
-        with self.status_lock:
-            active = [c for c in self.active_cancels if not c.is_set()]
-        if not active:
-            return {"status": "idle"}
-        for c in active:
-            c.set()
-        # The engine's _control thread (server.py:1477) polls cancel every 0.5s and sends STOP.
-        # Wait for the cancels to be observed: each is a threading.Event; we cannot wait on the
-        # engine's DONE directly here (that arrives on the request's own thread), but observing
-        # the cancel being processed is enough — the request's handler will return on its own.
-        # The HTTP response tells the client "STOP was sent"; the client can then re-issue.
-        deadline = time.monotonic() + timeout_s
-        start = time.monotonic()
-        while time.monotonic() < deadline:
-            # active_cancels is pruned by the request handler in its finally block (line ~6915).
-            # When the request finishes (DONE cancel=True), its cancel_event leaves active_cancels.
-            with self.status_lock:
-                remaining = sum(1 for c in active if c in self.active_cancels)
-            if remaining == 0:
-                return {"status": "cancelled", "cancels": len(active),
-                        "elapsed_ms": round((time.monotonic() - start) * 1000.0, 1)}
-            time.sleep(0.05)
-        return {"status": "timed_out", "cancels": len(active),
-                "elapsed_ms": round(timeout_s * 1000.0, 1),
-                "note": "STOP was sent but the engine did not acknowledge within the timeout; "
-                        "the request continues on its own"}
-
     @contextlib.contextmanager
     def _inference_fifo(self, deadline: float | None, cancel: threading.Event | None = None):
         if deadline is None:
@@ -4389,6 +4332,7 @@ class Service:
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
         try:
+            self._engine_starts = getattr(self, "_engine_starts", 0) + 1   # DIAGNOSTIC: count engine restarts
             self.engine.restart()
         except Exception as e:
             if vision_started:
@@ -4623,6 +4567,16 @@ class Service:
 
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
+        # DIAGNOSTIC: log the gap between this request and the last done, to detect if the engine
+        # was restarted between requests (which would explain the 50s delay before reading prompt).
+        now = time.time()
+        last_done = getattr(self, "_last_done_at", None)
+        if last_done is not None:
+            gap = now - last_done
+            if gap > 5.0:   # only log gaps longer than 5s (a quick stop+resume is <5s)
+                engine_restarts = getattr(self, "_engine_starts", 0)
+                print(f"[strata diag] {gap:.1f}s since last request's done (engine_restarts={engine_restarts})",
+                      flush=True)
         if not self.api_monitor:
             return None
         raw = json.dumps(req, ensure_ascii=False, indent=2)
@@ -5606,6 +5560,7 @@ class Service:
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
+                            self._last_done_at = time.time()   # DIAGNOSTIC: track when the last request ended
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
                                 print("[strata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
@@ -6813,29 +6768,6 @@ def make_handler(svc: Service):
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
-                return
-            # POST /v1/cancel: cancel the in-flight request cleanly without closing the socket.
-            # No body needed; the response confirms the STOP was acknowledged by the engine.
-            # Idempotent: 200 {"status": "idle"} when nothing is running, 200 {"status": "cancelled"} otherwise.
-            if path == "/v1/cancel":
-                if not self._own_page("the running request can be cancelled"):
-                    return
-                q = parse_qs(urlsplit(self.path).query)
-                timeout_s = None
-                if "timeout_s" in q:
-                    try:
-                        timeout_s = float(q["timeout_s"][0])
-                        if timeout_s <= 0:
-                            raise ValueError
-                    except (ValueError, IndexError):
-                        self._json(400, {"error": {"type": "invalid_request_error",
-                                                   "message": "timeout_s: a positive number of seconds"}})
-                        return
-                try:
-                    self._json(200, svc.cancel_running(timeout_s))
-                except EngineDied as e:
-                    self._json(503, {"error": {"type": "server_error",
-                                               "message": f"{e}; the next request restarts it"}})
                 return
             reserved = False
             try:
