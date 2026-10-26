@@ -788,7 +788,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(strata src/program/generate.cpp)
   strata_utf8_manifest(strata)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
-  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+  # strata links strata_prefill (which PUBLIC-links strata_mmq, which PUBLIC-links CUDA::cuda_driver),
+  # but in some CMake / nvcc combinations the transitive link does not propagate all the way to the
+  # final executable, leaving cuGetErrorString (driver API) and cublasGetStatusString (cuBLAS)
+  # undefined. Link them directly here as well — the linker ignores duplicates, and this makes the
+  # build robust against CMake's transitive-link quirks across versions.
+  target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target}
+                                   ${_strata_gpu_blas_target})
+  if(TARGET CUDA::cuda_driver)
+    target_link_libraries(strata PRIVATE CUDA::cuda_driver)
+  endif()
   if(WIN32 AND STRATA_ENABLE_HIP)
     # 0.2.1.2: the ROCm math libraries live in <package>\rocm\bin, which is on PATH only when the launcher starts the engine; load them on first
     # use (main() adds that folder to the DLL search first) so `strata.exe --version` works from the package folder.  amdhip64_7.dll and the
