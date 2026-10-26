@@ -9461,14 +9461,6 @@ int main(int argc, char** argv) {
         // variable lives on the stack for the engine's lifetime (the cache holds a pointer to it).
         strata::core::SessionFileIdentity spill_identity{};
         bool spill_attached = false;
-        // Monotonic counter for direct spills (the "RAM cache off" path and the "admit refused"
-        // path both spill the captured image outside the cache's evict_oldest). Without this,
-        // every direct spill uses serial = UINT64_MAX (a sentinel), and ConversationDiskStore::put()
-        // treats it as a re-spill of the same conversation — deleting the previous file. Each
-        // turn that spills overwrites the last, so only one file is ever on disk. Using a real
-        // counter gives each spill a unique serial → unique file → the disk store accumulates
-        // multiple turns and the LRU can evict the oldest.
-        uint64_t next_direct_spill_serial = 1ull << 63;   // high half: never collide with cache serials (low)
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -9577,7 +9569,7 @@ int main(int argc, char** argv) {
                                 std::move(reuse), &reused_bytes)) return false;
                         const size_t spill_tokens = image.live.ids.size();
                         const size_t spill_bytes = image.bytes();
-                        const uint64_t spill_serial = next_direct_spill_serial++;   // unique per direct spill
+                        const uint64_t spill_serial = static_cast<uint64_t>(-1);   // sentinel: not from cache
                         if (disk_store_ptr->put(std::move(image), spill_serial, spill_identity)) {
                             const double spill_ms = std::chrono::duration<double, std::milli>(
                                 Clock::now() - t0).count();
@@ -9777,7 +9769,7 @@ int main(int argc, char** argv) {
                     // in that case the conversation is lost as today.
                     if (disk_store_ptr != nullptr && spill_attached) {
                         const auto spill_t0 = Clock::now();
-                        const uint64_t spill_serial = next_direct_spill_serial++;   // unique per direct spill
+                        const uint64_t spill_serial = static_cast<uint64_t>(-1);   // sentinel: not from cache evict
                         // The disk store's put() is fail-soft: returns false on a full disk or I/O
                         // error, and the image is then lost (today's behavior).
                         strata::core::SavedConversation spill_image = std::move(image);
@@ -12704,6 +12696,12 @@ int main(int argc, char** argv) {
                 return imgs_below(req_imgs, L) == pre_imgs;
             };
             const bool want_cvec = strata::kernels::cvec().loaded() ? req_cvec != 0 : true;
+            // ── DIAGNOSTIC: timing of the request setup phases, to identify where the 50s delay
+            // before "reading the prompt" goes on the first request after a stop+resume.
+            const auto _diag_t0 = Clock::now();
+            auto _diag_ms = [&]() { return std::chrono::duration<double, std::milli>(Clock::now() - _diag_t0).count(); };
+            std::fprintf(stderr, "[strata diag] request setup start: %lld tokens, live_ok=%d\n",
+                         (long long) ids.size(), (int) live_ok);
             // the last request's final commit may still be running on the verifier's stream (set_commit_async):
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
@@ -12890,6 +12888,8 @@ int main(int argc, char** argv) {
                 }
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            std::fprintf(stderr, "[strata diag] after conversations.best(): %.1f ms (parked.tokens=%lld, resume=%lld, slot_tokens=%lld)\n",
+                         _diag_ms(), (long long) parked.tokens, (long long) resume, (long long) slot_tokens);
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
@@ -12915,6 +12915,8 @@ int main(int argc, char** argv) {
                 }
             }
             if (incoming || borrow) slot_source = -1;
+            std::fprintf(stderr, "[strata diag] after restore_from_disk_or_ram: %.1f ms (incoming=%d, borrow=%d, slot_source=%d)\n",
+                         _diag_ms(), (int) incoming.has_value(), (int) borrow, slot_source);
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
@@ -12991,10 +12993,16 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
-                       !park_current(incoming ? incoming->bytes() : 0)) {
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth) {
+                const auto _park_t0 = Clock::now();
+                const bool _park_ok = park_current(incoming ? incoming->bytes() : 0);
+                const double _park_ms = std::chrono::duration<double, std::milli>(Clock::now() - _park_t0).count();
+                std::fprintf(stderr, "[strata diag] park_current took %.1f ms (ok=%d, held=%zu)\n",
+                             _park_ms, (int) _park_ok, incoming ? incoming->bytes() : 0);
+                if (!_park_ok) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
             }
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
@@ -13274,6 +13282,8 @@ int main(int argc, char** argv) {
                 part_at.clear();
                 std::fill(part_next.begin(), part_next.end(), pp_next_check);
             }
+            std::fprintf(stderr, "[strata diag] before RESUME (total setup): %.1f ms (resume=%lld, read_from=%lld, n=%lld)\n",
+                         _diag_ms(), (long long) resume, (long long) read_from, (long long) n);
             std::printf("RESUME %lld\n", (long long) resume);   // before reading: this many prompt tokens are reused
             strata::core::progress_at("reading the prompt, from token", read_from);
             std::fflush(stdout);
