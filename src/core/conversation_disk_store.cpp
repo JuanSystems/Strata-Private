@@ -234,6 +234,96 @@ void ConversationDiskStore::purge_on_startup() {
     }
 }
 
+size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identity) {
+    // Phase 3: spills survive engine restarts. Scan the spill dir for conv-*.bin files written
+    // by a previous engine run, validate each one with session_file_read (header + identity +
+    // payload hash + full parse), capture the cheap manifest data (ids, imgs, geometry, layer
+    // carve, cvec, file_bytes), then DROP the heavy K/V image from RAM. The next request's
+    // best() finds the entry in the manifest and take() re-reads the file.
+    //
+    // Files that fail validation (corruption, identity mismatch, unsupported version) are
+    // deleted: they can never match this engine. A SessionError::memory (RAM preflight
+    // refused) keeps the file — the next engine start with more free RAM may succeed.
+    //
+    // Leftover .tmp files (an interrupted write) are also cleaned: they were never renamed
+    // to .bin, so they are not valid spills.
+    if (!enabled() || dir_.empty()) return 0;
+    // Clear any stale manifest first (we are about to rebuild it from disk).
+    entries_.clear();
+    serials_.clear();
+    bytes_ = 0;
+    std::error_code ec;
+    if (!fs::exists(dir_, ec)) return 0;
+    // Collect conv-*.bin files sorted by serial (filename sorts lexicographically the same
+    // as numeric for the decimal form std::to_string produces, so the LRU order entries_ is
+    // built oldest-first — mirrors the order put() inserts at).
+    std::vector<fs::path> files;
+    for (const auto& entry : fs::directory_iterator(dir_, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("conv-", 0) == 0 && name.size() > 9 &&
+            name.compare(name.size() - 4, 4, ".bin") == 0) {
+            files.push_back(entry.path());
+        } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+            // Leftover .tmp from an interrupted write: clean it up.
+            fs::remove(entry.path(), ec);
+        }
+    }
+    std::sort(files.begin(), files.end(),
+              [](const fs::path& a, const fs::path& b) {
+                  return a.filename().string() < b.filename().string();
+              });
+    size_t loaded = 0;
+    for (const auto& path : files) {
+        const std::string name = path.filename().string();   // conv-<serial>.bin
+        // Parse the serial from the filename: conv-<decimal>.bin
+        uint64_t serial = 0;
+        try {
+            serial = std::stoull(name.substr(5, name.size() - 9));
+        } catch (...) {
+            std::error_code ec2;
+            fs::remove(path, ec2);   // not a valid conv-<serial>.bin name: drop it
+            continue;
+        }
+        SavedConversation image;
+        size_t bytes_read = 0;
+        std::string error;
+        SessionStatus status;
+        if (!session_file_read(path.string(), identity, image, bytes_read, error, {}, &status)) {
+            // Identity mismatch, corruption, or RAM refusal. For memory (RAM preflight): keep
+            // the file, the next start with more RAM may succeed. Anything else: delete.
+            if (status.error != SessionError::memory) {
+                std::error_code ec2;
+                fs::remove(path, ec2);
+            }
+            continue;
+        }
+        // Capture the manifest data; the heavy K/V is dropped right after.
+        DiskEntry e;
+        e.serial = serial;
+        e.path = path.string();
+        e.ids = image.live.ids;
+        e.imgs = image.live.imgs;
+        e.geometry = image.geometry;
+        e.layer_lo = image.layer_lo;
+        e.layer_hi = image.layer_hi;
+        e.cvec = image.cvec;
+        e.file_bytes = bytes_read;
+        e.used = next_used_++;
+        { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
+        // LRU evict if over budget: drop the oldest entries (which we just loaded first).
+        while (!entries_.empty() && bytes_ + e.file_bytes > budget_) {
+            if (!evict_oldest()) break;
+        }
+        if (e.file_bytes > budget_) continue;   // single file bigger than the whole budget
+        entries_.push_back(std::move(e));
+        serials_.push_back(serial);
+        bytes_ += bytes_read;
+        ++loaded;
+    }
+    return loaded;
+}
+
 size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
                                               const std::vector<ConversationImageKey>& images,
                                               const std::vector<ConversationCheckpoint>& checkpoints,
@@ -317,6 +407,11 @@ size_t spill_clear(ConversationDiskStore* disk) {
 void spill_purge_on_startup(ConversationDiskStore* disk) {
     if (disk == nullptr) return;
     disk->purge_on_startup();   // safe on a disabled store too (cleans stale files)
+}
+
+size_t spill_reload_from_disk(ConversationDiskStore* disk, const SessionFileIdentity& identity) {
+    if (disk == nullptr) return 0;
+    return disk->reload_from_disk(identity);   // no-op on a disabled store
 }
 
 } // namespace strata::core

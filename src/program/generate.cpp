@@ -9441,7 +9441,10 @@ int main(int argc, char** argv) {
             spill_cfg.data_dir = o.pack;
             disk_store = strata::core::make_disk_store(spill_cfg, nullptr);   // identity bound below
             if (disk_store && disk_store->enabled()) {
-                disk_store->purge_on_startup();   // Phase 1: spills do not survive restarts
+                // Phase 3: spills survive engine restarts. We no longer purge the spill dir at
+                // startup; instead, we reload the manifest from disk after the engine's identity
+                // is bound (on the first request — see the spill_attached block below). The
+                // disk_store_ptr is wired in now so attach_spill can find it.
                 disk_store_ptr = disk_store.get();
                 std::fprintf(stderr, "strata serve: conversation spill: enabled with %lld GiB at %s "
                                      "(RAM cache stays auto-sized; the disk absorbs overflow)\n",
@@ -12875,6 +12878,17 @@ int main(int argc, char** argv) {
                 if (session_identity(spill_identity, spill_err, nullptr)) {
                     strata::core::attach_spill(conversations, disk_store_ptr, &spill_identity);
                     spill_attached = true;
+                    // Phase 3: spills survive engine restarts. Reload the manifest from disk so
+                    // a request can restore a conversation the previous engine run spilled.
+                    // Reads each conv-*.bin, validates identity + payload hash, captures the cheap
+                    // manifest data, and drops the heavy K/V right back out of RAM.
+                    const size_t n_loaded = strata::core::spill_reload_from_disk(disk_store_ptr, spill_identity);
+                    if (n_loaded > 0) {
+                        std::fprintf(stderr, "strata serve: conversation spill: reloaded %zu conversation%s "
+                                             "from disk (manifest=%zu, bytes=%.1f MiB)\n",
+                                     n_loaded, n_loaded == 1 ? "" : "s", disk_store_ptr->size(),
+                                     (double) disk_store_ptr->bytes() / (1024.0 * 1024.0));
+                    }
                 } else if (!spill_err.empty()) {
                     std::fprintf(stderr, "strata serve: conversation spill: could not resolve the engine "
                                          "identity yet (%s); the spill stays detached for this request\n",

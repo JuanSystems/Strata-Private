@@ -309,6 +309,77 @@ int main() {
         check(store.size() == 0, "manifest empty after drop_superseded");
     }
 
+    // ── 11. reload_from_disk: spills written by a previous engine run are picked up ──────
+    // Simulates the restart scenario: engine A writes a spill, exits; engine B creates a new
+    // ConversationDiskStore on the same dir, calls reload_from_disk(), and the spilled
+    // conversation is in the manifest (best() finds it, take() restores it).
+    {
+        const auto rdir = dir / "reload";
+        SessionFileIdentity id_b = id;
+        id_b.model = 0xABCDEF42;   // a different model fingerprint (simulates a restart)
+        // Engine A writes one spill.
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.enabled(), "store A enabled");
+            SavedConversation original = sample(100);
+            check(store_a.put(std::move(original), 100, id), "store A put");
+            check(store_a.size() == 1, "store A has one entry");
+            check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin on disk");
+        }
+        // Engine B starts (a new ConversationDiskStore on the same dir). Its manifest starts empty;
+        // reload_from_disk rebuilds it from the .bin files written by A. The identity must match
+        // (engine B is the same model + config as A — that's what makes the spills readable).
+        {
+            ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id);
+            check(store_b.enabled(), "store B enabled");
+            check(store_b.size() == 0, "store B manifest empty before reload");
+            const size_t loaded = store_b.reload_from_disk(id);
+            check(loaded == 1, "reloaded 1 entry from disk");
+            check(store_b.size() == 1, "store B has 1 entry after reload");
+            check(store_b.bytes() > 0, "store B has bytes after reload");
+            // The manifest's prefix data is what best() matches against — the K/V is gone from RAM.
+            // sample() builds the live checkpoint with imgs = {{3, 0x1234567890abcdefull ^ 1}}.
+            // The prompt's image list must match for best() to accept the prefix.
+            std::vector<int32_t> prompt;
+            for (int i = 0; i < 100; ++i) prompt.push_back(int32_t(1000 + i));
+            prompt.push_back(9999);   // one more token (the "new message")
+            const std::vector<ConversationImageKey> prompt_imgs = {{3, 0x1234567890abcdefull ^ 1}};
+            const auto m = store_b.best(prompt, prompt_imgs, false);
+            check(m.tokens == 100, "best() found the reloaded entry's 100-token prefix");
+            check(m.serial == 100, "best() returned the right serial");
+            // take() reads the file and restores the full image (and deletes the file).
+            SavedConversation back;
+            size_t bytes = 0;
+            std::string error;
+            SessionStatus status;
+            bool ok = session_file_read(rdir.string() + "/conv-100.bin", id, back, bytes, error, {}, &status);
+            check(ok, "reloaded file is readable");
+            check(back.live.ids.size() == 100, "reloaded image has 100 live ids");
+        }
+        check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin kept on disk after reload (only take() removes it)");
+    }
+
+    // ── 12. reload_from_disk deletes corrupt and wrong-identity files ────────────────────
+    {
+        const auto rdir = dir / "reload_corrupt";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        // Write a valid spill.
+        SavedConversation original = sample(50);
+        check(store.put(std::move(original), 200, id), "put valid spill");
+        // Drop a corrupt conv-*.bin file (just garbage bytes).
+        std::ofstream(rdir / "conv-300.bin") << "garbage not a real session file";
+        // Drop a file with a non-numeric serial (conv-XYZ.bin). The reload path tries to parse
+        // the serial; on failure the file is removed (it does not match any expected pattern).
+        std::ofstream(rdir / "conv-XYZ.bin") << "ignored";
+        check(store.size() == 1, "store has 1 valid entry");
+        const size_t loaded = store.reload_from_disk(id);
+        check(loaded == 1, "reloaded the 1 valid entry");
+        check(store.size() == 1, "manifest has 1 entry after reload");
+        check(!fs::exists(rdir / "conv-300.bin"), "corrupt conv-300.bin was deleted");
+        check(!fs::exists(rdir / "conv-XYZ.bin"), "non-numeric conv-XYZ.bin was deleted");
+        check(fs::exists(rdir / "conv-200.bin"), "valid conv-200.bin kept");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_store_test: %d checks passed\n", checks);
     return 0;

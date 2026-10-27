@@ -114,6 +114,16 @@ public:
     // sidecar .idx scan to keep spills across restarts.
     void purge_on_startup();
 
+    // Phase 3: spills survive engine restarts. Called once at startup AFTER the engine's
+    // SessionFileIdentity is bound (i.e. after attach_spill on the first request). Scans the
+    // spill dir for conv-*.bin files written by a previous engine run, validates each with
+    // session_file_read (header + identity + payload hash), captures the cheap manifest data
+    // (ids, imgs, geometry, layer carve, cvec, file_bytes) and DROPS the heavy K/V from RAM.
+    // Files that fail validation (corruption, identity mismatch) are deleted; SessionError::memory
+    // (RAM preflight refused) keeps the file for a later engine start. Leftover .tmp files are
+    // cleaned. Returns the number of valid entries loaded.
+    size_t reload_from_disk(const SessionFileIdentity& identity);
+
     // The same drop_superseded contract as ConversationCache's: when a fresh park supersedes
     // an old branch (same deepest checkpoint), the old spill file is deleted. Called by the
     // engine after ConversationCache::drop_superseded.
@@ -200,6 +210,13 @@ size_t spill_clear(ConversationDiskStore* disk);
 /// restarts; this deletes every conv-*.bin and leftover .tmp from a prior interrupted write.
 /// No-op when disk is nullptr.
 void spill_purge_on_startup(ConversationDiskStore* disk);
+
+/// Reload the spill manifest from disk at engine startup (Phase 3: spills survive restarts).
+/// Called after attach_spill binds the engine's SessionFileIdentity. Scans the spill dir,
+/// validates each conv-*.bin against the identity, and rebuilds the manifest. Files that fail
+/// validation are deleted (except SessionError::memory, which keeps the file for a later start
+/// with more free RAM). No-op when disk is nullptr. Returns the count of entries loaded.
+size_t spill_reload_from_disk(ConversationDiskStore* disk, const SessionFileIdentity& identity);
 
 // ── Template implementations ──────────────────────────────────────────────────────────────
 // Templates cannot live in conversation_disk_store.cpp; their definitions must be visible at
