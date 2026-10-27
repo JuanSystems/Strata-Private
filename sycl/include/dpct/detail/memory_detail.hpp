@@ -822,11 +822,14 @@ public:
   /// Constructor with range
   device_memory(const sycl::range<Dimension> &range_in)
       : _size(range_in.size() * sizeof(T)), _range(range_in), _reference(false),
-        _host_ptr(nullptr) {
+        _host_ptr(nullptr), _device_ptrs(get_ptrs_size(), nullptr) {
     static_assert((Memory == global) || (Memory == constant) ||
                       (Memory == shared),
                   "device memory region should be global, constant or shared");
-    // Strata: the pointer table, mem_mgr and dev_mgr are made at the first get_ptr_impl() (sycl/tools/fixups.py)
+    // Make sure that singleton class mem_mgr and dev_mgr will destruct later
+    // than this.
+    detail::mem_mgr::instance();
+    dev_mgr::instance();
   }
 
   /// Constructor with range
@@ -924,11 +927,6 @@ private:
   }
 
   value_t *get_ptr_impl(sycl::queue &q) {
-    if (_device_ptrs.empty()) {
-      detail::mem_mgr::instance();
-      dev_mgr::instance();
-      _device_ptrs.assign(get_ptrs_size(), nullptr);
-    }
 #ifdef DPCT_USM_LEVEL_NONE
     auto &ptr = _device_ptrs.front();
 #else
@@ -955,7 +953,7 @@ private:
   bool _reference;
   value_t *_host_ptr;
   std::vector<value_t *> _device_ptrs;
-  std::optional<sycl::queue> _q;   // Strata: a default-built sycl::queue picks a device (sycl/tools/fixups.py)
+  sycl::queue _q;
 };
 template <class T, memory_region Memory>
 class device_memory<T, Memory, 0> : public device_memory<T, Memory, 1> {

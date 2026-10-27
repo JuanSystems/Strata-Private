@@ -265,6 +265,10 @@ def request_tools(req: dict):
                       "required": ["input"]}
         tools.append({"name": flat, "description": description, "parameters": params})
         names[flat] = (namespace, name, kind)
+        if namespace:
+            # Qwen writes Codex's MCP tools as `mcp__server__tool` (the flat name it
+            # learned), not `mcp__server.tool`: map that spelling back as well.
+            names.setdefault(f"{namespace}__{name}", (namespace, name, kind))
 
     for i, tool in enumerate(given):
         param = f"tools[{i}]"
@@ -519,12 +523,12 @@ class Assembler:
     def index(self) -> int:
         return len(self.response["output"]) - 1
 
-    def close(self, status=None) -> list[dict]:
+    def close(self, status="completed") -> list[dict]:
         item, self.item = self.item, None
         if item is None:
             return []
         at, out = self.response["output"].index(item), []
-        item["status"] = status or ("incomplete" if item["type"] in ("function_call", "custom_tool_call") else "completed")
+        item["status"] = status
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
@@ -602,7 +606,7 @@ class Assembler:
                 item["input"] = value if isinstance(value, str) else json.dumps(ev.call.arguments, ensure_ascii=False)
                 out.append(self.event("response.custom_tool_call_input.delta", item_id=item["id"],
                                       output_index=self.index, delta=item["input"]))
-            out += self.close("completed")
+            out += self.close()
         return out
 
     def _release(self, text: str) -> list[dict]:

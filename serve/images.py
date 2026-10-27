@@ -141,8 +141,7 @@ def image_env(cfg: dict, base: dict | None = None) -> dict:
         var = {"cuda": "CUDA_VISIBLE_DEVICES", "hip": "HIP_VISIBLE_DEVICES",
                "vulkan": "GGML_VK_VISIBLE_DEVICES"}.get(cfg.get("backend"))
         if var:
-            # one card is "1"; a list ([1, 0], "1,0") is every one of them, in order - str() of a list is not a device list
-            env[var] = ",".join(str(x).strip() for x in gpu if str(x).strip() != "") if isinstance(gpu, (list, tuple)) else str(gpu)
+            env[var] = str(gpu)
             if var == "CUDA_VISIBLE_DEVICES":
                 env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     for k, v in (cfg.get("env") or {}).items():
@@ -231,12 +230,16 @@ class ImageGen:
         with self.lock:
             with open(logf, "w", encoding="utf-8", errors="replace") as lf:
                 try:
-                    from serve import lifeline
-                    proc = lifeline.popen(cmd, "image", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                          stdin=subprocess.DEVNULL, env=image_env(self.cfg),
-                                          cwd=str(work), text=True, errors="replace", bufsize=1)
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                            stdin=subprocess.DEVNULL, env=image_env(self.cfg),
+                                            cwd=str(work), text=True, errors="replace", bufsize=1)
                 except OSError as e:
                     raise ImageJobFailed(f"sd-cli did not start ({cmd[0]}): {e}") from e
+                try:
+                    from serve.winjob import contain
+                    contain(proc)                 # ends with the server (Windows)
+                except Exception:
+                    pass
                 why = None
 
                 def pump():

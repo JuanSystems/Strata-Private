@@ -58,7 +58,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
         engine = RecordingEngine(self.tok, [self.loop,
             'I have verified the solution.\n</think>\nComplete solution.'])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = enabled
         events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
         return engine, events
@@ -67,7 +66,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
         engine = RecordingEngine(self.tok, [self.loop,
             'Verified.\n</think>\nComplete solution.'])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         request = {'temperature': .2, 'presence_penalty': 0, 'top_p': .95, 'top_k': 64, 'seed': 2}
         list(service.run(self.ids, True, [], 40000, request, threading.Event()))
@@ -83,7 +81,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_frozen_cohort_sampler_is_unchanged_during_recovery(self):
         engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\nComplete solution.'])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         sampler = {'temperature': 1.0, 'top_p': .95, 'top_k': 20, 'presence_penalty': 1.5, 'seed': 2}
         list(service.run(self.ids, True, [], 40000, sampler, threading.Event()))
@@ -94,7 +91,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_a_lower_top_p_and_top_k_are_never_raised_or_lowered(self):
         engine = RecordingEngine(self.tok, [self.loop, 'Verified.\n</think>\nComplete solution.'])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = "recover"
         list(service.run(self.ids, True, [], 40000, {'temperature': 0, 'top_p': .5, 'top_k': 5}, threading.Event()))
         self.assertEqual((engine.sampling_calls[1]['top_p'], engine.sampling_calls[1]['top_k']), (.5, 5))
@@ -114,7 +110,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_stop_mode_ends_the_reply_at_the_loop(self):
         engine = RecordingEngine(self.tok, [self.loop])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = "stop"
         events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
         self.assertEqual(len(engine.calls), 1)                   # no second pass
@@ -126,7 +121,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
         """#1753: the word count never sees the digits, so only the tail's period ends the reply."""
         engine = RecordingEngine(self.tok, ['9^104 = ' + '58747693387' * 3000])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = "stop"
         events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
         self.assertEqual(len(engine.calls), 1)                   # no second pass
@@ -142,7 +136,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_default_single_token_guard_does_not_detect_passage_loop(self):
         engine = RecordingEngine(self.tok, [self.loop])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         events = list(service.run(self.ids, True, [], 16384, {}, threading.Event()))
         self.assertEqual(service.repeat_stop_tokens, 256)
         self.assertEqual(events[-1][1]['finish'], 'length')
@@ -152,7 +145,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_recovery_is_once_and_never_extends_output_limit(self):
         engine = RecordingEngine(self.tok, [self.loop, self.loop])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         events = list(service.run(self.ids, True, [], 16384, {}, threading.Event()))
         self.assertEqual(len(engine.calls), 2)
@@ -163,7 +155,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_repeated_final_text_does_not_change_sampler_or_prompt(self):
         engine = RecordingEngine(self.tok, [self.loop])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         events = list(service.run(self.ids, False, [], 40000, {}, threading.Event()))
         self.assertEqual(len(engine.calls), 1)
@@ -172,7 +163,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_missing_native_high_hint_skips_recovery(self):
         engine = RecordingEngine(self.tok, [self.loop])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         ids = self.tok.encode('<|im_start|>user\nTask<|im_end|>\n', parse_special=True)
         events = list(service.run(ids, True, [], 40000, {}, threading.Event()))
@@ -182,7 +172,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
     def test_cancel_during_reasoning_does_not_start_recovery(self):
         engine = RecordingEngine(self.tok, [self.loop, 'Unused'])
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         cancel = threading.Event()
         events = []
@@ -198,7 +187,6 @@ class ReasoningLoopRecovery(unittest.TestCase):
         engine = RecordingEngine(self.tok, [self.loop, 'Done.\n</think>\nAnswer.'])
         engine.batch = 2
         service = Service(engine, self.tok, None)
-        service.answer_room = False      # these cases test the loop guards at the cap itself
         service.reasoning_loop_recovery = True
         events = list(service.run(self.ids, True, [], 40000, {}, threading.Event()))
         self.assertEqual(events[-1][1]['reasoning_recoveries'], 1)
