@@ -235,7 +235,24 @@ says they are (the files are checked against it first: every tensor's name, type
 saves the 23-50 GB copy on the disk. The answers are the same: on the Coder, 64 greedy tokens from `experts.bin` and
 from the GGUF gave identical tokens and logits. An expert read from the GGUF is three reads instead of one, so the
 engine fetches a layer's missing experts on 8 threads (`STRATA_FETCH_THREADS`) with one batched page request
-(Windows `PrefetchVirtualMemory`). With an `experts.bin` in the pack, nothing changes. Setup does not use this yet.
+(Windows `PrefetchVirtualMemory`). With an `experts.bin` in the pack, nothing changes.
+
+Setup uses it when `STRATA_NO_EXPERTS_BIN=1` is set: it then does not write the pack's `experts.bin` at all and
+starts the engine on the same pack, which reads the experts from the GGUFs. The saved space is the copy the
+low-RAM mode used to make: about 35 GB on IQ2_XS and about 50 GB on IQ3_S. `STRATA_RESIDENT_VARIANT=1`, together
+with the first variable, forces `--resident-experts` instead of the automatic resident/mapped choice. It is an
+escape hatch: on most PCs the default (the OS page cache) is faster. Without `STRATA_NO_EXPERTS_BIN` the setup
+writes `experts.bin` exactly as before.
+
+On a Linux disk that is too small even for the GGUFs plus the pack, `tools/strata_extract_experts_bin.py` builds
+`experts.bin` by extracting each shard's experts into an intermediate file and hole-punching the ranges they came
+from, so the disk use stays at about 70 GB instead of growing to about 105 GB (90 GB free with the 70 GB of GGUFs
+already downloaded is the case it was written for). **The saving is real on Linux only**: hole-punch is
+`fallocate(FALLOC_FL_PUNCH_HOLE)`, which Windows and macOS do not have, so there the tool rebuilds `experts.bin`
+without freeing anything from the GGUFs and says so. On those systems use `STRATA_NO_EXPERTS_BIN=1` instead (no
+`experts.bin` at all, the GGUFs untouched). Phases: `--phase 1` (shard 1), `--phase 2` (shard 2), `--phase 3`
+(concatenate), `--phase 4` (sidecar and `.done` marks), or `--phase all`. An interrupted phase 1 or 2 resumes from
+the layers recorded in `expert-NN.bin.progress.json`. Speed of the mode itself: not measured yet on this machine.
 
 **Linux file-tier I/O path (opt in, `STRATA_IO_PREFETCH=1`; 0.1.40.2):** the mapped file tier reads experts through
 page faults. With this on, the layer's uncached experts and the router-predicted ones of the next layer (`STRATA_LOOKAHEAD_K`,
