@@ -3914,7 +3914,23 @@ def toolkit_root_defs(nvcc) -> list:
 def engine_defs(archs, toolkit=13) -> list:
     """Extra CMake definitions for the engine: the experimental Pascal/Volta build (#295) for cards below sm_75, and
     for every CUDA 12 engine (the same build as the ready-made CUDA 12 one: it admits the older cards)."""
-    return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(int(x) for x in archs) < 75 or int(toolkit) == 12 else []
+    return ["-DSTRATA_EXPERIMENTAL_SM60=ON"] if min(arch_numbers(archs)) < 75 or int(toolkit) == 12 else []
+
+
+def arch_numbers(value) -> list:
+    """The CUDA architectures of a BUILD.json `archs` / `vision_archs` value, as numbers.  The packaging recipes write the picture
+    reader's as ONE string ("75;86;89;120", packaging/package_engine.py stamp_vision_archs, build_cuda_linux.sh), the engine's own as a
+    list of numbers ([75, 86, 89, 120]); [60, "sm_61", "70-real", "compute_89"] and "60,61 70" are read too (#3810: a string was
+    iterated character by character and setup stopped with int(';'))."""
+    if value is None or value == "":
+        return []
+    parts = list(value) if isinstance(value, (list, tuple, set)) else re.split(r"[;,\s]+", str(value))
+    out: list = []
+    for part in parts:
+        m = re.search(r"\d+", str(part))
+        if m and int(m.group()) not in out:
+            out.append(int(m.group()))
+    return out
 
 
 def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
@@ -3923,7 +3939,7 @@ def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
     of compiling one, which fails on most Windows PCs (no Visual Studio / CUDA toolkit); --build compiles it."""
     if vision != "gpu":
         return vision
-    va = [int(x) for x in meta.get("vision_archs", meta.get("archs", []))]
+    va = arch_numbers(meta.get("vision_archs", meta.get("archs")))
     if va and int(gpu["arch"]) not in va and not (meta.get("ptx") and int(gpu["arch"]) > max(va)):
         warn(f"the ready-made image encoder has no code for your GPU (sm_{gpu['arch']}): it runs on the CPU instead "
              "(images take longer; setup --build compiles one for your GPU)")
