@@ -1,3 +1,8 @@
+# Default: auto-detect text files, normalize to LF in the repo (Windows checks out CRLF only
+# for *.bat below; everything else stays LF). This stops Syncthing/Git from seeing 299 "modified"
+# files when syncing between Windows and Linux — they all share the same LF line endings.
+* text=auto eol=lf
+
 # Frozen prompts are hashed byte for byte (manifest sha256): never convert their line endings.
 bench/prompts/** -text
 
