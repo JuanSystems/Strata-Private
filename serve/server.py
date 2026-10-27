@@ -3124,6 +3124,22 @@ def engine_args(cfg: dict) -> list[str]:
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    # Conversation spill to disk (Phase 1 of the cache-loss fix). When the RAM cache evicts a
+    # conversation, the engine writes it to a file in spill_path (default: the model's data_dir/
+    # strata-spill/) instead of dropping it; the next turn restores it in ~1-2 s instead of
+    # re-processing 72K tokens (~210 s). budget_gib 0 disables the spill (A/B safe). The
+    # "not in args" guards let user_args.merge() (applied above, line 3084) keep a user-set path
+    # or budget. Mirrors the vram_elastic / vision / layer_split pattern.
+    spill = cfg.get("conversation_spill")
+    if isinstance(spill, dict):
+        if isinstance(spill.get("budget_gib"), int) and not isinstance(spill["budget_gib"], bool) \
+                and "--conversation-spill-gib" not in args:
+            args += ["--conversation-spill-gib", str(spill["budget_gib"])]
+        if isinstance(spill.get("path"), str) and spill["path"] and "--conversation-spill-path" not in args:
+            args += ["--conversation-spill-path", spill["path"]]
+        if isinstance(spill.get("min_tokens"), int) and not isinstance(spill["min_tokens"], bool) \
+                and spill["min_tokens"] > 0 and "--conversation-spill-min-tokens" not in args:
+            args += ["--conversation-spill-min-tokens", str(spill["min_tokens"])]
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)
@@ -4004,6 +4020,47 @@ class Service:
                 cancel.set()
                 if active:
                     self.client_disconnect_cancels += 1
+
+    def cancel_running(self, timeout_s: float | None = None) -> dict:
+        """POST /v1/cancel: cancel the in-flight request cleanly (without closing the client's
+        socket). Sets every active cancel event (there is normally one per request; with --batch
+        there may be more); the engine's _control thread sends STOP on stdin, the engine replies
+        DONE cancel=True, and the conversation is preserved (parked to RAM or spilled to disk).
+
+        Returns {"status": "cancelled", "cancels": N, "elapsed_ms": ...} when at least one request
+        was active; {"status": "idle"} when no request was in flight (idempotent: two POSTs in a
+        row never error). timeout_s (default: the engine's stop_wait_s) bounds how long this call
+        waits for the engine to acknowledge the STOP; on timeout the cancels are still set (the
+        engine will see them on its next loop) and the response says "timed_out".
+        """
+        if timeout_s is None:
+            timeout_s = getattr(self, "stop_wait_s", 30.0)
+        with self.status_lock:
+            active = [c for c in self.active_cancels if not c.is_set()]
+        if not active:
+            return {"status": "idle"}
+        for c in active:
+            c.set()
+        # The engine's _control thread (server.py:1477) polls cancel every 0.5s and sends STOP.
+        # Wait for the cancels to be observed: each is a threading.Event; we cannot wait on the
+        # engine's DONE directly here (that arrives on the request's own thread), but observing
+        # the cancel being processed is enough — the request's handler will return on its own.
+        # The HTTP response tells the client "STOP was sent"; the client can then re-issue.
+        deadline = time.monotonic() + timeout_s
+        start = time.monotonic()
+        while time.monotonic() < deadline:
+            # active_cancels is pruned by the request handler in its finally block (line ~6915).
+            # When the request finishes (DONE cancel=True), its cancel_event leaves active_cancels.
+            with self.status_lock:
+                remaining = sum(1 for c in active if c in self.active_cancels)
+            if remaining == 0:
+                return {"status": "cancelled", "cancels": len(active),
+                        "elapsed_ms": round((time.monotonic() - start) * 1000.0, 1)}
+            time.sleep(0.05)
+        return {"status": "timed_out", "cancels": len(active),
+                "elapsed_ms": round(timeout_s * 1000.0, 1),
+                "note": "STOP was sent but the engine did not acknowledge within the timeout; "
+                        "the request continues on its own"}
 
     @contextlib.contextmanager
     def _inference_fifo(self, deadline: float | None, cancel: threading.Event | None = None):
@@ -6830,6 +6887,29 @@ def make_handler(svc: Service):
                         self._json(200, svc.vram(r))
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                # POST /v1/cancel: cancel the in-flight request cleanly without closing the socket.
+                # No body needed; the response confirms the STOP was acknowledged by the engine.
+                # Idempotent: 200 {"status": "idle"} when nothing is running, 200 {"status": "cancelled"} otherwise.
+                if path == "/v1/cancel":
+                    if not self._own_page("the running request can be cancelled"):
+                        return
+                    q = parse_qs(urlsplit(self.path).query)
+                    timeout_s = None
+                    if "timeout_s" in q:
+                        try:
+                            timeout_s = float(q["timeout_s"][0])
+                            if timeout_s <= 0:
+                                raise ValueError
+                        except (ValueError, IndexError):
+                            self._json(400, {"error": {"type": "invalid_request_error",
+                                                       "message": "timeout_s: a positive number of seconds"}})
+                            return
+                    try:
+                        self._json(200, svc.cancel_running(timeout_s))
+                    except EngineDied as e:
+                        self._json(503, {"error": {"type": "server_error",
+                                                   "message": f"{e}; the next request restarts it"}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
