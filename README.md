@@ -1,243 +1,173 @@
-<h1 align="center">Strata</h1>
+# Strata Private — fork de Strata con modo low-RAM sin `experts.bin`
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+Este repositorio es un **fork** de [Strata](https://github.com/Niko1221/Strata).
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+Aquí solo se documenta **lo que este fork añade** sobre el repositorio original. Para instalar, configurar
+o entender Strata en sí (modelos, motores, la app, la Terminal, las APIs), ve al repositorio original:
+**[github.com/Niko1221/Strata](https://github.com/Niko1221/Strata)**.
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+- Repositorio original (upstream): <https://github.com/Niko1221/Strata>
+- Este fork: <https://github.com/JuanSystems/Strata-Private>
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+---
 
-## How fast is it?
+## Qué añade este fork
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+Dos cosas, las dos alrededor del mismo problema: **el archivo `experts.bin` ocupa entre 35 y 50 GB que
+quizá no tienes.**
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+### 1. Modo low-RAM que no escribe `experts.bin`
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+El motor de Strata ya sabía leer los expertos directamente de los shards GGUF cuando el pack no tiene
+`experts.bin` (desde el motor 0.1.31). Lo que faltaba era que el setup dejara de escribirlo. Ahora lo hace
+con una variable de entorno:
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
-
-</td><td>
-
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
-
-</td></tr>
-</table>
-
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
-
-## What you need
-
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
-
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
-
-Experimental, written and tested by community members on their own machines:
-
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **Apple Silicon Macs (M1 to M5)**, built from source by `./setup.sh` (the Metal engine): [Mac](docs/MAC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
-
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
-
-## Install
-
-### Let your AI set it up
-
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
-
-```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+```sh
+STRATA_NO_EXPERTS_BIN=1
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+Con ella, el setup descarga los GGUFs y **no crea** el archivo de expertos. El espacio ahorrado es la
+copia que el modo low-RAM hacía antes: unos 35 GB en IQ2_XS y unos 50 GB en IQ3_S.
 
-### Or do it yourself
+Si quieres forzar la variante que precarga en RAM los expertos que la GPU no retiene, añade también:
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
-
-**Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once
-(`xcode-select --install` in Terminal; Xcode itself is not needed). Then open Terminal in the Strata folder and run
-**`./setup.sh`**. It builds the Mac engine on your Mac (about 7 minutes), asks the same questions, downloads the model
-and starts it. Next time, `./setup.sh` starts it right away. Which size fits your Mac and how fast it is:
-[docs/MAC.md](docs/MAC.md).
-
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
-
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
-
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
-
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
-
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
-
-**Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
-
-## Which model should I pick?
-
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
-
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
-
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0](docs/MODELS.md#unsloths-files-ud-iq4_xs-to-q8_0):**
-  4- to 8-bit, closer to the full model (93-95% the same next token as Q8_0). Fast where every expert fits in RAM
-  (~88 GB for UD-Q4_K_XL up to ~136 GB for Q8_0); with less RAM Strata reads part of them from the SSD while it
-  answers, which is much slower (7-8.5 tokens/s for UD-Q4_K_XL on a 64 GB PC).
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
-
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
-
-## Using it
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
-
-### Optional: more speed on one card when the whole model fits in RAM
-
-Two opt-in settings (by RubenTorney, #1904 and #1905). They help when you run one graphics card and your RAM holds
-every expert (Strata's arena mode, for example Q2_0 or IQ3_XXS on a 64 GB PC). Open your config,
-`strata-<model>.json` in the Strata data folder ([where](docs/INSTALL.md#where-things-are-stored)), and add:
-
-- **Faster decode:** `"--adapt-async", "1"` to the `"args"` list. The expert cache then updates on a helper thread
-  instead of pausing the answer. Measured on an RTX 5070 (Windows, Q2_0): +4-5% decode, +7-10% on code and long
-  documents. Answers can differ slightly from the default (they stay the same from run to run).
-- **Faster prompt reading on Windows:** `"STRATA_PIN_BY_NEED": "1"` in the `"env"` block. Windows can lock only about
-  half the RAM for the graphics card; this locks the experts the card actually needs first. Measured on the RTX 5070:
-  +4.4% prompt reading.
-
-```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+```sh
+STRATA_RESIDENT_VARIANT=1
 ```
 
-Restart Strata (`START-HERE.bat` or `./setup.sh`) after the change. To undo, remove the two entries.
+Es solo un escape hatch: en la mayoría de los PCs el comportamiento automático (page cache del sistema
+operativo) rinde mejor.
 
-## Something went wrong?
+Sin `STRATA_NO_EXPERTS_BIN`, el setup escribe `experts.bin` exactamente como antes. **El camino por
+defecto no cambia ni un byte.**
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+### 2. `tools/strata_extract_experts_bin.py` — construir el pack perforando el GGUF
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+#### Por qué se perfora el GGUF
 
-## How does it work?
+Hay dos formas de darle los expertos al motor y cada una gana en algo distinto:
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
+- **Leerlos del GGUF en sitio** ahorra disco, pero la inferencia es más lenta: cada experto son tres
+  lecturas separadas (gate, up, down) esparcidas por el archivo, en vez de un bloque contiguo.
+- **Tenerlos en `experts.bin`** es más rápido, porque cada experto es un bloque contiguo que el motor
+  lee de una vez, pero eso **duplica** los expertos: siguen dentro del GGUF *y* están otra vez en el
+  archivo nuevo. De ahí los ~105 GB.
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+Perforar el GGUF resuelve la duplicación. Cuando los expertos de un rango ya se copiaron a `experts.bin`,
+ese rango del GGUF se convierte en un hueco: el archivo sigue midiendo lo mismo de cara al sistema
+(las posiciones no cambian, `native_experts.txt` sigue siendo válido), pero esos bytes **dejan de ocupar
+disco**. El GGUF queda conteniendo solo lo que el modelo sigue leyendo de él —las partes densas, los
+routers, las tablas—, y los expertos se leen del `experts.bin` contiguo.
 
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
+El resultado es lo mejor de los dos mundos: **la velocidad de inferencia de `experts.bin` sin pagar dos
+veces el espacio de los expertos.**
 
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
+#### Uso
 
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
+Para discos muy ajustados. El setup estándar necesita los GGUFs (~70 GB) **más** `experts.bin`
+(~35 GB) al mismo tiempo: unos 105 GB. Si tienes 90 GB libres y ya bajaste los GGUFs, el setup falla.
 
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+Esta herramienta extrae los expertos capa por capa a un archivo intermedio, **perfora** (hole-punch)
+los rangos del GGUF de los que ya se copiaron y luego concatena. El uso de disco se mantiene alrededor
+de 70 GB durante toda la operación, en vez de crecer a 105 GB.
 
-## Credits and license
+```sh
+python3 tools/strata_extract_experts_bin.py \
+    --gguf /ruta/al/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+    --out  /ruta/al/data/packs/iq2xs \
+    --phase all
+```
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+Fases, por si prefieres ir paso a paso y verificar entre medias:
 
-## Support Strata
+| Fase | Qué hace |
+|------|----------|
+| `--phase 1` | extrae los expertos del shard 1 a `expert-01.bin` y perfora el shard 1 |
+| `--phase 2` | extrae los expertos del shard 2 a `expert-02.bin` y perfora el shard 2 |
+| `--phase 3` | concatena los intermedios en `experts.bin` (streaming, sin pico de disco) |
+| `--phase 4` | escribe el sidecar `experts.bin.src.json` y actualiza las marcas `.done` |
+| `--phase all` | las cuatro, en orden |
 
-Strata is free and open source. If it is useful to you, you can support its development:
+Si una fase se interrumpe, las fases 1 y 2 retoman desde las capas registradas en
+`expert-NN.bin.progress.json`. No empiezan de cero.
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+**La herramienta comprueba antes de tocar nada que tu sistema de archivos soporte hole-punch.** Si no
+lo soporta, aborta con un mensaje en vez de dejarte creyendo que ahorraste 35 GB que en realidad no se
+liberaron.
+
+---
+
+## Cómo subir tu GGUF perforado a Hugging Face
+
+Un GGUF perforado **no se puede subir tal cual**. Hugging Face no guarda archivos sparse: cuando subes un
+archivo de 70 GB, lo rellena y vuelve a ocupar los 70 GB reales, perdiendo todo el ahorro. Por eso hay que
+empaquetarlo primero con `tar --sparse` (que conserva los huecos) y comprimirlo (los ceros se comprimen casi
+a nada).
+
+### Paso 1: empaquetar con `tar --sparse` + compresión
+
+```bash
+# Empaquetar (preserva sparse + comprime los ceros restantes muy bien)
+tar --sparse -cf - -C /tmp/strata-data/models/IQ2_XS \
+    Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \
+  | gzip -1 > /kaggle/working/Qwen-IQ2_XS-shard1-sparse.tar.gz
+```
+
+Ajusta la ruta `-C` al directorio donde están tus GGUFs y el nombre del `.gguf` al de tu shard. Repite el
+comando para el shard 2 si también lo perforaste.
+
+`-1` es el nivel de compresión más rápido. Los huecos son ceros y comprimen igual de bien en cualquier
+nivel, así que no hace falta subir a `-9`: tardarías mucho más para ganar muy poco.
+
+### Paso 2: subir el `.tar.gz`
+
+Sube el archivo resultante a tu repositorio de Hugging Face con la interfaz web o con `huggingface-cli`:
+
+```bash
+huggingface-cli upload <usuario>/<repositorio> /kaggle/working/Qwen-IQ2_XS-shard1-sparse.tar.gz
+```
+
+### Paso 3: al descargarlo, descomprimir conservando los huecos
+
+```bash
+tar --sparse -xzf Qwen-IQ2_XS-shard1-sparse.tar.gz -C /tmp/strata-data/models/IQ2_XS
+```
+
+`--sparse` en la extracción es imprescindible: sin él, `tar` escribe los ceros como datos reales y el
+archivo vuelve a ocupar los 70 GB.
+
+### Verificar que el ahorro sobrevivió
+
+```bash
+# "aparente" vs "real en disco": deben ser distintos
+ls -lh  Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
+du -h   Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf
+```
+
+Si `du` reporta bastante menos que `ls`, los huecos siguen ahí.
+
+### Recordatorio
+
+Las marcas `.done` de los GGUFs quedan con la línea `trimmed:`, así que el setup no intentará rehashear
+111 GB de ceros ni volverá a descargar los archivos. Si compartes el pack, incluye también el
+`experts.bin.src.json` que dejó la fase 4: el motor lo usa para saber a qué modelo pertenece cada
+`experts.bin`.
+
+---
+
+## Tests
+
+```sh
+python tools/test_setup_lowram.py
+python tools/test_extract_experts_bin.py
+```
+
+Los dos son `unittest`, sin GPU y sin descargas.
+
+---
+
+## Créditos y licencia
+
+Todo el trabajo del motor, el setup, la app y la Terminal es de **[Strata](https://github.com/Niko1221/Strata)**
+y sus contribuidores. Este fork solo añade lo descrito arriba. La licencia es la misma del proyecto original
+(ver [LICENSE](LICENSE)).
