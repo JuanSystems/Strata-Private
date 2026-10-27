@@ -3080,6 +3080,7 @@ class Service:
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
         self.status_lock = threading.Lock()
+        self.active_cancels: set[threading.Event] = set()   # POST /v1/cancel: the cancel Events of the requests in flight
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -3611,6 +3612,31 @@ class Service:
         with self.status_lock:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+
+    def cancel_running(self, timeout_s: float | None = None) -> dict:
+        """POST /v1/cancel: cancel the in-flight request cleanly (without closing the client's
+        socket). Sets every active cancel event (normally one per request; with --batch there
+        may be more). Returns {"status": "cancelled", ...} when at least one was active and
+        {"status": "idle"} when none was (idempotent: two POSTs in a row never error)."""
+        if timeout_s is None:
+            timeout_s = getattr(self, "stop_wait_s", 30.0)
+        with self.status_lock:
+            active = [c for c in self.active_cancels if not c.is_set()]
+        if not active:
+            return {"status": "idle"}
+        for c in active:
+            c.set()
+        deadline = time.monotonic() + timeout_s
+        start = time.monotonic()
+        while time.monotonic() < deadline:
+            with self.status_lock:
+                remaining = sum(1 for c in active if c in self.active_cancels)
+            if remaining == 0:
+                return {"status": "cancelled", "cancels": len(active),
+                        "elapsed_ms": round((time.monotonic() - start) * 1000.0, 1)}
+            time.sleep(0.05)
+        return {"status": "timed_out", "cancels": len(active),
+                "elapsed_ms": round(timeout_s * 1000.0, 1)}
 
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
@@ -5168,19 +5194,28 @@ def make_handler(svc: Service):
             sock = self.connection
 
             def watch():
-                while not done.wait(0.5) and not cancel.is_set():
-                    try:
-                        readable, _, _ = select.select([sock], [], [], 0)
-                        gone = bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
-                    except (ConnectionError, TimeoutError):
-                        gone = True
-                    except (OSError, ValueError):            # the socket was closed here: the request has ended
-                        return
-                    if gone:
-                        self._note(outcome="disconnected")
-                        cancel.set()
-                        return
+                try:
+                    while not done.wait(0.5) and not cancel.is_set():
+                        try:
+                            readable, _, _ = select.select([sock], [], [], 0)
+                            gone = bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
+                        except (ConnectionError, TimeoutError):
+                            gone = True
+                        except (OSError, ValueError):            # the socket was closed here: the request has ended
+                            return
+                        if gone:
+                            self._note(outcome="disconnected")
+                            cancel.set()
+                            return
+                finally:
+                    # Every request path that starts a watcher must also leave the cancel registry,
+                    # or cancel_running() waits the whole timeout for a request that already ended.
+                    with svc.status_lock:
+                        svc.active_cancels.discard(cancel)
 
+            self.cancel_event = cancel
+            with svc.status_lock:
+                svc.active_cancels.add(cancel)
             threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
 
         def _note(self, **values):
@@ -5502,6 +5537,14 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
+                if path == "/v1/cancel":                       # cancel the in-flight request without closing the socket
+                    if not self._own_page("the running request can be cancelled"):
+                        return
+                    t = req.get("timeout_s")
+                    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t < 0):
+                        raise ValueError("timeout_s: a number of seconds (0 or more), or null for the engine's stop_wait_s")
+                    self._json(200, svc.cancel_running(None if t is None else float(t)))
+                    return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
@@ -5569,6 +5612,9 @@ def make_handler(svc: Service):
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
                     self.watch_done.set()
+                if getattr(self, "cancel_event", None) is not None:
+                    with svc.status_lock:
+                        svc.active_cancels.discard(self.cancel_event)
                 record = self.record
                 if record is not None:
                     with svc.status_lock:
