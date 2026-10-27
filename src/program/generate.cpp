@@ -24,6 +24,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_disk_store.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -633,6 +634,14 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// --conversation-spill-gib N / --conversation-spill-path PATH / --conversation-spill-min-tokens N:
+    /// disk-tier spill. When the RAM cache evicts a parked conversation, write it to a file in
+    /// spill_path instead of dropping it; the next turn restores it in ~1-2 s instead of re-processing
+    /// 72K tokens (~210 s). budget_gib 0 disables the spill (the disk store stays nullptr and the
+    /// engine behaves exactly as today).
+    int64_t conversation_spill_gib = 0;
+    std::string conversation_spill_path;
+    int64_t conversation_spill_min_tokens = 0;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
@@ -2119,10 +2128,13 @@ int main(int argc, char** argv) {
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
+            else if (a == "--conversation-spill-gib") o.conversation_spill_gib = number;
+            else if (a == "--conversation-spill-min-tokens") o.conversation_spill_min_tokens = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
         }
+        else if (a == "--conversation-spill-path") o.conversation_spill_path = next("--conversation-spill-path");
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -8138,6 +8150,42 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // Disk-tier spill (cache-loss fix): when RAM pressure evicts a parked conversation, write
+        // it to a file in spill_path instead of dropping it; the next turn restores it in ~1-2 s
+        // instead of re-processing 72K tokens (~210 s). budget_gib 0 keeps today's behavior
+        // (store is disabled, evict_oldest drops as before). The SessionFileIdentity is the same
+        // one SAVE/RESTORE uses; we attach the spill lazily on the first request (after the
+        // identity is resolved, see "Lazy spill attach" below).
+        std::unique_ptr<strata::core::ConversationDiskStore> disk_store;
+        strata::core::ConversationDiskStore* disk_store_ptr = nullptr;
+        if (o.conversation_spill_gib > 0) {
+            strata::core::SpillConfig spill_cfg;
+            spill_cfg.path = o.conversation_spill_path;
+            spill_cfg.budget_gib = (uint64_t) o.conversation_spill_gib;
+            spill_cfg.min_tokens = o.conversation_spill_min_tokens > 0
+                                       ? o.conversation_spill_min_tokens : o.conversation_cache_min_tokens;
+            spill_cfg.data_dir = o.pack;
+            disk_store = strata::core::make_disk_store(spill_cfg, nullptr);
+            if (disk_store && disk_store->enabled()) {
+                disk_store_ptr = disk_store.get();
+                std::fprintf(stderr, "strata serve: conversation spill: enabled with %lld GiB at %s "
+                                     "(RAM cache stays auto-sized; the disk absorbs overflow)\n",
+                             (long long) o.conversation_spill_gib, disk_store->dir().c_str());
+            } else if (disk_store) {
+                std::fprintf(stderr, "strata serve: conversation spill: disabled (budget_gib = 0 or "
+                                     "directory creation failed); today's behavior (drop on evict)\n");
+            } else {
+                std::fprintf(stderr, "strata serve: conversation spill: disabled (no data_dir or path; "
+                                     "pass --conversation-spill-path)\n");
+            }
+        }
+        // The spill store's identity is bound lazily on the first request (the model and config
+        // fingerprints are not known until the model is loaded).
+        strata::core::SessionFileIdentity spill_identity{};
+        bool spill_attached = false;
+        // Monotonic serial for direct spills (the spill-when-cache-off path): the high half of the
+        // uint64_t range, so they never collide with the cache's serials (low half, starting at 1).
+        uint64_t next_direct_spill_serial = 1ull << 63;
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -8215,7 +8263,13 @@ int main(int argc, char** argv) {
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // ── Spill-when-cache-off flag: when the RAM cache is OFF but the spill is on, we skip
+            // the early return below and let the code run until draft0/view are declared, then do
+            // a direct spill. This fixes the bug where Kaggle (low free RAM) had the spill enabled
+            // but the disk store stayed empty because park_current_body returned early.
+            const bool spill_when_cache_off = !conversations.enabled() && disk_store_ptr != nullptr
+                                              && spill_attached && live_ok && !live.empty();
+            if (!spill_when_cache_off && (!conversations.enabled() || !live_ok || live.empty())) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -8254,6 +8308,37 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
+            // ── Direct spill when the RAM cache is OFF (spill_when_cache_off was set at the top).
+            // draft0 and view are now declared, so we can capture and spill. This is the path that
+            // fixes the bug where Kaggle (low free RAM) had the spill enabled but the disk store
+            // stayed empty because park_current_body returned early.
+            if (spill_when_cache_off) {
+                const auto t0 = Clock::now();
+                try {
+                    strata::core::SavedConversation image;
+                    size_t reused_bytes = 0;
+                    strata::core::ConversationKvReuse empty_reuse;   // no cache → no retained K/V
+                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                            std::move(empty_reuse), &reused_bytes)) return false;
+                    const size_t spill_tokens = image.live.ids.size();
+                    const size_t spill_bytes = image.bytes();
+                    const uint64_t spill_serial = next_direct_spill_serial++;   // unique per direct spill
+                    if (disk_store_ptr->put(std::move(image), spill_serial, spill_identity)) {
+                        const double spill_ms = std::chrono::duration<double, std::milli>(
+                            Clock::now() - t0).count();
+                        std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB) "
+                                             "to disk in %.1f ms (RAM cache off; the next turn restores it)\n",
+                                     spill_tokens, spill_bytes / (1024.0 * 1024.0), spill_ms);
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation cache: lost %zu tokens "
+                                             "(RAM cache off and disk spill write failed)\n", spill_tokens);
+                    }
+                } catch (const std::bad_alloc&) {
+                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill "
+                                         "(RAM cache off); the conversation is lost\n");
+                }
+                return true;
+            }
             auto reuse = conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
@@ -10982,9 +11067,41 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            // ── Lazy spill attach: the disk store needs a SessionFileIdentity to write files bound
+            // to this engine. The identity depends on model_fp/config_fp, resolved lazily by
+            // session_identity; we attach on the first request that arrives after the model is loaded.
+            if (disk_store_ptr != nullptr && !spill_attached) {
+                std::string spill_err;
+                if (session_identity(spill_identity, spill_err, nullptr)) {
+                    strata::core::attach_spill(conversations, disk_store_ptr, &spill_identity);
+                    spill_attached = true;
+                    // Phase 3: spills survive engine restarts. Reload the manifest from disk so
+                    // a request can restore a conversation the previous engine run spilled.
+                    const size_t n_loaded = strata::core::spill_reload_from_disk(disk_store_ptr, spill_identity);
+                    if (n_loaded > 0) {
+                        std::fprintf(stderr, "strata serve: conversation spill: reloaded %zu conversation%s "
+                                             "from disk (manifest=%zu, bytes=%.1f MiB)\n",
+                                     n_loaded, n_loaded == 1 ? "" : "s", disk_store_ptr->size(),
+                                     (double) disk_store_ptr->bytes() / (1024.0 * 1024.0));
+                    }
+                } else if (!spill_err.empty()) {
+                    std::fprintf(stderr, "strata serve: conversation spill: could not resolve the engine "
+                                         "identity yet (%s); the spill stays detached for this request\n",
+                                 spill_err.c_str());
+                }
+            }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            // ── Restore-path fallback: when the RAM cache has no usable prefix, consult the disk store.
+            if (!incoming && disk_store_ptr != nullptr) {
+                if (auto from_disk = strata::core::restore_from_disk_or_ram(
+                        parked, disk_store_ptr, ids, req_imgs, want_cvec, resume, slot_tokens, spill_identity)) {
+                    incoming.emplace(std::move(*from_disk));
+                    std::fprintf(stderr, "strata serve: conversation spill: restored %zu tokens from disk "
+                                         "(RAM cache had no match)\n", incoming->live.ids.size());
+                }
+            }
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.

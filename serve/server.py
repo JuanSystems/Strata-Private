@@ -2599,6 +2599,21 @@ def engine_args(cfg: dict) -> list[str]:
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
             args += ["--vram-segment-mib", str(seg)]
+    # Conversation spill to disk (cache-loss fix). When the RAM cache evicts a conversation, the
+    # engine writes it to a file in spill_path (default: the model's data_dir/strata-spill/)
+    # instead of dropping it; the next turn restores it in ~1-2 s instead of re-processing 72K
+    # tokens (~210 s). budget_gib 0 disables the spill (A/B safe). The "not in args" guards let
+    # user_args.merge() keep a user-set path or budget.
+    spill = cfg.get("conversation_spill")
+    if isinstance(spill, dict):
+        if isinstance(spill.get("budget_gib"), int) and not isinstance(spill["budget_gib"], bool) \
+                and "--conversation-spill-gib" not in args:
+            args += ["--conversation-spill-gib", str(spill["budget_gib"])]
+        if isinstance(spill.get("path"), str) and spill["path"] and "--conversation-spill-path" not in args:
+            args += ["--conversation-spill-path", spill["path"]]
+        if isinstance(spill.get("min_tokens"), int) and not isinstance(spill["min_tokens"], bool) \
+                and spill["min_tokens"] > 0 and "--conversation-spill-min-tokens" not in args:
+            args += ["--conversation-spill-min-tokens", str(spill["min_tokens"])]
     args += parallel_args(cfg, args)
     return learned_profile_args(cfg, args)
 
