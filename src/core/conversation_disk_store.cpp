@@ -236,14 +236,22 @@ void ConversationDiskStore::purge_on_startup() {
 
 size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identity) {
     // Phase 3: spills survive engine restarts. Scan the spill dir for conv-*.bin files written
-    // by a previous engine run, validate each one with session_file_read (header + identity +
-    // payload hash + full parse), capture the cheap manifest data (ids, imgs, geometry, layer
-    // carve, cvec, file_bytes), then DROP the heavy K/V image from RAM. The next request's
-    // best() finds the entry in the manifest and take() re-reads the file.
+    // by a previous engine run, validate the most recent one with session_file_read (header +
+    // identity + payload hash + full parse), capture the cheap manifest data (ids, imgs,
+    // geometry, layer carve, cvec, file_bytes), then DROP the heavy K/V image from RAM. The
+    // next request's best() finds the entry in the manifest and take() re-reads the file.
+    //
+    // RAM SAFETY: session_file_read materializes a full SavedConversation in host RAM
+    // transiently (~1.5 GB at 65K tokens). Reading multiple spills in a loop on a RAM-tight
+    // host (Kaggle: 32 GB, ~26 GB already used by the model + resident experts) can OOM the
+    // engine. So we load at most MAX_SPILLS_TO_RELOAD spills (the most recent ones — they
+    // have the longest prefix, the older ones are superseded) and DELETE the rest (older
+    // snapshots of the same conversation that the new spill includes).
     //
     // Files that fail validation (corruption, identity mismatch, unsupported version) are
-    // deleted: they can never match this engine. A SessionError::memory (RAM preflight
-    // refused) keeps the file — the next engine start with more free RAM may succeed.
+    // also deleted: they can never match this engine. A SessionError::memory (RAM preflight
+    // refused) keeps the file — the next engine start with more free RAM may succeed. A
+    // std::bad_alloc mid-read stops the reload (we keep what we have, leave the rest on disk).
     //
     // Leftover .tmp files (an interrupted write) are also cleaned: they were never renamed
     // to .bin, so they are not valid spills.
@@ -257,69 +265,98 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     // Collect conv-*.bin files sorted by serial (filename sorts lexicographically the same
     // as numeric for the decimal form std::to_string produces, so the LRU order entries_ is
     // built oldest-first — mirrors the order put() inserts at).
-    std::vector<fs::path> files;
+    struct SpillFile { fs::path path; uint64_t serial; };
+    std::vector<SpillFile> files;
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
         if (ec) break;
         const std::string name = entry.path().filename().string();
         if (name.rfind("conv-", 0) == 0 && name.size() > 9 &&
             name.compare(name.size() - 4, 4, ".bin") == 0) {
-            files.push_back(entry.path());
+            uint64_t serial = 0;
+            try {
+                serial = std::stoull(name.substr(5, name.size() - 9));
+            } catch (...) {
+                std::error_code ec2;
+                fs::remove(entry.path(), ec2);   // not a valid conv-<serial>.bin name: drop it
+                continue;
+            }
+            files.push_back({entry.path(), serial});
         } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
             // Leftover .tmp from an interrupted write: clean it up.
             fs::remove(entry.path(), ec);
         }
     }
+    if (files.empty()) return 0;
     std::sort(files.begin(), files.end(),
-              [](const fs::path& a, const fs::path& b) {
-                  return a.filename().string() < b.filename().string();
-              });
+              [](const SpillFile& a, const SpillFile& b) { return a.serial < b.serial; });
+    // RAM SAFETY: load at most MAX_SPILLS_TO_RELOAD of the most recent spills. The rest are
+    // older snapshots of the same conversation (the most recent includes them as a prefix) and
+    // are deleted to bound disk usage and avoid accumulating stale files.
+    const size_t MAX_SPILLS_TO_RELOAD = 1;
+    const size_t keep_count = std::min(files.size(), MAX_SPILLS_TO_RELOAD);
+    const size_t reload_start = files.size() - keep_count;   // index of the most recent spill to keep
     size_t loaded = 0;
-    for (const auto& path : files) {
-        const std::string name = path.filename().string();   // conv-<serial>.bin
-        // Parse the serial from the filename: conv-<decimal>.bin
-        uint64_t serial = 0;
+    for (size_t i = reload_start; i < files.size(); ++i) {
+        const auto& path = files[i].path;
+        const uint64_t serial = files[i].serial;
         try {
-            serial = std::stoull(name.substr(5, name.size() - 9));
-        } catch (...) {
-            std::error_code ec2;
-            fs::remove(path, ec2);   // not a valid conv-<serial>.bin name: drop it
-            continue;
-        }
-        SavedConversation image;
-        size_t bytes_read = 0;
-        std::string error;
-        SessionStatus status;
-        if (!session_file_read(path.string(), identity, image, bytes_read, error, {}, &status)) {
-            // Identity mismatch, corruption, or RAM refusal. For memory (RAM preflight): keep
-            // the file, the next start with more RAM may succeed. Anything else: delete.
-            if (status.error != SessionError::memory) {
-                std::error_code ec2;
-                fs::remove(path, ec2);
+            SavedConversation image;
+            size_t bytes_read = 0;
+            std::string error;
+            SessionStatus status;
+            if (!session_file_read(path.string(), identity, image, bytes_read, error, {}, &status)) {
+                // Identity mismatch, corruption, or RAM refusal. For memory (RAM preflight): keep
+                // the file, the next start with more RAM may succeed. Anything else: delete.
+                if (status.error != SessionError::memory) {
+                    std::error_code ec2;
+                    fs::remove(path, ec2);
+                }
+                continue;
             }
-            continue;
+            // Capture the manifest data; the heavy K/V is dropped right after.
+            DiskEntry e;
+            e.serial = serial;
+            e.path = path.string();
+            e.ids = image.live.ids;
+            e.imgs = image.live.imgs;
+            e.geometry = image.geometry;
+            e.layer_lo = image.layer_lo;
+            e.layer_hi = image.layer_hi;
+            e.cvec = image.cvec;
+            e.file_bytes = bytes_read;
+            e.used = next_used_++;
+            { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
+            // LRU evict if over budget: drop the oldest entries (which we just loaded first).
+            while (!entries_.empty() && bytes_ + e.file_bytes > budget_) {
+                if (!evict_oldest()) break;
+            }
+            if (e.file_bytes > budget_) continue;   // single file bigger than the whole budget
+            entries_.push_back(std::move(e));
+            serials_.push_back(serial);
+            bytes_ += bytes_read;
+            ++loaded;
+        } catch (const std::bad_alloc&) {
+            // RAM exhausted mid-load: stop, keep what we have so far, leave the remaining files
+            // on disk for a later reload (when the engine has more free RAM). Older spills
+            // (those before reload_start) are deleted below.
+            std::fprintf(stderr, "strata serve: conversation spill: reload_from_disk stopped at "
+                                 "file %zu/%zu (host RAM exhausted; remaining files kept on disk)\n",
+                         i + 1, files.size());
+            break;
         }
-        // Capture the manifest data; the heavy K/V is dropped right after.
-        DiskEntry e;
-        e.serial = serial;
-        e.path = path.string();
-        e.ids = image.live.ids;
-        e.imgs = image.live.imgs;
-        e.geometry = image.geometry;
-        e.layer_lo = image.layer_lo;
-        e.layer_hi = image.layer_hi;
-        e.cvec = image.cvec;
-        e.file_bytes = bytes_read;
-        e.used = next_used_++;
-        { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
-        // LRU evict if over budget: drop the oldest entries (which we just loaded first).
-        while (!entries_.empty() && bytes_ + e.file_bytes > budget_) {
-            if (!evict_oldest()) break;
-        }
-        if (e.file_bytes > budget_) continue;   // single file bigger than the whole budget
-        entries_.push_back(std::move(e));
-        serials_.push_back(serial);
-        bytes_ += bytes_read;
-        ++loaded;
+    }
+    // Delete the older spills (everything before reload_start): the kept spill includes them as
+    // a prefix, so they are dead weight. Without this, the dir would accumulate one file per
+    // request when restore fails (the original bug).
+    size_t deleted_old = 0;
+    for (size_t i = 0; i < reload_start; ++i) {
+        std::error_code ec2;
+        if (fs::remove(files[i].path, ec2)) ++deleted_old;
+    }
+    if (deleted_old > 0) {
+        std::fprintf(stderr, "strata serve: conversation spill: deleted %zu older spill file%s "
+                             "(superseded by the most recent one)\n",
+                     deleted_old, deleted_old == 1 ? "" : "s");
     }
     return loaded;
 }
@@ -333,6 +370,16 @@ size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
         for (const auto& k : checkpoints)
             if (k.ids == cid && k.imgs == cimgs) return true;
         return false;
+    };
+    // A spill whose ids are a strict prefix of the new conversation's ids is OBSOLETE: the new
+    // spill (about to be written, or just written by the regular park path) carries that older
+    // conversation as a prefix, plus the new turn on top. Keeping the old spill on disk wastes
+    // the disk budget (and best() would never pick it over the longer new one). So drop it too.
+    // This is what fixes the "11 files for 1 conversation" bug: each request grew the live state
+    // by ~80 tokens, the spill stayed at the old length, and exact-equality drop never matched.
+    auto is_prefix_of = [](const std::vector<int32_t>& cid, const std::vector<int32_t>& longer) {
+        if (cid.empty() || cid.size() > longer.size()) return false;
+        return std::equal(cid.begin(), cid.end(), longer.begin());
     };
     size_t dropped = 0;
     for (size_t i = 0; i < entries_.size();) {
@@ -349,6 +396,30 @@ size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
             erase(i);
             ++dropped;
             continue;
+        }
+        // Also drop spills whose ids are a strict prefix of the new live state: they are
+        // snapshots of an earlier turn of the SAME conversation, now included in the longer one.
+        // The image check: the spill's images must be a prefix of the prompt's images (the new
+        // conversation may have added image rows the old one didn't have, but it cannot have fewer).
+        if (!e.ids.empty() && is_prefix_of(e.ids, ids)) {
+            // Verify images are a prefix: every image the spill has must also be in the prompt,
+            // at the same position (the spill's images are an early subset of the new conversation's).
+            bool imgs_ok = true;
+            for (const auto& im : e.imgs) {
+                bool found = false;
+                for (const auto& pim : images) {
+                    if (pim == im) { found = true; break; }
+                }
+                if (!found) { imgs_ok = false; break; }
+            }
+            if (imgs_ok) {
+                std::error_code ec;
+                fs::remove(e.path, ec);
+                bytes_ -= e.file_bytes;
+                erase(i);
+                ++dropped;
+                continue;
+            }
         }
         ++i;
     }

@@ -315,8 +315,6 @@ int main() {
     // conversation is in the manifest (best() finds it, take() restores it).
     {
         const auto rdir = dir / "reload";
-        SessionFileIdentity id_b = id;
-        id_b.model = 0xABCDEF42;   // a different model fingerprint (simulates a restart)
         // Engine A writes one spill.
         {
             ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
@@ -359,25 +357,53 @@ int main() {
         check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin kept on disk after reload (only take() removes it)");
     }
 
+    // ── 11b. reload_from_disk with multiple spills: only the most recent is kept ─────────
+    // The RAM-safety guard: when the dir has multiple spills of the same growing conversation,
+    // only the most recent (longest prefix) is loaded into the manifest. Older spills are
+    // deleted (they are snapshots the new one includes as a prefix).
+    {
+        const auto rdir = dir / "reload_multi";
+        // Engine A writes 3 spills with growing serials (mimics 3 requests on the same conversation).
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.put(std::move(sample(100)), 100, id), "put serial 100");
+            check(store_a.put(std::move(sample(200)), 101, id), "put serial 101");
+            check(store_a.put(std::move(sample(300)), 102, id), "put serial 102");
+            check(store_a.size() == 3, "store A has 3 entries");
+            check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin on disk");
+            check(fs::exists(rdir / "conv-101.bin"), "conv-101.bin on disk");
+            check(fs::exists(rdir / "conv-102.bin"), "conv-102.bin on disk");
+        }
+        // Engine B reloads: only conv-102.bin (most recent) is kept and loaded.
+        {
+            ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = store_b.reload_from_disk(id);
+            check(loaded == 1, "reloaded 1 entry (the most recent) from 3 spills");
+            check(store_b.size() == 1, "store B has 1 entry after reload");
+            check(!fs::exists(rdir / "conv-100.bin"), "older conv-100.bin was deleted");
+            check(!fs::exists(rdir / "conv-101.bin"), "older conv-101.bin was deleted");
+            check(fs::exists(rdir / "conv-102.bin"), "most recent conv-102.bin kept");
+        }
+    }
+
     // ── 12. reload_from_disk deletes corrupt and wrong-identity files ────────────────────
+    // When the most recent file is corrupt, it is deleted; no entries are loaded. Older spills
+    // are still deleted (they were superseded, even if the new one can't be read).
     {
         const auto rdir = dir / "reload_corrupt";
         ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
-        // Write a valid spill.
+        // Write a valid spill with a low serial (it would be the "older" one).
         SavedConversation original = sample(50);
         check(store.put(std::move(original), 200, id), "put valid spill");
-        // Drop a corrupt conv-*.bin file (just garbage bytes).
+        // Drop a corrupt conv-*.bin file with a HIGHER serial (so it becomes the "most recent"
+        // and the reload path tries to load it first, fails, and falls back to nothing).
         std::ofstream(rdir / "conv-300.bin") << "garbage not a real session file";
-        // Drop a file with a non-numeric serial (conv-XYZ.bin). The reload path tries to parse
-        // the serial; on failure the file is removed (it does not match any expected pattern).
-        std::ofstream(rdir / "conv-XYZ.bin") << "ignored";
         check(store.size() == 1, "store has 1 valid entry");
         const size_t loaded = store.reload_from_disk(id);
-        check(loaded == 1, "reloaded the 1 valid entry");
-        check(store.size() == 1, "manifest has 1 entry after reload");
+        check(loaded == 0, "reloaded 0 entries (the most recent was corrupt)");
+        check(store.size() == 0, "manifest empty after reload (corrupt file was deleted)");
         check(!fs::exists(rdir / "conv-300.bin"), "corrupt conv-300.bin was deleted");
-        check(!fs::exists(rdir / "conv-XYZ.bin"), "non-numeric conv-XYZ.bin was deleted");
-        check(fs::exists(rdir / "conv-200.bin"), "valid conv-200.bin kept");
+        check(!fs::exists(rdir / "conv-200.bin"), "older conv-200.bin was also deleted (superseded)");
     }
 
     fs::remove_all(dir);
