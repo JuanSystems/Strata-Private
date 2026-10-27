@@ -15,6 +15,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -129,6 +130,19 @@ public:
     // engine after ConversationCache::drop_superseded.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                             const std::vector<ConversationCheckpoint>& checkpoints, bool cvec);
+
+    // ── Manifest inspection (for diagnostics) ──
+    // Returns a pointer to entry i's ids, or nullptr if i is out of range. Used by the
+    // restore_from_disk_or_ram diagnostic log to show what the manifest holds vs the prompt.
+    const std::vector<int32_t>* entry_ids(size_t i) const {
+        return i < entries_.size() ? &entries_[i].ids : nullptr;
+    }
+    const std::vector<ConversationImageKey>* entry_imgs(size_t i) const {
+        return i < entries_.size() ? &entries_[i].imgs : nullptr;
+    }
+    uint64_t entry_serial(size_t i) const {
+        return i < serials_.size() ? serials_[i] : 0;
+    }
 
 private:
     std::string dir_;
@@ -275,7 +289,42 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
     prompt32.reserve(prompt.size());
     for (const auto& t : prompt) prompt32.push_back(static_cast<int32_t>(t));
     auto disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);
-    if (disk_match.tokens <= ram_floor) return std::nullopt;
+    // ── DIAGNOSTIC: when the disk has entries but no match (or a match below the floor), say so.
+    // This pinpoints whether the issue is (a) no matching prefix (the manifest entries' ids don't
+    // line up with the prompt's) or (b) a matching prefix that the floor caps out below.
+    if (disk_match.tokens <= ram_floor) {
+        std::fprintf(stderr, "[strata diag] restore_from_disk_or_ram: no usable disk match "
+                              "(disk_size=%zu, disk_best=%lld, ram_floor=%lld, prompt=%zu, cvec=%d, prompt_imgs=%zu)\n",
+                     disk->size(), (long long) disk_match.tokens, (long long) ram_floor,
+                     prompt.size(), (int) cvec, images.size());
+        // Print the first/last few ids of each manifest entry vs the prompt, to see where the
+        // mismatch is (when the manifest has entries but best() returns 0).
+        if (disk->size() > 0) {
+            std::fprintf(stderr, "[strata diag]   prompt first 5 ids:");
+            for (size_t i = 0; i < prompt.size() && i < 5; ++i)
+                std::fprintf(stderr, " %d", (int) prompt32[i]);
+            std::fprintf(stderr, " | last 5:");
+            for (size_t i = prompt32.size() >= 5 ? prompt32.size() - 5 : 0; i < prompt32.size(); ++i)
+                std::fprintf(stderr, " %d", (int) prompt32[i]);
+            std::fprintf(stderr, "\n");
+            // Show the manifest entries' ids too, so we can compare against the prompt
+            for (size_t i = 0; i < disk->size() && i < 4; ++i) {   // first 4 entries
+                const std::vector<int32_t>* e_ids = disk->entry_ids(i);
+                if (e_ids && !e_ids->empty()) {
+                    std::fprintf(stderr, "[strata diag]   manifest[%zu] serial=%llu n_ids=%zu first 5:",
+                                 i, (unsigned long long) disk->entry_serial(i), e_ids->size());
+                    for (size_t k = 0; k < e_ids->size() && k < 5; ++k)
+                        std::fprintf(stderr, " %d", (int) (*e_ids)[k]);
+                    std::fprintf(stderr, " | last 5:");
+                    for (size_t k = e_ids->size() >= 5 ? e_ids->size() - 5 : 0; k < e_ids->size(); ++k)
+                        std::fprintf(stderr, " %d", (int) (*e_ids)[k]);
+                    const std::vector<ConversationImageKey>* e_imgs = disk->entry_imgs(i);
+                    std::fprintf(stderr, " imgs=%zu cvec=%d\n", e_imgs ? e_imgs->size() : 0, (int) cvec);
+                }
+            }
+        }
+        return std::nullopt;
+    }
     return const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits);
 }
 
