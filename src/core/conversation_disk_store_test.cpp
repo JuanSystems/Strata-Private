@@ -108,30 +108,30 @@ int main() {
     fs::create_directories(dir);
     const SessionFileIdentity id{0x1111222233334444ull, 0x5555666677778888ull};
 
-    // ── 1. Round trip: put → best → take returns the same image, file is gone after take ──────
+    // ── 1. Round trip: put → best → take returns the same image, file is KEPT after take ─────
+    // take() no longer deletes the file — the user wants conversations preserved on disk.
+    // The file is only deleted by drop_superseded (replacement) or evict_oldest (budget).
     {
         ConversationDiskStore store(dir.string() + "/rt", 1ull << 30, &id);
         check(store.enabled(), "store enabled with non-zero budget");
         SavedConversation original = sample(1000);
-        // best() uses conversation_prefix() which requires the prompt's image list to match the
-        // entry's live.imgs (one image at start=3 here). Pass the same image list so the prefix matches.
         const std::vector<ConversationImageKey> imgs = original.live.imgs;
         const uint64_t serial = 42;
         check(store.put(std::move(original), serial, id), "put succeeds");
         check(store.size() == 1, "manifest holds one entry");
-        // The manifest's prefix matches the original's live ids (1000 tokens).
         std::vector<int32_t> prompt;
         for (int i = 0; i < 1000; ++i) prompt.push_back(int32_t(1000 + i));
-        prompt.push_back(9999);   // one more: the next turn's token
+        prompt.push_back(9999);
         const auto m = store.best(prompt, imgs, /*cvec=*/false);
         check(m.tokens == 1000, "best() matches the live prefix (1000 tokens)");
         check(m.serial == serial, "best() returns the correct serial");
         auto back = store.take(m, id);
         check(back.has_value(), "take returns the image");
         check(same(sample(1000), *back), "round trip is identical");
-        check(store.size() == 0, "take removes the entry");
+        check(store.size() == 0, "take removes the entry from manifest");
         check(store.bytes() == 0, "take accounts bytes");
-        check(!fs::exists(dir / "rt" / ("conv-" + std::to_string(serial) + ".bin")), "file deleted after take");
+        // El archivo se QUEDA en disco (no se borra en take exitoso).
+        check(fs::exists(dir / "rt" / ("conv-" + std::to_string(serial) + ".bin")), "file KEPT after take (preserved)");
         check(store.restores() == 1, "restore counter incremented");
     }
 
@@ -450,7 +450,7 @@ int main() {
         const size_t loaded = store.reload_from_disk(id);
         check(loaded == 1, "reloaded 1 entry (the valid conv-200.bin)");
         check(store.size() == 1, "manifest has 1 entry after reload");
-        check(!fs::exists(rdir / "conv-300.bin"), "corrupt conv-300.bin was deleted");
+        check(fs::exists(rdir / "conv-300.bin"), "corrupt conv-300.bin KEPT on disk (never deleted)");
         check(fs::exists(rdir / "conv-200.bin"), "valid conv-200.bin kept on disk");
     }
 
@@ -591,8 +591,8 @@ int main() {
             const size_t loaded = store_b.reload_from_disk(id_b);
             check(loaded == 0, "wrong-identity .idx → slow path → identity mismatch → 0 loaded");
             check(store_b.size() == 0, "manifest empty (the .bin was from another engine)");
-            check(!fs::exists(rdir / "conv-100.bin"), "wrong-identity .bin deleted");
-            check(!fs::exists(rdir / "conv-100.idx"), "wrong-identity .idx deleted");
+            check(fs::exists(rdir / "conv-100.bin"), "wrong-identity .bin KEPT on disk (never deleted)");
+            check(fs::exists(rdir / "conv-100.idx"), "wrong-identity .idx KEPT on disk (never deleted)");
         }
     }
 
@@ -619,8 +619,8 @@ int main() {
             const size_t loaded = store_b.reload_from_disk(id);
             check(loaded == 0, "stale .idx → slow path → garbage .bin → 0 loaded");
             check(store_b.size() == 0, "manifest empty");
-            check(!fs::exists(rdir / "conv-100.bin"), "garbage .bin deleted");
-            check(!fs::exists(rdir / "conv-100.idx"), "stale .idx deleted (remove_spill_files)");
+            check(fs::exists(rdir / "conv-100.bin"), "garbage .bin KEPT on disk (never deleted)");
+            check(fs::exists(rdir / "conv-100.idx"), "stale .idx KEPT on disk (never deleted)");
         }
     }
 
@@ -661,8 +661,8 @@ int main() {
             check(m.tokens == 100, "best finds the survivor");
             auto back = store_b.take(m, id);
             check(back.has_value(), "take succeeded");
-            check(!fs::exists(rdir / "conv-102.bin"), "taken 102 .bin gone");
-            check(!fs::exists(rdir / "conv-102.idx"), "taken 102 .idx gone");
+            check(fs::exists(rdir / "conv-102.bin"), "taken 102 .bin KEPT (preserved on disk)");
+            check(fs::exists(rdir / "conv-102.idx"), "taken 102 .idx KEPT (preserved on disk)");
         }
         // clear(): write 2 more, clear, both .bin and .idx gone.
         {

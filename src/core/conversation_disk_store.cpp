@@ -63,7 +63,7 @@ namespace {
 
 // Magic + version. Bumping the version invalidates every old .idx (the slow path rewrites them).
 constexpr char kIdxMagic[4] = {'S', 'I', 'D', 'X'};
-constexpr uint32_t kIdxVersion = 1;
+constexpr uint32_t kIdxVersion = 2;   // v2: adds ckpt_ids + ckpt_imgs after live imgs
 
 // Layout (little-endian, no struct memcpy — explicit byte writes):
 //   4   magic "SIDX"
@@ -500,24 +500,27 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
     SessionStatus status;
     const bool ok = session_file_read(path, id, back, read, error, limits, &status);
     if (!ok) {
-        // Identity mismatch or corruption: the file is unusable. Drop it from the manifest
-        // (it can never match this engine) and try to delete it. RAM preflight refusal is the
-        // one case where we KEEP the file (the caller's admit said "no RAM now, retry later").
-        const bool keep_file = (status.error == SessionError::memory);
-        if (!keep_file) {
-            remove_spill_files(path);   // .bin + .idx + .idx.tmp
-        }
-        // Remove from manifest regardless: a corrupt or wrong-identity file is dead weight.
+        // NUNCA borrar el .bin aquí tampoco. Solo se borra en take() exitoso (la conversación
+        // volvió a RAM) o por evict_oldest() (budget excedido). Si la lectura falla, loguear
+        // y conservar el archivo para diagnóstico.
+        std::fprintf(stderr, "[strata diag] spill take: SKIP %s (read failed, KEPT on disk): "
+                             "error=%s, status=%d\n",
+                     path.c_str(), error.c_str(), (int) status.error);
+        // Remove from manifest (the entry is not usable right now), but DON'T delete the file.
         for (size_t i = 0; i < serials_.size(); ++i) {
             if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
         }
         return std::nullopt;
     }
-    // Success: remove the entry and delete the file (the conversation is back in RAM).
+    // Success: the conversation is back in RAM. Remove from the manifest but DON'T delete the
+    // file — the user wants conversations preserved on disk. The file will be replaced only
+    // when a newer spill of the same conversation is written (drop_superseded), or evicted by
+    // the LRU when the disk budget is exceeded.
     for (size_t i = 0; i < serials_.size(); ++i) {
         if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
     }
-    remove_spill_files(path);   // .bin + .idx + .idx.tmp (the conversation is back in RAM)
+    // NO borrar el archivo. La conversación está en RAM pero el archivo se queda en disco
+    // como copia de seguridad. Si el engine se reinicia, el archivo sigue ahí.
     ++restores_;
     return back;
 }
@@ -668,11 +671,15 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             std::string error;
             SessionStatus status;
             if (!session_file_read(bin_path, identity, image, bytes_read, error, {}, &status)) {
-                // Identity mismatch, corruption, or RAM refusal. For memory (RAM preflight): keep
-                // the file, the next start with more RAM may succeed. Anything else: delete.
-                if (status.error != SessionError::memory) {
-                    remove_spill_files(bin_path);   // .bin + .idx + .idx.tmp
-                }
+                // NUNCA borrar el .bin aquí. Sea identity mismatch, corrupción, RAM rechazada,
+                // o cualquier otro error: loguear y conservar. El archivo solo se elimina por:
+                //   1. evict_oldest() cuando excede el budget (LRU)
+                //   2. take() exitoso (la conversación volvió a RAM)
+                // Si borráramos aquí, no podríamos diagnosticar qué pasó, y un cambio de config
+                // temporal (como --max-context) destruiría conversaciones guardadas.
+                std::fprintf(stderr, "[strata diag] spill reload: SKIP %s (read failed, KEPT on disk): "
+                                     "error=%s, status=%d\n",
+                             bin_path.c_str(), error.c_str(), (int) status.error);
                 continue;
             }
             // Capture the manifest data; the heavy K/V is dropped right after.
@@ -758,21 +765,19 @@ size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
         // prefix itself is what the new conversation supersedes, drop. (Phase 2: store the
         // deepest checkpoint's ids/imgs in the manifest too for a more accurate match.)
         if (!e.ids.empty() && held(e.ids, e.imgs)) {
+            // Exact match: the new spill is the same conversation. Replace the old file.
             const std::string drop_path = e.path;
             const uint64_t drop_bytes = e.file_bytes;
             erase(i);
             bytes_ -= drop_bytes;
-            remove_spill_files(drop_path);   // .bin + .idx + .idx.tmp
+            remove_spill_files(drop_path);   // BORRAR: reemplazo por versión más nueva
             ++dropped;
             continue;
         }
         // Also drop spills whose ids are a strict prefix of the new live state: they are
         // snapshots of an earlier turn of the SAME conversation, now included in the longer one.
-        // The image check: the spill's images must be a prefix of the prompt's images (the new
-        // conversation may have added image rows the old one didn't have, but it cannot have fewer).
+        // This is the "20 messages replaces 10 messages" case.
         if (!e.ids.empty() && is_prefix_of(e.ids, ids)) {
-            // Verify images are a prefix: every image the spill has must also be in the prompt,
-            // at the same position (the spill's images are an early subset of the new conversation's).
             bool imgs_ok = true;
             for (const auto& im : e.imgs) {
                 bool found = false;
@@ -786,7 +791,7 @@ size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
                 const uint64_t drop_bytes = e.file_bytes;
                 erase(i);
                 bytes_ -= drop_bytes;
-                remove_spill_files(drop_path);   // .bin + .idx + .idx.tmp
+                remove_spill_files(drop_path);   // BORRAR: la conversación mayor reemplaza a la menor
                 ++dropped;
                 continue;
             }

@@ -8309,35 +8309,41 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            // ── Direct spill when the RAM cache is OFF (spill_when_cache_off was set at the top).
-            // draft0 and view are now declared, so we can capture and spill. This is the path that
-            // fixes the bug where Kaggle (low free RAM) had the spill enabled but the disk store
-            // stayed empty because park_current_body returned early.
-            if (spill_when_cache_off) {
+            // ── Disk spill: SIEMPRE que el disk_store esté activo, sin importar si la RAM cache
+            // está encendida o apagada. Aprovecha la pausa después de que el modelo terminó de
+            // responder para escribir una copia de seguridad en disco. Si el engine se reinicia,
+            // el siguiente request restaura desde disco en vez de recomputar todo.
+            // Si la RAM cache está apagada (spill_when_cache_off), este spill es el único destino
+            // de la conversación. Si está encendida, la conversación también se guarda en RAM
+            // abajo (parking normal), pero el disco es la copia de seguridad.
+            if (disk_store_ptr != nullptr && spill_attached && live_ok && !live.empty()) {
                 const auto t0 = Clock::now();
                 try {
                     strata::core::SavedConversation image;
                     size_t reused_bytes = 0;
-                    strata::core::ConversationKvReuse empty_reuse;   // no cache → no retained K/V
+                    strata::core::ConversationKvReuse empty_reuse;
                     if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
                             std::move(empty_reuse), &reused_bytes)) return false;
                     const size_t spill_tokens = image.live.ids.size();
                     const size_t spill_bytes = image.bytes();
-                    const uint64_t spill_serial = next_direct_spill_serial++;   // unique per direct spill
+                    const uint64_t spill_serial = next_direct_spill_serial++;
                     if (disk_store_ptr->put(std::move(image), spill_serial, spill_identity)) {
                         const double spill_ms = std::chrono::duration<double, std::milli>(
                             Clock::now() - t0).count();
                         std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB) "
-                                             "to disk in %.1f ms (RAM cache off; the next turn restores it)\n",
+                                             "to disk in %.1f ms (auto-spill after response; the next restart restores it)\n",
                                      spill_tokens, spill_bytes / (1024.0 * 1024.0), spill_ms);
                     } else {
-                        std::fprintf(stderr, "strata serve: conversation cache: lost %zu tokens "
-                                             "(RAM cache off and disk spill write failed)\n", spill_tokens);
+                        std::fprintf(stderr, "strata serve: conversation cache: disk spill write failed "
+                                             "(%zu tokens); the conversation stays in RAM only\n", spill_tokens);
                     }
                 } catch (const std::bad_alloc&) {
-                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill "
-                                         "(RAM cache off); the conversation is lost\n");
+                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill; "
+                                         "the conversation stays in RAM only\n");
                 }
+            }
+            // Si la RAM cache está apagada, el spill al disco fue lo único que pudimos hacer.
+            if (spill_when_cache_off) {
                 return true;
             }
             auto reuse = conversations.take_reuse();
