@@ -51,6 +51,285 @@ std::string ConversationDiskStore::path_for(uint64_t serial) const {
     return dir_ + "/conv-" + std::to_string(serial) + ".bin";
 }
 
+// ── Sidecar .idx: cheap manifest metadata without parsing the .bin ──────────────────────────
+// The .idx is a small (few hundred bytes) sidecar file written next to each conv-<serial>.bin.
+// It carries exactly the fields DiskEntry needs (ids, imgs, geometry, layer_lo/hi, cvec,
+// file_bytes) plus a freshness hint (bin_size, bin_mtime_ns) so reload_from_disk() can decide
+// whether to trust the .idx or fall back to a full session_file_read of the .bin. The layout is
+// little-endian (matching the .bin's v1 format). Writes are atomic (temp + rename), reads never
+// throw — a corrupt or stale .idx degrades to the slow path, never aborts the engine start.
+
+namespace {
+
+// Magic + version. Bumping the version invalidates every old .idx (the slow path rewrites them).
+constexpr char kIdxMagic[4] = {'S', 'I', 'D', 'X'};
+constexpr uint32_t kIdxVersion = 1;
+
+// Layout (little-endian, no struct memcpy — explicit byte writes):
+//   4   magic "SIDX"
+//   4   uint32 version
+//   8   uint64 model        (SessionFileIdentity.model)
+//   8   uint64 config       (SessionFileIdentity.config)
+//   144 18 × int64 geometry (std::array<int64_t, 18>)
+//   8   int64  layer_lo
+//   8   int64  layer_hi
+//   1   uint8  cvec
+//   8   uint64 file_bytes    (size of the .bin on disk when the .idx was written)
+//   8   uint64 bin_size      (fs::file_size of the .bin at write time — freshness check)
+//   8   int64  bin_mtime_ns  (fs::last_write_time as nanoseconds since epoch — freshness check)
+//   4   uint32 n_ids
+//   n_ids × 4   int32 ids[]
+//   4   uint32 n_imgs
+//   n_imgs × 16 (int64 start, uint64 hash) imgs[]
+//   8   uint64 checksum      (session_hash64 of everything above)
+
+void write_le_u32(std::vector<uint8_t>& buf, uint32_t v) {
+    buf.push_back(uint8_t(v & 0xFF));
+    buf.push_back(uint8_t((v >> 8) & 0xFF));
+    buf.push_back(uint8_t((v >> 16) & 0xFF));
+    buf.push_back(uint8_t((v >> 24) & 0xFF));
+}
+void write_le_u64(std::vector<uint8_t>& buf, uint64_t v) {
+    for (int i = 0; i < 8; ++i) buf.push_back(uint8_t((v >> (i * 8)) & 0xFF));
+}
+void write_le_i64(std::vector<uint8_t>& buf, int64_t v) { write_le_u64(buf, uint64_t(v)); }
+void write_le_u8(std::vector<uint8_t>& buf, uint8_t v) { buf.push_back(v); }
+
+bool read_le_u32(const std::vector<uint8_t>& buf, size_t& pos, uint32_t& out) {
+    if (pos + 4 > buf.size()) return false;
+    out = uint32_t(buf[pos]) | (uint32_t(buf[pos + 1]) << 8) |
+          (uint32_t(buf[pos + 2]) << 16) | (uint32_t(buf[pos + 3]) << 24);
+    pos += 4;
+    return true;
+}
+bool read_le_u64(const std::vector<uint8_t>& buf, size_t& pos, uint64_t& out) {
+    if (pos + 8 > buf.size()) return false;
+    out = 0;
+    for (int i = 0; i < 8; ++i) out |= uint64_t(buf[pos + i]) << (i * 8);
+    pos += 8;
+    return true;
+}
+bool read_le_i64(const std::vector<uint8_t>& buf, size_t& pos, int64_t& out) {
+    uint64_t u = 0;
+    if (!read_le_u64(buf, pos, u)) return false;
+    out = int64_t(u);
+    return true;
+}
+bool read_le_u8(const std::vector<uint8_t>& buf, size_t& pos, uint8_t& out) {
+    if (pos + 1 > buf.size()) return false;
+    out = buf[pos++];
+    return true;
+}
+
+// Build the .idx payload (everything except the trailing checksum) into a byte buffer.
+std::vector<uint8_t> build_idx_payload(const DiskEntry& e, const SessionFileIdentity& id,
+                                       uint64_t bin_size, int64_t bin_mtime_ns) {
+    std::vector<uint8_t> buf;
+    buf.reserve(256 + e.ids.size() * 4 + e.imgs.size() * 16);
+    for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(kIdxMagic[i]));
+    write_le_u32(buf, kIdxVersion);
+    write_le_u64(buf, id.model);
+    write_le_u64(buf, id.config);
+    for (size_t i = 0; i < e.geometry.size(); ++i) write_le_i64(buf, e.geometry[i]);
+    write_le_i64(buf, e.layer_lo);
+    write_le_i64(buf, e.layer_hi);
+    write_le_u8(buf, e.cvec ? 1 : 0);
+    write_le_u64(buf, e.file_bytes);
+    write_le_u64(buf, bin_size);
+    write_le_i64(buf, bin_mtime_ns);
+    write_le_u32(buf, uint32_t(e.ids.size()));
+    for (int32_t v : e.ids) write_le_u32(buf, uint32_t(v));   // int32 tokens as uint32 (4 bytes)
+    write_le_u32(buf, uint32_t(e.imgs.size()));
+    for (const auto& im : e.imgs) {
+        write_le_i64(buf, im.start);
+        write_le_u64(buf, im.hash);
+    }
+    return buf;
+}
+
+// Compute the checksum over the payload (everything except the trailing 8-byte checksum field).
+uint64_t idx_checksum(const std::vector<uint8_t>& payload) {
+    // FNV-1a 64-bit (non-cryptographic, same role as session_hash64 in the .bin format).
+    uint64_t h = 1469598103934665603ull;
+    for (uint8_t b : payload) {
+        h ^= b;
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+}   // anonymous namespace
+
+std::string ConversationDiskStore::path_for_idx(uint64_t serial) const {
+    return dir_ + "/conv-" + std::to_string(serial) + ".idx";
+}
+
+bool ConversationDiskStore::write_idx(const DiskEntry& e, const std::string& bin_path,
+                                       const SessionFileIdentity& id) const {
+    // Read the .bin's size and mtime for the freshness hint. If either fails, the .idx is
+    // written with zeros — reload_from_disk() will fall back to the slow path on the next start.
+    uint64_t bin_size = 0;
+    int64_t bin_mtime_ns = 0;
+    std::error_code ec;
+    if (fs::exists(bin_path, ec) && !ec) {
+        bin_size = (uint64_t) fs::file_size(bin_path, ec);
+        if (ec) bin_size = 0;
+        const fs::file_time_type ft = fs::last_write_time(bin_path, ec);
+        if (!ec) {
+            // file_clock → system_clock → nanoseconds since epoch (C++20 chrono).
+            const auto sys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+            bin_mtime_ns = sys.time_since_epoch().count();
+        }
+    }
+    // Build the payload (everything except the checksum).
+    std::vector<uint8_t> payload = build_idx_payload(e, id, bin_size, bin_mtime_ns);
+    // Append the checksum.
+    const uint64_t cs = idx_checksum(payload);
+    write_le_u64(payload, cs);
+    // Atomic write: temp + rename. The temp file is <idx>.tmp; on any error it is removed.
+    const std::string idx_path = path_for_idx(e.serial);
+    const std::string tmp_path = idx_path + ".tmp";
+    try {
+        std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
+        if (!f) return false;
+        const size_t n = std::fwrite(payload.data(), 1, payload.size(), f);
+        std::fclose(f);
+        if (n != payload.size()) {
+            std::error_code ec2;
+            fs::remove(tmp_path, ec2);
+            return false;
+        }
+        std::error_code ren_ec;
+        fs::rename(tmp_path, idx_path, ren_ec);
+        if (ren_ec) {
+            std::error_code ec2;
+            fs::remove(tmp_path, ec2);
+            return false;
+        }
+        return true;
+    } catch (const std::exception&) {
+        std::error_code ec2;
+        fs::remove(tmp_path, ec2);
+        return false;
+    }
+}
+
+bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out,
+                                      const SessionFileIdentity& id) const {
+    // Read the whole .idx into a buffer. Never throws — any I/O or parse error returns false.
+    std::error_code ec;
+    if (!fs::exists(idx_path, ec) || ec) return false;
+    const uint64_t fsize = fs::file_size(idx_path, ec);
+    if (ec || fsize == 0 || fsize > (1u << 20)) return false;   // sanity bound: 1 MiB max
+    std::vector<uint8_t> buf;
+    try {
+        buf.resize(size_t(fsize));
+    } catch (const std::exception&) {
+        return false;
+    }
+    std::FILE* f = std::fopen(idx_path.c_str(), "rb");
+    if (!f) return false;
+    const size_t n = std::fread(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+    if (n != buf.size()) return false;
+    // Parse magic + version.
+    size_t pos = 0;
+    if (buf.size() < 4 + 4 + 8 + 8) return false;   // header minimum
+    for (int i = 0; i < 4; ++i) if (buf[i] != uint8_t(kIdxMagic[i])) return false;
+    pos = 4;
+    uint32_t version = 0;
+    if (!read_le_u32(buf, pos, version) || version != kIdxVersion) return false;
+    // Identity check: a .idx from another engine is unusable.
+    uint64_t model = 0, config = 0;
+    if (!read_le_u64(buf, pos, model) || !read_le_u64(buf, pos, config)) return false;
+    if (model != id.model || config != id.config) return false;
+    // Parse the rest of the fixed-size header.
+    DiskEntry e;
+    for (size_t i = 0; i < e.geometry.size(); ++i) {
+        if (!read_le_i64(buf, pos, e.geometry[i])) return false;
+    }
+    if (!read_le_i64(buf, pos, e.layer_lo) || !read_le_i64(buf, pos, e.layer_hi)) return false;
+    uint8_t cvec_byte = 0;
+    if (!read_le_u8(buf, pos, cvec_byte)) return false;
+    e.cvec = (cvec_byte != 0);
+    if (!read_le_u64(buf, pos, e.file_bytes)) return false;
+    uint64_t bin_size = 0;
+    int64_t bin_mtime_ns = 0;
+    if (!read_le_u64(buf, pos, bin_size) || !read_le_i64(buf, pos, bin_mtime_ns)) return false;
+    // Parse ids.
+    uint32_t n_ids = 0;
+    if (!read_le_u32(buf, pos, n_ids) || n_ids > (1u << 28)) return false;   // sanity bound
+    try {
+        e.ids.reserve(n_ids);
+    } catch (const std::exception&) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_ids; ++i) {
+        uint32_t v = 0;
+        if (!read_le_u32(buf, pos, v)) return false;
+        e.ids.push_back(int32_t(v));
+    }
+    // Parse imgs.
+    uint32_t n_imgs = 0;
+    if (!read_le_u32(buf, pos, n_imgs) || n_imgs > (1u << 20)) return false;
+    try {
+        e.imgs.reserve(n_imgs);
+    } catch (const std::exception&) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_imgs; ++i) {
+        int64_t start = 0;
+        uint64_t hash = 0;
+        if (!read_le_i64(buf, pos, start) || !read_le_u64(buf, pos, hash)) return false;
+        e.imgs.push_back(ConversationImageKey{start, hash});
+    }
+    // Checksum: the last 8 bytes of the buffer must equal idx_checksum(everything before).
+    if (pos + 8 > buf.size()) return false;
+    const uint64_t stored_cs = [&] {
+        uint64_t u = 0;
+        for (int i = 0; i < 8; ++i) u |= uint64_t(buf[pos + i]) << (i * 8);
+        return u;
+    }();
+    buf.resize(pos);   // drop the checksum bytes before hashing
+    const uint64_t computed_cs = idx_checksum(buf);
+    if (stored_cs != computed_cs) return false;
+    // Fill in the rest of DiskEntry.
+    e.serial = 0;   // caller (reload_from_disk) sets it from the filename
+    e.path = std::string();   // caller sets it to the .bin path
+    e.used = 0;   // caller assigns next_used_++
+    // Freshness check: verify the .bin on disk right now matches what the .idx recorded.
+    // If size or mtime differ (the .bin was rewritten or restored), force the slow path.
+    const std::string bin_path = idx_path.substr(0, idx_path.size() - 4) + ".bin";   // .idx → .bin
+    if (!fs::exists(bin_path, ec) || ec) return false;   // .bin gone → .idx is orphan, ignore
+    const uint64_t actual_bin_size = fs::file_size(bin_path, ec);
+    if (ec || actual_bin_size != bin_size) return false;   // size mismatch → fallback
+    const fs::file_time_type actual_ft = fs::last_write_time(bin_path, ec);
+    if (ec) return false;
+    const auto actual_sys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+        actual_ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+    const int64_t actual_mtime_ns = actual_sys.time_since_epoch().count();
+    if (actual_mtime_ns != bin_mtime_ns) return false;   // mtime mismatch → fallback
+    out = std::move(e);
+    out.path = bin_path;
+    return true;
+}
+
+void ConversationDiskStore::remove_spill_files(const std::string& bin_path) {
+    // Best-effort removal of a spill's .bin, .idx and .idx.tmp. The .bin path is the input; the
+    // .idx path replaces the .bin suffix with .idx (NOT .bin + ".idx"). Any of the three may
+    // not exist; all errors are swallowed. Used by every site that today does fs::remove(.bin).
+    std::error_code ec;
+    fs::remove(bin_path, ec);
+    // Derive conv-<serial>.idx from conv-<serial>.bin (replace the last 4 chars ".bin" with ".idx").
+    std::string idx_path = bin_path;
+    if (idx_path.size() > 4 && idx_path.compare(idx_path.size() - 4, 4, ".bin") == 0) {
+        idx_path.replace(idx_path.size() - 4, 4, ".idx");
+    }
+    fs::remove(idx_path, ec);
+    fs::remove(idx_path + ".tmp", ec);
+}
+
 void ConversationDiskStore::erase(size_t index) {
     if (index >= entries_.size()) return;
     entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
@@ -73,14 +352,15 @@ bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
                                 const SessionFileIdentity& id, const SessionWriteOptions& options) {
     if (!enabled()) return false;
     // If this serial is already spilled (re-park of a conversation that came back from disk
-    // and got evicted again), replace it: delete the old file and re-add the entry.
+    // and got evicted again), replace it: delete the old files (.bin + .idx) and re-add the entry.
     if (DiskEntry* existing = find_by_serial(serial)) {
         std::error_code ec;
-        if (fs::remove(existing->path, ec) && !ec) {
-            bytes_ -= existing->file_bytes;
-            const size_t idx = static_cast<size_t>(existing - &entries_.front());
-            erase(idx);
-        }
+        const std::string old_bin = existing->path;
+        const uint64_t old_bytes = existing->file_bytes;
+        const size_t idx = static_cast<size_t>(existing - &entries_.front());
+        erase(idx);   // invalidates `existing`
+        bytes_ -= old_bytes;
+        remove_spill_files(old_bin);
     }
     // Capture the cheap manifest data before we move the image out (kv + checkpoints live on).
     // We mirror what ConversationCache's best() matches against: the live state and the deepest
@@ -134,6 +414,22 @@ bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
     entries_.push_back(std::move(e));
     serials_.push_back(serial);
     ++writes_;
+    // Sidecar .idx: write the manifest metadata next to the .bin so the next start can load
+    // the entry without parsing the full .bin. Best-effort: on failure, log and move on — the
+    // .bin is valid, the slow path (full parse) takes over on the next start and rewrites the
+    // .idx then. The .idx is written AFTER the .bin is published (rename done), so a half-written
+    // .idx never points to a non-existent .bin (it would point to the previous .bin's path,
+    // but write_idx re-stats the .bin and bakes its size/mtime into the .idx, so the freshness
+    // check on reload catches any mismatch and falls back to the slow path).
+    {
+        // entries_.back() is the entry we just pushed (e was moved). We need its data for write_idx.
+        const DiskEntry& just_written = entries_.back();
+        if (!write_idx(just_written, just_written.path, id)) {
+            std::fprintf(stderr, "strata serve: conversation spill: warning: could not write "
+                                 "%s.idx (the .bin is fine; the next start will parse it fully)\n",
+                         just_written.path.c_str());
+        }
+    }
     return true;
 }
 
@@ -171,8 +467,7 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
         // one case where we KEEP the file (the caller's admit said "no RAM now, retry later").
         const bool keep_file = (status.error == SessionError::memory);
         if (!keep_file) {
-            std::error_code ec;
-            fs::remove(path, ec);
+            remove_spill_files(path);   // .bin + .idx + .idx.tmp
         }
         // Remove from manifest regardless: a corrupt or wrong-identity file is dead weight.
         for (size_t i = 0; i < serials_.size(); ++i) {
@@ -184,8 +479,7 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
     for (size_t i = 0; i < serials_.size(); ++i) {
         if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
     }
-    std::error_code ec;
-    fs::remove(path, ec);   // best-effort; an orphan file is harmless (purge_on_startup cleans)
+    remove_spill_files(path);   // .bin + .idx + .idx.tmp (the conversation is back in RAM)
     ++restores_;
     return back;
 }
@@ -197,18 +491,14 @@ bool ConversationDiskStore::evict_oldest() {
     bytes_ -= e.file_bytes;
     entries_.pop_front();
     serials_.pop_front();
-    std::error_code ec;
-    if (!fs::remove(e.path, ec) && ec) {
-        // File already gone (manual cleanup, restart with a stale manifest) — silently move on.
-    }
+    remove_spill_files(e.path);   // .bin + .idx + .idx.tmp — best-effort, all three
     ++drops_;
     return true;
 }
 
 size_t ConversationDiskStore::clear() {
     const size_t n = entries_.size();
-    std::error_code ec;
-    for (const auto& e : entries_) fs::remove(e.path, ec);   // best-effort
+    for (const auto& e : entries_) remove_spill_files(e.path);   // .bin + .idx + .idx.tmp
     entries_.clear();
     serials_.clear();
     bytes_ = 0;
@@ -225,10 +515,15 @@ void ConversationDiskStore::purge_on_startup() {
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
         if (ec) break;
         const std::string name = entry.path().filename().string();
-        // conv-<serial>.bin and any leftover .tmp from an interrupted write.
-        if (name.rfind("conv-", 0) == 0 && (name.size() > 4 && name.compare(name.size() - 4, 4, ".bin") == 0)) {
-            fs::remove(entry.path(), ec);
-        } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+        // conv-<serial>.bin, its sidecar conv-<serial>.idx, and any leftover .tmp from an
+        // interrupted write (.bin.tmp or .idx.tmp). All are removed; other files (e.g. keep.txt
+        // in the test) are left alone.
+        const bool is_bin = name.rfind("conv-", 0) == 0 && name.size() > 4 &&
+                            name.compare(name.size() - 4, 4, ".bin") == 0;
+        const bool is_idx = name.rfind("conv-", 0) == 0 && name.size() > 4 &&
+                            name.compare(name.size() - 4, 4, ".idx") == 0;
+        const bool is_tmp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
+        if (is_bin || is_idx || is_tmp) {
             fs::remove(entry.path(), ec);
         }
     }
@@ -280,13 +575,12 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             try {
                 serial = std::stoull(name.substr(5, name.size() - 9));
             } catch (...) {
-                std::error_code ec2;
-                fs::remove(entry.path(), ec2);   // not a valid conv-<serial>.bin name: drop it
+                remove_spill_files(entry.path().string());   // invalid conv-<serial>.bin name: drop .bin + .idx
                 continue;
             }
             files.push_back({entry.path(), serial});
         } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
-            // Leftover .tmp from an interrupted write: clean it up.
+            // Leftover .tmp from an interrupted write (.bin.tmp or .idx.tmp): clean it up.
             fs::remove(entry.path(), ec);
         }
     }
@@ -300,24 +594,53 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     for (size_t i = 0; i < files.size(); ++i) {
         const auto& path = files[i].path;
         const uint64_t serial = files[i].serial;
+        const std::string bin_path = path.string();
+        // ── Fast path: try the sidecar .idx first. It carries exactly the manifest data we
+        // need (ids, imgs, geometry, layer carve, cvec, file_bytes) without parsing the .bin's
+        // K/V. read_idx validates magic, version, identity, checksum, and freshness (the .bin's
+        // size + mtime on disk must match what the .idx recorded). On any mismatch it returns
+        // false and we fall through to the slow path (full session_file_read).
+        {
+            DiskEntry from_idx;
+            const std::string idx_path = path_for_idx(serial);
+            if (read_idx(idx_path, from_idx, identity)) {
+                from_idx.serial = serial;
+                // from_idx.path was set to the .bin path by read_idx
+                // Budget check: same as the slow path. evict_oldest() pops the oldest (front).
+                while (!entries_.empty() && bytes_ + from_idx.file_bytes > budget_) {
+                    if (!evict_oldest()) break;
+                }
+                if (from_idx.file_bytes > budget_) {
+                    // Single file bigger than the whole budget: drop it (same as slow path).
+                    remove_spill_files(bin_path);
+                    continue;
+                }
+                from_idx.used = next_used_++;
+                entries_.push_back(std::move(from_idx));
+                serials_.push_back(serial);
+                bytes_ += entries_.back().file_bytes;
+                ++loaded;
+                continue;   // .bin not read — that is the whole point of the .idx
+            }
+        }
+        // ── Slow path: .idx missing, corrupt, stale, or wrong-identity. Parse the .bin fully.
         try {
             SavedConversation image;
             size_t bytes_read = 0;
             std::string error;
             SessionStatus status;
-            if (!session_file_read(path.string(), identity, image, bytes_read, error, {}, &status)) {
+            if (!session_file_read(bin_path, identity, image, bytes_read, error, {}, &status)) {
                 // Identity mismatch, corruption, or RAM refusal. For memory (RAM preflight): keep
                 // the file, the next start with more RAM may succeed. Anything else: delete.
                 if (status.error != SessionError::memory) {
-                    std::error_code ec2;
-                    fs::remove(path, ec2);
+                    remove_spill_files(bin_path);   // .bin + .idx + .idx.tmp
                 }
                 continue;
             }
             // Capture the manifest data; the heavy K/V is dropped right after.
             DiskEntry e;
             e.serial = serial;
-            e.path = path.string();
+            e.path = bin_path;
             e.ids = image.live.ids;
             e.imgs = image.live.imgs;
             e.geometry = image.geometry;
@@ -338,6 +661,13 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             serials_.push_back(serial);
             bytes_ += bytes_read;
             ++loaded;
+            // Re-write the .idx that was missing/stale — best-effort, same as put().
+            // On failure the slow path runs again next start; no data loss.
+            if (!write_idx(entries_.back(), bin_path, identity)) {
+                std::fprintf(stderr, "strata serve: conversation spill: warning: could not rewrite "
+                                     "%s.idx after slow-path parse (the .bin is fine)\n",
+                             bin_path.c_str());
+            }
         } catch (const std::bad_alloc&) {
             // RAM exhausted mid-load: stop, keep what we have so far, leave the remaining files
             // on disk for a later reload (when the engine has more free RAM). They are NOT
@@ -384,10 +714,11 @@ size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
         // prefix itself is what the new conversation supersedes, drop. (Phase 2: store the
         // deepest checkpoint's ids/imgs in the manifest too for a more accurate match.)
         if (!e.ids.empty() && held(e.ids, e.imgs)) {
-            std::error_code ec;
-            fs::remove(e.path, ec);
-            bytes_ -= e.file_bytes;
+            const std::string drop_path = e.path;
+            const uint64_t drop_bytes = e.file_bytes;
             erase(i);
+            bytes_ -= drop_bytes;
+            remove_spill_files(drop_path);   // .bin + .idx + .idx.tmp
             ++dropped;
             continue;
         }
@@ -407,10 +738,11 @@ size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
                 if (!found) { imgs_ok = false; break; }
             }
             if (imgs_ok) {
-                std::error_code ec;
-                fs::remove(e.path, ec);
-                bytes_ -= e.file_bytes;
+                const std::string drop_path = e.path;
+                const uint64_t drop_bytes = e.file_bytes;
                 erase(i);
+                bytes_ -= drop_bytes;
+                remove_spill_files(drop_path);   // .bin + .idx + .idx.tmp
                 ++dropped;
                 continue;
             }

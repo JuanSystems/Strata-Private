@@ -454,6 +454,279 @@ int main() {
         check(fs::exists(rdir / "conv-200.bin"), "valid conv-200.bin kept on disk");
     }
 
+    // ── 13. Sidecar .idx: put() writes it ─────────────────────────────────────────────────
+    // After a successful put(), conv-<serial>.idx exists next to the .bin and is small.
+    {
+        const auto rdir = dir / "sidecar_put";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        check(store.put(std::move(sample(100)), 100, id), "put for sidecar test");
+        check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin on disk");
+        check(fs::exists(rdir / "conv-100.idx"), "conv-100.idx sidecar on disk");
+        const uintmax_t bin_size = fs::file_size(rdir / "conv-100.bin");
+        const uintmax_t idx_size = fs::file_size(rdir / "conv-100.idx");
+        check(idx_size > 0, "idx file is non-empty");
+        check(idx_size < bin_size, "idx is smaller than the bin");
+        check(idx_size < 4096, "idx is small (few hundred bytes, not KiB)");
+    }
+
+    // ── 14. Sidecar .idx: fast path reload without parsing the .bin ────────────────────────
+    // Engine A writes a spill, Engine B reloads using the .idx (fast path). The manifest data
+    // (size, bytes, serial, ids, imgs) must match what the slow path would produce.
+    {
+        const auto rdir = dir / "sidecar_fast";
+        // Engine A: write + capture the manifest via slow path (so we have a reference).
+        std::vector<int32_t> ref_ids;
+        std::vector<ConversationImageKey> ref_imgs;
+        uint64_t ref_serial = 0;
+        size_t ref_size = 0;
+        uint64_t ref_bytes = 0;
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.put(std::move(sample(100)), 100, id), "store A put");
+            // The .idx was written by put(). Best() finds the entry and its ids match.
+            std::vector<int32_t> prompt;
+            for (int i = 0; i < 100; ++i) prompt.push_back(int32_t(1000 + i));
+            prompt.push_back(9999);
+            const std::vector<ConversationImageKey> prompt_imgs = {{3, 0x1234567890abcdefull ^ 1}};
+            const auto m = store_a.best(prompt, prompt_imgs, false);
+            check(m.tokens == 100, "store A best() finds 100-token prefix");
+            ref_serial = m.serial;
+            ref_size = store_a.size();
+            ref_bytes = store_a.bytes();
+            const std::vector<int32_t>* e_ids = store_a.entry_ids(0);
+            const std::vector<ConversationImageKey>* e_imgs = store_a.entry_imgs(0);
+            check(e_ids && e_imgs, "store A entry accessors work");
+            ref_ids = *e_ids;
+            ref_imgs = *e_imgs;
+        }
+        // Engine B: reload. The .idx is present and valid → fast path, no .bin parse.
+        {
+            ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = store_b.reload_from_disk(id);
+            check(loaded == 1, "fast-path reloaded 1 entry");
+            check(store_b.size() == ref_size, "size matches slow path");
+            check(store_b.bytes() == ref_bytes, "bytes match slow path");
+            check(store_b.entry_serial(0) == ref_serial, "serial matches slow path");
+            const std::vector<int32_t>* e_ids = store_b.entry_ids(0);
+            const std::vector<ConversationImageKey>* e_imgs = store_b.entry_imgs(0);
+            check(e_ids && *e_ids == ref_ids, "ids match slow path");
+            check(e_imgs && *e_imgs == ref_imgs, "imgs match slow path");
+            // best() finds the prefix too (proves the manifest data is usable, not just present).
+            std::vector<int32_t> prompt;
+            for (int i = 0; i < 100; ++i) prompt.push_back(int32_t(1000 + i));
+            prompt.push_back(9999);
+            const std::vector<ConversationImageKey> prompt_imgs = {{3, 0x1234567890abcdefull ^ 1}};
+            const auto m = store_b.best(prompt, prompt_imgs, false);
+            check(m.tokens == 100, "fast-path best() finds the 100-token prefix");
+            check(fs::exists(rdir / "conv-100.bin"), ".bin kept on disk");
+            check(fs::exists(rdir / "conv-100.idx"), ".idx kept on disk");
+        }
+    }
+
+    // ── 15. Sidecar .idx: fallback when .idx is missing (rewrite on reload) ──────────────
+    // Delete the .idx manually, reload → slow path loads the entry AND rewrites the .idx.
+    {
+        const auto rdir = dir / "sidecar_missing_idx";
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.put(std::move(sample(80)), 100, id), "put for missing-idx test");
+            check(fs::exists(rdir / "conv-100.idx"), ".idx written by put");
+        }
+        // Delete the .idx — reload must fall back to the slow path.
+        fs::remove(rdir / "conv-100.idx");
+        check(!fs::exists(rdir / "conv-100.idx"), ".idx deleted before reload");
+        {
+            ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = store_b.reload_from_disk(id);
+            check(loaded == 1, "slow-path reloaded 1 entry (.idx was missing)");
+            check(store_b.size() == 1, "manifest has 1 entry");
+            // The slow path MUST rewrite the .idx so the next start is fast.
+            check(fs::exists(rdir / "conv-100.idx"), ".idx rewritten by slow path");
+        }
+    }
+
+    // ── 16. Sidecar .idx: fallback when .idx is corrupt (truncated) ───────────────────────
+    // Truncate the .idx to half its size, reload → slow path, .idx rewritten.
+    {
+        const auto rdir = dir / "sidecar_corrupt_idx";
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.put(std::move(sample(70)), 100, id), "put for corrupt-idx test");
+            check(fs::exists(rdir / "conv-100.idx"), ".idx written");
+        }
+        // Truncate the .idx to 10 bytes (way too small for the header).
+        {
+            std::ofstream f(rdir / "conv-100.idx", std::ios::trunc);
+            f << "1234567890";
+        }
+        check(fs::file_size(rdir / "conv-100.idx") == 10, ".idx truncated to 10 bytes");
+        {
+            ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = store_b.reload_from_disk(id);
+            check(loaded == 1, "slow-path reloaded 1 entry (.idx was corrupt)");
+            check(store_b.size() == 1, "manifest has 1 entry");
+            check(fs::file_size(rdir / "conv-100.idx") > 10, ".idx rewritten with valid content");
+        }
+    }
+
+    // ── 17. Sidecar .idx: fallback when identity differs ──────────────────────────────────
+    // A .idx with a different config must NOT be used — the slow path validates the .bin
+    // against THIS engine's identity and rejects it (the .bin was written by another engine).
+    {
+        const auto rdir = dir / "sidecar_wrong_identity";
+        SessionFileIdentity id_a = id;
+        SessionFileIdentity id_b = id;
+        id_b.config = 0xDEADBEEFCAFEBABEull;   // different config → different engine instance
+        // Engine A writes a spill + .idx.
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id_a);
+            check(store_a.put(std::move(sample(60)), 100, id_a), "put with identity A");
+            check(fs::exists(rdir / "conv-100.idx"), ".idx written with identity A");
+        }
+        // Engine B (different identity) reloads. The .idx has id_a.config ≠ id_b.config, so
+        // read_idx returns false. The slow path parses the .bin, finds identity mismatch
+        // (the .bin's header says id_a), and deletes both .bin and .idx (corruption path).
+        {
+            ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id_b);
+            const size_t loaded = store_b.reload_from_disk(id_b);
+            check(loaded == 0, "wrong-identity .idx → slow path → identity mismatch → 0 loaded");
+            check(store_b.size() == 0, "manifest empty (the .bin was from another engine)");
+            check(!fs::exists(rdir / "conv-100.bin"), "wrong-identity .bin deleted");
+            check(!fs::exists(rdir / "conv-100.idx"), "wrong-identity .idx deleted");
+        }
+    }
+
+    // ── 18. Sidecar .idx: fallback when the .bin changed (stale .idx) ────────────────────
+    // Rewrite the .bin with different content (or touch its mtime), leaving the .idx stale.
+    // reload must detect the size/mtime mismatch and fall back to the slow path.
+    {
+        const auto rdir = dir / "sidecar_stale_idx";
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.put(std::move(sample(90)), 100, id), "put for stale-idx test");
+            check(fs::exists(rdir / "conv-100.idx"), ".idx written");
+        }
+        // Overwrite the .bin with garbage (different size). The .idx still says the old size.
+        {
+            std::ofstream f(rdir / "conv-100.bin", std::ios::trunc);
+            for (int i = 0; i < 1000; ++i) f << "X";
+        }
+        // Reload: the .idx's bin_size no longer matches the .bin's actual size → fallback.
+        // The slow path parses the .bin, finds it is not a valid session file (garbage), and
+        // deletes it (corruption path).
+        {
+            ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = store_b.reload_from_disk(id);
+            check(loaded == 0, "stale .idx → slow path → garbage .bin → 0 loaded");
+            check(store_b.size() == 0, "manifest empty");
+            check(!fs::exists(rdir / "conv-100.bin"), "garbage .bin deleted");
+            check(!fs::exists(rdir / "conv-100.idx"), "stale .idx deleted (remove_spill_files)");
+        }
+    }
+
+    // ── 19. Sidecar .idx: coherent deletion (evict, take, clear, drop_superseded) ────────
+    // Every site that deletes a .bin must also delete its .idx. This test exercises evict,
+    // take, and clear; drop_superseded is covered by the integration test.
+    {
+        const auto rdir = dir / "sidecar_deletion";
+        // evict_oldest: write 3 spills with a budget that fits 1, reload → 2 evicted.
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.put(std::move(sample(100)), 100, id), "put 100");
+            check(store_a.put(std::move(sample(100)), 101, id), "put 101");
+            check(store_a.put(std::move(sample(100)), 102, id), "put 102");
+            check(fs::exists(rdir / "conv-100.idx"), ".idx for 100");
+            check(fs::exists(rdir / "conv-101.idx"), ".idx for 101");
+            check(fs::exists(rdir / "conv-102.idx"), ".idx for 102");
+        }
+        // Reload with a budget that fits only 1 → evict 2 oldest (100, 101). Their .idx must go too.
+        {
+            const uint64_t budget_1 = 50000;   // ~1 spill is 40427, 2 is 80854
+            ConversationDiskStore store_b(rdir.string(), budget_1, &id);
+            const size_t loaded = store_b.reload_from_disk(id);
+            check(loaded >= 1, "at least 1 loaded");
+            check(store_b.size() == 1, "only 1 entry fits the budget");
+            check(!fs::exists(rdir / "conv-100.bin"), "evicted 100 .bin gone");
+            check(!fs::exists(rdir / "conv-100.idx"), "evicted 100 .idx gone");
+            check(!fs::exists(rdir / "conv-101.bin"), "evicted 101 .bin gone");
+            check(!fs::exists(rdir / "conv-101.idx"), "evicted 101 .idx gone");
+            check(fs::exists(rdir / "conv-102.bin"), "kept 102 .bin");
+            check(fs::exists(rdir / "conv-102.idx"), "kept 102 .idx");
+            // take() the survivor → its .bin and .idx must go.
+            std::vector<int32_t> prompt;
+            for (int i = 0; i < 100; ++i) prompt.push_back(int32_t(1000 + i));
+            prompt.push_back(9999);
+            const std::vector<ConversationImageKey> prompt_imgs = {{3, 0x1234567890abcdefull ^ 1}};
+            const auto m = store_b.best(prompt, prompt_imgs, false);
+            check(m.tokens == 100, "best finds the survivor");
+            auto back = store_b.take(m, id);
+            check(back.has_value(), "take succeeded");
+            check(!fs::exists(rdir / "conv-102.bin"), "taken 102 .bin gone");
+            check(!fs::exists(rdir / "conv-102.idx"), "taken 102 .idx gone");
+        }
+        // clear(): write 2 more, clear, both .bin and .idx gone.
+        {
+            ConversationDiskStore store_c(rdir.string(), 1ull << 30, &id);
+            check(store_c.put(std::move(sample(50)), 200, id), "put 200");
+            check(store_c.put(std::move(sample(50)), 201, id), "put 201");
+            check(fs::exists(rdir / "conv-200.idx"), ".idx for 200");
+            check(fs::exists(rdir / "conv-201.idx"), ".idx for 201");
+            store_c.clear();
+            check(!fs::exists(rdir / "conv-200.bin"), "clear 200 .bin gone");
+            check(!fs::exists(rdir / "conv-200.idx"), "clear 200 .idx gone");
+            check(!fs::exists(rdir / "conv-201.bin"), "clear 201 .bin gone");
+            check(!fs::exists(rdir / "conv-201.idx"), "clear 201 .idx gone");
+        }
+    }
+
+    // ── 20. Sidecar .idx: orphan .idx (no .bin) is ignored ───────────────────────────────
+    // A .idx without its .bin must not create a phantom entry. read_idx checks the .bin exists.
+    {
+        const auto rdir = dir / "sidecar_orphan_idx";
+        // Drop an orphan .idx (no .bin). reload must ignore it.
+        fs::create_directories(rdir);
+        {
+            std::ofstream f(rdir / "conv-999.idx", std::ios::binary);
+            // Write a minimal valid-looking .idx so we test the .bin-exists check, not the parser.
+            // (Even garbage would be rejected by the checksum, but we want to test the .bin path.)
+            f << "SIDX" << char(1) << char(0) << char(0) << char(0);   // magic + version
+            for (int i = 0; i < 64; ++i) f << char(0);   // 8 × 8 bytes of model/config/geometry/...
+        }
+        check(fs::exists(rdir / "conv-999.idx"), "orphan .idx present");
+        check(!fs::exists(rdir / "conv-999.bin"), "no .bin for the orphan .idx");
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        const size_t loaded = store.reload_from_disk(id);
+        check(loaded == 0, "orphan .idx → 0 loaded");
+        check(store.size() == 0, "manifest empty");
+    }
+
+    // ── 21. purge_on_startup cleans .bin, .idx, .idx.tmp; keeps other files ────────────────
+    {
+        const auto rdir = dir / "sidecar_purge";
+        fs::create_directories(rdir);
+        // Drop a mix of files: a real .bin + .idx pair, an orphan .idx.tmp, an orphan .bin.tmp,
+        // and an unrelated keep.txt that must survive.
+        std::ofstream(rdir / "conv-1.bin") << "bin";
+        std::ofstream(rdir / "conv-1.idx") << "idx";
+        std::ofstream(rdir / "conv-2.idx.tmp") << "idx tmp";
+        std::ofstream(rdir / "conv-3.bin.tmp") << "bin tmp";
+        std::ofstream(rdir / "keep.txt") << "keep me";
+        check(fs::exists(rdir / "conv-1.bin"), "conv-1.bin before purge");
+        check(fs::exists(rdir / "conv-1.idx"), "conv-1.idx before purge");
+        check(fs::exists(rdir / "conv-2.idx.tmp"), "conv-2.idx.tmp before purge");
+        check(fs::exists(rdir / "conv-3.bin.tmp"), "conv-3.bin.tmp before purge");
+        check(fs::exists(rdir / "keep.txt"), "keep.txt before purge");
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            store.purge_on_startup();
+        }
+        check(!fs::exists(rdir / "conv-1.bin"), "conv-1.bin purged");
+        check(!fs::exists(rdir / "conv-1.idx"), "conv-1.idx purged");
+        check(!fs::exists(rdir / "conv-2.idx.tmp"), "conv-2.idx.tmp purged");
+        check(!fs::exists(rdir / "conv-3.bin.tmp"), "conv-3.bin.tmp purged");
+        check(fs::exists(rdir / "keep.txt"), "keep.txt kept");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_store_test: %d checks passed\n", checks);
     return 0;

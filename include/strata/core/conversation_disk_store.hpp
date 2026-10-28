@@ -171,6 +171,18 @@ private:
     std::deque<uint64_t> serials_;   // entries_[i]'s serial, mirrors ConversationCache
 
     std::string path_for(uint64_t serial) const;
+    // Sidecar .idx: <dir>/conv-<serial>.idx — small manifest metadata without parsing the .bin.
+    std::string path_for_idx(uint64_t serial) const;
+    // Write the .idx atomically (temp + rename). Best-effort: on failure returns false, the
+    // .bin is still valid and the next start falls back to a full parse of it.
+    bool write_idx(const DiskEntry& e, const std::string& bin_path, const SessionFileIdentity& id) const;
+    // Read and validate the .idx. Returns false on any I/O/parse/checksum/identity/freshness
+    // error — never throws, never asserts. On success, fills `out` with the manifest data
+    // (path set to the .bin). The caller sets serial, used, and pushes into the manifest.
+    bool read_idx(const std::string& idx_path, DiskEntry& out, const SessionFileIdentity& id) const;
+    // Remove a spill's .bin and its .idx (and the .idx.tmp) — best-effort, all three with
+    // std::error_code. Used by every site that today does fs::remove(.bin).
+    void remove_spill_files(const std::string& bin_path);
     void erase(size_t index);
     DiskEntry* find_by_serial(uint64_t serial);
     const DiskEntry* find_by_serial(uint64_t serial) const;
