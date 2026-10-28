@@ -13314,15 +13314,17 @@ int main(int argc, char** argv) {
                 helper_bytes_before = bytes;
             }
         }
-        // ── Auto-spill después de que el modelo terminó de responder (DONE).
-        // Aprovecha la pausa entre requests para escribir una copia de seguridad en disco.
-        // Si el engine se reinicia antes del siguiente request, la conversación se pierde sin esto.
-        // park_current_body ya hace el spill al disk_store si está activo.
+        // ── Auto-spill al CERRAR el engine (QUIT o EOF en stdin).
+        // Durante la ejecución normal, el spill al disco se hace en park_current_body al inicio
+        // del siguiente request (cuando se parquea la conversación saliente). Pero si el engine
+        // se cierra sin que llegue un siguiente request, la conversación del último turno se
+        // pierde. Este spill final la guarda.
+        // NO se hace después de cada DONE (eso agregaría ~3s de latencia a cada turno).
         if (live_ok && !live.empty() && disk_store_ptr != nullptr && spill_attached) {
-            std::fprintf(stderr, "[strata diag] auto-spill after DONE: parking %zu tokens to disk...\n",
+            std::fprintf(stderr, "[strata diag] auto-spill on shutdown: parking %zu tokens to disk...\n",
                          live.size());
             if (!park_current(0)) {
-                std::fprintf(stderr, "[strata diag] auto-spill after DONE: park_current failed (%s)\n", err.c_str());
+                std::fprintf(stderr, "[strata diag] auto-spill on shutdown: park_current failed (%s)\n", err.c_str());
             }
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
