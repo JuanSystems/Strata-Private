@@ -125,7 +125,7 @@ bool read_le_u8(const std::vector<uint8_t>& buf, size_t& pos, uint8_t& out) {
 std::vector<uint8_t> build_idx_payload(const DiskEntry& e, const SessionFileIdentity& id,
                                        uint64_t bin_size, int64_t bin_mtime_ns) {
     std::vector<uint8_t> buf;
-    buf.reserve(256 + e.ids.size() * 4 + e.imgs.size() * 16);
+    buf.reserve(256 + e.ids.size() * 4 + e.imgs.size() * 16 + e.ckpt_ids.size() * 4 + e.ckpt_imgs.size() * 16);
     for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(kIdxMagic[i]));
     write_le_u32(buf, kIdxVersion);
     write_le_u64(buf, id.model);
@@ -137,10 +137,19 @@ std::vector<uint8_t> build_idx_payload(const DiskEntry& e, const SessionFileIden
     write_le_u64(buf, e.file_bytes);
     write_le_u64(buf, bin_size);
     write_le_i64(buf, bin_mtime_ns);
+    // live ids + imgs
     write_le_u32(buf, uint32_t(e.ids.size()));
-    for (int32_t v : e.ids) write_le_u32(buf, uint32_t(v));   // int32 tokens as uint32 (4 bytes)
+    for (int32_t v : e.ids) write_le_u32(buf, uint32_t(v));
     write_le_u32(buf, uint32_t(e.imgs.size()));
     for (const auto& im : e.imgs) {
+        write_le_i64(buf, im.start);
+        write_le_u64(buf, im.hash);
+    }
+    // checkpoint ids + imgs (the turn boundary — what the next request's prompt actually matches)
+    write_le_u32(buf, uint32_t(e.ckpt_ids.size()));
+    for (int32_t v : e.ckpt_ids) write_le_u32(buf, uint32_t(v));
+    write_le_u32(buf, uint32_t(e.ckpt_imgs.size()));
+    for (const auto& im : e.ckpt_imgs) {
         write_le_i64(buf, im.start);
         write_le_u64(buf, im.hash);
     }
@@ -284,6 +293,26 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
         if (!read_le_i64(buf, pos, start) || !read_le_u64(buf, pos, hash)) return false;
         e.imgs.push_back(ConversationImageKey{start, hash});
     }
+    // Read checkpoint ids + imgs (the turn boundary).
+    {
+        uint32_t n_ckpt_ids = 0;
+        if (!read_le_u32(buf, pos, n_ckpt_ids) || n_ckpt_ids > (1u << 28)) return false;
+        try { e.ckpt_ids.reserve(n_ckpt_ids); } catch (const std::exception&) { return false; }
+        for (uint32_t i = 0; i < n_ckpt_ids; ++i) {
+            uint32_t v = 0;
+            if (!read_le_u32(buf, pos, v)) return false;
+            e.ckpt_ids.push_back(int32_t(v));
+        }
+        uint32_t n_ckpt_imgs = 0;
+        if (!read_le_u32(buf, pos, n_ckpt_imgs) || n_ckpt_imgs > (1u << 20)) return false;
+        try { e.ckpt_imgs.reserve(n_ckpt_imgs); } catch (const std::exception&) { return false; }
+        for (uint32_t i = 0; i < n_ckpt_imgs; ++i) {
+            int64_t start = 0;
+            uint64_t hash = 0;
+            if (!read_le_i64(buf, pos, start) || !read_le_u64(buf, pos, hash)) return false;
+            e.ckpt_imgs.push_back(ConversationImageKey{start, hash});
+        }
+    }
     // Checksum: the last 8 bytes of the buffer must equal idx_checksum(everything before).
     if (pos + 8 > buf.size()) return false;
     const uint64_t stored_cs = [&] {
@@ -371,6 +400,15 @@ bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
     e.path = path_for(serial);
     e.ids = image.live.ids;                  // copy: the manifest keeps these in RAM
     e.imgs = image.live.imgs;
+    // Capture the deepest checkpoint's ids/imgs too — this is the turn boundary that the next
+    // request's prompt actually matches (the client re-renders the history without the
+    // assistant's thinking tokens, so live.ids diverges after the reasoning; ckpt_ids stops
+    // at the <|im_start|> before the new turn, which is what the prompt contains).
+    if (!image.checkpoints.empty()) {
+        const auto& deepest = image.checkpoints.back();
+        e.ckpt_ids = deepest.ids;
+        e.ckpt_imgs = deepest.imgs;
+    }
     e.geometry = image.geometry;
     e.layer_lo = image.layer_lo;
     e.layer_hi = image.layer_hi;
@@ -643,6 +681,12 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             e.path = bin_path;
             e.ids = image.live.ids;
             e.imgs = image.live.imgs;
+            // Capture the deepest checkpoint too (same as put()).
+            if (!image.checkpoints.empty()) {
+                const auto& deepest = image.checkpoints.back();
+                e.ckpt_ids = deepest.ids;
+                e.ckpt_imgs = deepest.imgs;
+            }
             e.geometry = image.geometry;
             e.layer_lo = image.layer_lo;
             e.layer_hi = image.layer_hi;

@@ -35,6 +35,12 @@ struct DiskEntry {
     // checkpoint of a parked conversation (the rest are discarded by session_checkpoints_to_save).
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
+    // The deepest checkpoint's ids/imgs (the turn boundary — what the next request's prompt
+    // actually matches, since the client re-renders the history without the assistant's
+    // thinking tokens). When the live ids don't match the prompt (because of reasoning tokens
+    // the client strips), best() falls back to matching against ckpt_ids.
+    std::vector<int32_t> ckpt_ids;
+    std::vector<ConversationImageKey> ckpt_imgs;
     std::array<int64_t, 18> geometry{};
     int64_t layer_lo = 0, layer_hi = 0;
     bool cvec = true;
@@ -299,7 +305,14 @@ ConversationCache::Match ConversationDiskStore::best(const std::vector<Token>& p
     for (size_t i = entries_.size(); i-- > 0;) {
         const auto& e = entries_[i];
         if (e.cvec != cvec) continue;
-        const int64_t n = detail::best_match_tokens(e.ids, e.imgs, prompt32, images);
+        // Try matching against the live ids first (the full conversation state including
+        // reasoning tokens). If that fails (the client strips thinking tokens), try the
+        // deepest checkpoint's ids (the turn boundary — what the next request's prompt
+        // actually contains).
+        int64_t n = detail::best_match_tokens(e.ids, e.imgs, prompt32, images);
+        if (n <= 0 && !e.ckpt_ids.empty()) {
+            n = detail::best_match_tokens(e.ckpt_ids, e.ckpt_imgs, prompt32, images);
+        }
         if (n > best.tokens) {
             best.tokens = n;
             best.serial = e.serial;
