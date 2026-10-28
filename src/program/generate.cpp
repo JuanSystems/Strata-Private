@@ -11071,7 +11071,16 @@ int main(int argc, char** argv) {
             // ── Lazy spill attach: the disk store needs a SessionFileIdentity to write files bound
             // to this engine. The identity depends on model_fp/config_fp, resolved lazily by
             // session_identity; we attach on the first request that arrives after the model is loaded.
+            // DIAGNOSTIC: log whether the disk store was initialized at startup.
+            if (disk_store_ptr == nullptr) {
+                static bool diag_spill_null_logged = false;
+                if (!diag_spill_null_logged) {
+                    std::fprintf(stderr, "[strata diag] spill: disk_store_ptr is NULL (spill not enabled or budget_gib=0)\n");
+                    diag_spill_null_logged = true;
+                }
+            }
             if (disk_store_ptr != nullptr && !spill_attached) {
+                std::fprintf(stderr, "[strata diag] spill: disk_store_ptr is set, attempting attach...\n");
                 std::string spill_err;
                 if (session_identity(spill_identity, spill_err, nullptr)) {
                     strata::core::attach_spill(conversations, disk_store_ptr, &spill_identity);
@@ -11079,6 +11088,11 @@ int main(int argc, char** argv) {
                     // Phase 3: spills survive engine restarts. Reload the manifest from disk so
                     // a request can restore a conversation the previous engine run spilled.
                     const size_t n_loaded = strata::core::spill_reload_from_disk(disk_store_ptr, spill_identity);
+                    // DIAGNOSTIC: always log the reload result, even when 0, so we can see whether
+                    // the .idx/.bin were found, validated, or rejected.
+                    std::fprintf(stderr, "[strata diag] spill reload: loaded=%zu, manifest=%zu, bytes=%.1f MiB\n",
+                                 n_loaded, disk_store_ptr->size(),
+                                 (double) disk_store_ptr->bytes() / (1024.0 * 1024.0));
                     if (n_loaded > 0) {
                         std::fprintf(stderr, "strata serve: conversation spill: reloaded %zu conversation%s "
                                              "from disk (manifest=%zu, bytes=%.1f MiB)\n",
