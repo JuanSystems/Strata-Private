@@ -12,6 +12,7 @@
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_file.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -354,6 +355,31 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
                         std::fprintf(stderr, " %d", (int) (*e_ids)[k]);
                     const std::vector<ConversationImageKey>* e_imgs = disk->entry_imgs(i);
                     std::fprintf(stderr, " imgs=%zu cvec=%d\n", e_imgs ? e_imgs->size() : 0, (int) cvec);
+                    // Show where the manifest and prompt diverge: compare byte by byte until
+                    // the first mismatch. This tells us exactly which token broke the prefix.
+                    const size_t cmp_n = std::min(e_ids->size(), prompt32.size());
+                    size_t diverge = 0;
+                    while (diverge < cmp_n && (*e_ids)[diverge] == prompt32[diverge]) ++diverge;
+                    if (diverge < cmp_n) {
+                        std::fprintf(stderr, "[strata diag]     diverge at token %zu: manifest=%d prompt=%d\n",
+                                     diverge, (int) (*e_ids)[diverge], (int) prompt32[diverge]);
+                        // Show 3 tokens around the divergence point
+                        const size_t show_start = diverge >= 3 ? diverge - 3 : 0;
+                        const size_t show_end = std::min(diverge + 4, cmp_n);
+                        std::fprintf(stderr, "[strata diag]     around divergence:");
+                        for (size_t k = show_start; k < show_end; ++k) {
+                            const char* mark = (k == diverge) ? ">>" : "  ";
+                            std::fprintf(stderr, " %s[%zu]m=%d p=%d", mark, k, (int) (*e_ids)[k], (int) prompt32[k]);
+                        }
+                        std::fprintf(stderr, "\n");
+                    } else if (e_ids->size() < prompt32.size()) {
+                        std::fprintf(stderr, "[strata diag]     manifest is a strict prefix of prompt "
+                                     "(all %zu tokens match; prompt has %zu more)\n",
+                                     e_ids->size(), prompt32.size() - e_ids->size());
+                    } else if (e_ids->size() == prompt32.size()) {
+                        std::fprintf(stderr, "[strata diag]     manifest and prompt have the same length "
+                                     "and all %zu tokens match — but best() still returned 0?\n", e_ids->size());
+                    }
                 }
             }
         }
