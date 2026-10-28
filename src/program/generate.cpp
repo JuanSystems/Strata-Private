@@ -13306,6 +13306,17 @@ int main(int argc, char** argv) {
                 helper_bytes_before = bytes;
             }
         }
+        // ── Auto-spill después de que el modelo terminó de responder (DONE).
+        // Aprovecha la pausa entre requests para escribir una copia de seguridad en disco.
+        // Si el engine se reinicia antes del siguiente request, la conversación se pierde sin esto.
+        // park_current_body ya hace el spill al disk_store si está activo.
+        if (live_ok && !live.empty() && disk_store_ptr != nullptr && spill_attached) {
+            std::fprintf(stderr, "[strata diag] auto-spill after DONE: parking %zu tokens to disk...\n",
+                         live.size());
+            if (!park_current(0)) {
+                std::fprintf(stderr, "[strata diag] auto-spill after DONE: park_current failed (%s)\n", err.c_str());
+            }
+        }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
