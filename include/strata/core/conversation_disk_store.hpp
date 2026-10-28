@@ -115,14 +115,29 @@ public:
     // sidecar .idx scan to keep spills across restarts.
     void purge_on_startup();
 
-    // Phase 3: spills survive engine restarts. Called once at startup AFTER the engine's
-    // SessionFileIdentity is bound (i.e. after attach_spill on the first request). Scans the
-    // spill dir for conv-*.bin files written by a previous engine run, validates each with
-    // session_file_read (header + identity + payload hash), captures the cheap manifest data
-    // (ids, imgs, geometry, layer carve, cvec, file_bytes) and DROPS the heavy K/V from RAM.
-    // Files that fail validation (corruption, identity mismatch) are deleted; SessionError::memory
-    // (RAM preflight refused) keeps the file for a later engine start. Leftover .tmp files are
-    // cleaned. Returns the number of valid entries loaded.
+    // Reload every valid spill file from disk on engine startup, so a request can restore a
+    // conversation the previous engine run spilled. Scans the spill dir for conv-*.bin files,
+    // validates each with session_file_read (header + identity + payload hash + full parse),
+    // captures the cheap manifest data (ids, imgs, geometry, layer carve, cvec, file_bytes) and
+    // DROPS the heavy K/V from RAM right after.
+    //
+    // The disk budget is enforced by evict_oldest() (the real LRU): files that don't fit are
+    // deleted with proper accounting (drops_++). The spill dir can hold conversations from
+    // multiple sessions, so we no longer assume the highest serial "includes" the others —
+    // every valid file is loaded and the LRU decides what stays.
+    //
+    // Files that fail validation (corruption, identity mismatch, unsupported version) are
+    // deleted: they can never match this engine. A SessionError::memory (RAM preflight refused)
+    // KEEPS the file — the next engine start with more free RAM may succeed. A std::bad_alloc
+    // mid-read stops the loop: the remaining files stay on disk for a later reload (NOT deleted
+    // — they were never validated, and deleting unvalidated files was the bug).
+    //
+    // Iteration order: ASCENDING by serial (oldest first), so entries_ ends up oldest-first
+    // (LRU front = oldest), matching put()'s order. Under budget pressure, evict_oldest()
+    // pops the OLDEST spill (the right one) — never the newest.
+    //
+    // Leftover .tmp files (an interrupted write) are cleaned. Returns the count of files that
+    // were read and pushed into the manifest (NOT the count of survivors — see size()).
     size_t reload_from_disk(const SessionFileIdentity& identity);
 
     // The same drop_superseded contract as ConversationCache's: when a fresh park supersedes
@@ -225,11 +240,18 @@ size_t spill_clear(ConversationDiskStore* disk);
 /// No-op when disk is nullptr.
 void spill_purge_on_startup(ConversationDiskStore* disk);
 
-/// Reload the spill manifest from disk at engine startup (Phase 3: spills survive restarts).
-/// Called after attach_spill binds the engine's SessionFileIdentity. Scans the spill dir,
-/// validates each conv-*.bin against the identity, and rebuilds the manifest. Files that fail
-/// validation are deleted (except SessionError::memory, which keeps the file for a later start
-/// with more free RAM). No-op when disk is nullptr. Returns the count of entries loaded.
+/// Reload the spill manifest from disk at engine startup. Validates and loads EVERY valid
+/// conv-*.bin in the spill dir; the disk budget is enforced by evict_oldest() (the real LRU),
+/// so files that don't fit are deleted with proper accounting (drops_++). The spill dir can
+/// hold conversations from multiple sessions — we no longer assume the highest serial
+/// "includes" the others.
+///
+/// Called after attach_spill binds the engine's SessionFileIdentity. Files that fail
+/// validation (corruption, identity mismatch) are deleted; SessionError::memory keeps the
+/// file for a later start with more free RAM; a std::bad_alloc mid-read stops the loop and
+/// leaves the remaining files on disk (NOT deleted — they were never validated). No-op when
+/// disk is nullptr. Returns the count of files that were read and pushed (NOT the survivors —
+/// see ConversationDiskStore::size()).
 size_t spill_reload_from_disk(ConversationDiskStore* disk, const SessionFileIdentity& identity);
 
 // ── Template implementations ──────────────────────────────────────────────────────────────

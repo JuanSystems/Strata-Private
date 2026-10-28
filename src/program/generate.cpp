@@ -11085,6 +11085,38 @@ int main(int argc, char** argv) {
                                      n_loaded, n_loaded == 1 ? "" : "s", disk_store_ptr->size(),
                                      (double) disk_store_ptr->bytes() / (1024.0 * 1024.0));
                     }
+                    // ── Anti-collision: lift next_direct_spill_serial above the max serial present
+                    // on disk. next_direct_spill_serial starts at 1<<63 on every engine start; the
+                    // first direct spill would re-use the serial of an existing conv-*.bin and put()
+                    // would delete the older file (find_by_serial + fs::remove), losing that parked
+                    // conversation. Scan the dir for conv-<serial>.bin names (including files that
+                    // did NOT load into the manifest — bad_alloc, over-budget evicted, etc.) and
+                    // raise the counter above the max. Public API only: dir(), no new methods.
+                    {
+                        const std::string& spill_dir = disk_store_ptr->dir();
+                        if (!spill_dir.empty()) {
+                            std::error_code ec;
+                            uint64_t max_seen = 0;
+                            bool any_seen = false;
+                            for (const auto& entry : std::filesystem::directory_iterator(spill_dir, ec)) {
+                                if (ec) break;
+                                const std::string name = entry.path().filename().string();
+                                if (name.rfind("conv-", 0) == 0 && name.size() > 9 &&
+                                    name.compare(name.size() - 4, 4, ".bin") == 0) {
+                                    try {
+                                        const uint64_t s = std::stoull(name.substr(5, name.size() - 9));
+                                        if (!any_seen || s > max_seen) { max_seen = s; any_seen = true; }
+                                    } catch (...) {}
+                                }
+                            }
+                            if (any_seen) {
+                                const uint64_t floor = max_seen + 1;
+                                if (floor > next_direct_spill_serial) {
+                                    next_direct_spill_serial = floor;
+                                }
+                            }
+                        }
+                    }
                 } else if (!spill_err.empty()) {
                     std::fprintf(stderr, "strata serve: conversation spill: could not resolve the engine "
                                          "identity yet (%s); the spill stays detached for this request\n",

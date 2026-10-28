@@ -357,13 +357,14 @@ int main() {
         check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin kept on disk after reload (only take() removes it)");
     }
 
-    // ── 11b. reload_from_disk with multiple spills: only the most recent is kept ─────────
-    // The RAM-safety guard: when the dir has multiple spills of the same growing conversation,
-    // only the most recent (longest prefix) is loaded into the manifest. Older spills are
-    // deleted (they are snapshots the new one includes as a prefix).
+    // ── 11b. reload_from_disk with multiple spills: all are loaded (no unconditional deletion) ─
+    // The fix: when the dir has multiple spills (conversations from multiple sessions, or
+    // growing snapshots of the same one), reload_from_disk() validates and loads ALL of them.
+    // The disk budget is enforced by evict_oldest() (the real LRU); older spills are NOT
+    // unconditionally deleted on startup. With an ample budget, all 3 should survive.
     {
         const auto rdir = dir / "reload_multi";
-        // Engine A writes 3 spills with growing serials (mimics 3 requests on the same conversation).
+        // Engine A writes 3 spills with growing serials.
         {
             ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
             check(store_a.put(std::move(sample(100)), 100, id), "put serial 100");
@@ -374,36 +375,83 @@ int main() {
             check(fs::exists(rdir / "conv-101.bin"), "conv-101.bin on disk");
             check(fs::exists(rdir / "conv-102.bin"), "conv-102.bin on disk");
         }
-        // Engine B reloads: only conv-102.bin (most recent) is kept and loaded.
+        // Engine B reloads: with an ample budget, ALL 3 are kept and loaded.
         {
             ConversationDiskStore store_b(rdir.string(), 1ull << 30, &id);
             const size_t loaded = store_b.reload_from_disk(id);
-            check(loaded == 1, "reloaded 1 entry (the most recent) from 3 spills");
-            check(store_b.size() == 1, "store B has 1 entry after reload");
-            check(!fs::exists(rdir / "conv-100.bin"), "older conv-100.bin was deleted");
-            check(!fs::exists(rdir / "conv-101.bin"), "older conv-101.bin was deleted");
-            check(fs::exists(rdir / "conv-102.bin"), "most recent conv-102.bin kept");
+            check(loaded == 3, "reloaded 3 entries (all valid spills loaded)");
+            check(store_b.size() == 3, "store B has 3 entries after reload");
+            check(store_b.bytes() > 0, "store B has bytes after reload");
+            check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin kept on disk");
+            check(fs::exists(rdir / "conv-101.bin"), "conv-101.bin kept on disk");
+            check(fs::exists(rdir / "conv-102.bin"), "conv-102.bin kept on disk");
+            // Iteration order is ASCENDING (oldest first), so entry_serial(0) is the OLDEST
+            // serial (100), entry_serial(2) is the NEWEST (102). This is what makes evict_oldest()
+            // pop the right one under budget pressure (see 11c).
+            check(store_b.entry_serial(0) == 100, "manifest[0] is the oldest serial (100)");
+            check(store_b.entry_serial(1) == 101, "manifest[1] is serial 101");
+            check(store_b.entry_serial(2) == 102, "manifest[2] is the newest serial (102)");
         }
     }
 
-    // ── 12. reload_from_disk deletes corrupt and wrong-identity files ────────────────────
-    // When the most recent file is corrupt, it is deleted; no entries are loaded. Older spills
-    // are still deleted (they were superseded, even if the new one can't be read).
+    // ── 11c. reload_from_disk under budget pressure: oldest evicted, newest kept ──────────
+    // The disk budget is enforced by evict_oldest() (the real LRU). With 3 spills and a budget
+    // that fits only 2, the OLDEST (lowest serial) is evicted — both from the manifest and from
+    // disk. This is the regression test for the ascending-iteration order: if anyone inverts
+    // it (newest first), the NEWEST conversation would be at the front of entries_ and
+    // evict_oldest() would drop the wrong one.
+    {
+        const auto rdir = dir / "reload_budget";
+        // Engine A writes 3 spills with a huge budget, just to populate the dir.
+        {
+            ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
+            check(store_a.put(std::move(sample(100)), 100, id), "put serial 100");
+            check(store_a.put(std::move(sample(200)), 101, id), "put serial 101");
+            check(store_a.put(std::move(sample(300)), 102, id), "put serial 102");
+            check(store_a.size() == 3, "store A has 3 entries");
+            check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin on disk");
+            check(fs::exists(rdir / "conv-101.bin"), "conv-101.bin on disk");
+            check(fs::exists(rdir / "conv-102.bin"), "conv-102.bin on disk");
+            // Each spill file is ~40427 bytes (sample() with 3 KV layers of 4096+ bytes each).
+            // 2 spills = ~80854, 3 spills = ~121281. A budget of 100000 fits 2 but not 3: when
+            // the 3rd is loaded, evict_oldest() pops the 1st (serial 100). `loaded` counts the
+            // files that were read and pushed into the manifest (3); `size()` counts the
+            // survivors (2).
+            {
+                const uint64_t budget_2 = 100000;   // between 80854 (2 spills) and 121281 (3 spills)
+                ConversationDiskStore store_b(rdir.string(), budget_2, &id);
+                check(store_b.budget() == budget_2, "store B budget is the small one");
+                const size_t loaded = store_b.reload_from_disk(id);
+                check(loaded == 3, "reloaded 3 entries (all 3 files were read and pushed)");
+                check(store_b.size() == 2, "store B has 2 entries after LRU eviction (oldest evicted)");
+                check(store_b.entry_serial(0) == 101, "manifest[0] is serial 101 (oldest kept)");
+                check(store_b.entry_serial(1) == 102, "manifest[1] is serial 102 (newest kept)");
+                check(!fs::exists(rdir / "conv-100.bin"), "oldest conv-100.bin evicted from disk");
+                check(fs::exists(rdir / "conv-101.bin"), "conv-101.bin kept on disk");
+                check(fs::exists(rdir / "conv-102.bin"), "conv-102.bin kept on disk");
+                check(store_b.drops() >= 1, "drops() counted the LRU eviction");
+            }
+        }
+    }
+
+    // ── 12. reload_from_disk deletes corrupt files, keeps valid ones ─────────────────────
+    // A corrupt conv-*.bin is deleted (it can never match this engine); a valid one with a
+    // lower serial is loaded into the manifest and KEPT on disk. Under the new contract the
+    // valid file is not "superseded" by the corrupt one — both are independent entries.
     {
         const auto rdir = dir / "reload_corrupt";
         ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
-        // Write a valid spill with a low serial (it would be the "older" one).
+        // Write a valid spill with a low serial.
         SavedConversation original = sample(50);
         check(store.put(std::move(original), 200, id), "put valid spill");
-        // Drop a corrupt conv-*.bin file with a HIGHER serial (so it becomes the "most recent"
-        // and the reload path tries to load it first, fails, and falls back to nothing).
+        // Drop a corrupt conv-*.bin file with a HIGHER serial.
         std::ofstream(rdir / "conv-300.bin") << "garbage not a real session file";
         check(store.size() == 1, "store has 1 valid entry");
         const size_t loaded = store.reload_from_disk(id);
-        check(loaded == 0, "reloaded 0 entries (the most recent was corrupt)");
-        check(store.size() == 0, "manifest empty after reload (corrupt file was deleted)");
+        check(loaded == 1, "reloaded 1 entry (the valid conv-200.bin)");
+        check(store.size() == 1, "manifest has 1 entry after reload");
         check(!fs::exists(rdir / "conv-300.bin"), "corrupt conv-300.bin was deleted");
-        check(!fs::exists(rdir / "conv-200.bin"), "older conv-200.bin was also deleted (superseded)");
+        check(fs::exists(rdir / "conv-200.bin"), "valid conv-200.bin kept on disk");
     }
 
     fs::remove_all(dir);
