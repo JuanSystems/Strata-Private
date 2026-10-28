@@ -8256,6 +8256,14 @@ int main(int argc, char** argv) {
                     {"no_fast_attn", o.no_fast_attn}, {"no_fused_gdn", o.no_fused_gdn},
                     {"no_fast_select", o.no_fast_select}, {"vision", o.vision}};
                 config_fp = strata::core::session_config_fingerprint(c);
+                // DIAGNOSTIC: log the fingerprints so we can compare across restarts and see
+                // which one changed (and thus invalidated the .bin's identity check).
+                std::fprintf(stderr, "[strata diag] session identity: model_fp=%016llx config_fp=%016llx "
+                                     "(version=%s backend=%s kv=%s max_ctx=%lld cvec=%016llx)\n",
+                             (unsigned long long) (model_fp ? *model_fp : 0),
+                             (unsigned long long) *config_fp,
+                             STRATA_VERSION, c.backend.c_str(), c.kv.c_str(),
+                             (long long) c.max_context, (unsigned long long) c.cvec);
             }
             id.model = *model_fp;
             id.config = *config_fp;
