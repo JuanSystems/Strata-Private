@@ -43,6 +43,19 @@ static bool prefix_snapshot(const DiskEntry& e) {
            std::equal(e.ids.begin(), e.ids.end(), e.ckpt_ids.begin());
 }
 
+// Every protection's one predicate: a shared-prefix asset by EITHER signal — the caller said
+// so at write time (e.prefix, the pfx- name), or the entry has the prefix SHAPE (its live ids
+// ARE its deepest checkpoint's; a whole-conversation park never does) which also recognizes
+// prefix files written by older builds under the conv- name.
+static bool is_prefix_entry(const DiskEntry& e) {
+    return e.prefix || prefix_snapshot(e);
+}
+
+// The file-name prefix of a spill kind: conv- (a whole conversation) or pfx- (a shared
+// prefix). reload_from_disk parses the kind back out of the name; everything else flows from
+// DiskEntry::prefix.
+static const char* kind_name(bool prefix) { return prefix ? "pfx-" : "conv-"; }
+
 bool ConversationDiskStore::holds(const std::vector<int32_t>& ids,
                                   const std::vector<ConversationImageKey>& imgs, bool cvec) const {
     if (!enabled() || ids.empty()) return false;
@@ -80,18 +93,29 @@ bool ConversationDiskStore::holds(const std::vector<int32_t>& ids,
     return false;
 }
 
+std::vector<int64_t> ConversationDiskStore::prefix_pin_lengths() const {
+    std::vector<int64_t> out;
+    if (!enabled()) return out;
+    flush_pending();
+    for (const auto& e : entries_)
+        if (is_prefix_entry(e) && !e.ids.empty()) out.push_back((int64_t) e.ids.size());
+    return out;
+}
+
 void ConversationDiskStore::flush_pending() const {
     std::unique_lock<std::mutex> lk(writer_mu_);
     writer_cv_.wait(lk, [&] { return pending_.empty() && !writer_busy_; });
 }
 
 bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial,
-                                      const SessionFileIdentity& id, const SessionWriteOptions& options) {
+                                      const SessionFileIdentity& id, const SessionWriteOptions& options,
+                                      bool prefix) {
     if (!enabled()) return false;
     PendingWrite p;
     p.serial = serial;
     p.id = id;
     p.options = options;
+    p.prefix = prefix;
     p.sup_ids = image.live.ids;        // cheap copies for the post-write superseded cleanup
     p.sup_imgs = image.live.imgs;
     p.sup_cvec = image.cvec;
@@ -99,17 +123,25 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
     bool inline_write = false;   // thread creation failed: write on the calling thread
     {
         std::lock_guard<std::mutex> lk(writer_mu_);
-        // Queue depth 1 (plus the one in the writer's hands): each queued image is hundreds of
-        // MiB of host RAM and Kaggle-class boxes run close to the floor. A second park before
-        // the first lands is the retry loop — the queued (older) capture of the SAME
-        // conversation is superseded by this one, so dropping it is the intent, not a loss.
-        if (!pending_.empty()) {
-            ++async_dropped_;
-            std::fprintf(stderr, "strata serve: conversation spill: background write queue full; "
-                                 "dropping the oldest queued image (%.1f MiB) for this one\n",
-                         (double) pending_.front().image.bytes() / (1024.0 * 1024.0));
-            pending_.pop_front();
-        }
+        // Queue: at most ONE conversation image plus ONE prefix image (plus the one in the
+        // writer's hands). Each queued conversation image is hundreds of MiB of host RAM and
+        // Kaggle-class boxes run close to the floor; a prefix snapshot is tens of MiB. The
+        // back-to-back parks that overflow the queue are the retry loop's earlier capture of
+        // the SAME conversation, superseded by the newer one anyway — but a prefix snapshot's
+        // loss is unrecoverable this run (the engine spills once per pin length), so a queued
+        // prefix is NEVER dropped for an arriving conversation image: each kind only replaces
+        // its own.
+        for (auto it = pending_.begin(); it != pending_.end(); ++it)
+            if (it->prefix == prefix) {
+                ++async_dropped_;
+                std::fprintf(stderr, "strata serve: conversation spill: background write queue "
+                                     "full; dropping the older queued %s image (%.1f MiB) for "
+                                     "this one\n",
+                             prefix ? "prefix" : "conversation",
+                             (double) it->image.bytes() / (1024.0 * 1024.0));
+                pending_.erase(it);
+                break;
+            }
         if (!writer_.joinable()) {
             try {
                 writer_ = std::thread([this] { writer_loop(); });
@@ -126,7 +158,7 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
         // before put). AFTER the write the new entry's ids equal the cleanup's `ids` and the
         // exact-match branch would delete the file we just wrote.
         const size_t superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
-        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options);
+        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
         if (ok && superseded > 0)
             std::fprintf(stderr, "strata serve: conversation spill: write landed (serial %llu) "
                                  "and dropped %zu superseded spill file%s\n",
@@ -153,7 +185,7 @@ void ConversationDiskStore::writer_loop() {
         // before put). AFTER the write the new entry's ids equal the cleanup's `ids` and the
         // exact-match branch would delete the file we just wrote (the async test caught this).
         const size_t superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
-        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options);
+        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
         lk.lock();
         writer_busy_ = false;
         if (!ok)
@@ -205,7 +237,7 @@ ConversationDiskStore::~ConversationDiskStore() {
         pending_.pop_front();
         // same order as the writer: the superseded cleanup runs BEFORE the write
         (void) drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
-        if (!put_impl(std::move(p.image), p.serial, p.id, p.options))
+        if (!put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix))
             std::fprintf(stderr, "strata serve: conversation spill: shutdown drain write FAILED "
                                  "(serial %llu)\n", (unsigned long long) p.serial);
     }
@@ -214,8 +246,8 @@ ConversationDiskStore::~ConversationDiskStore() {
 // Not movable since Phase 2 (the writer thread + mutex + cv); no call site ever moved the
 // store by value — everything holds it as unique_ptr.
 
-std::string ConversationDiskStore::path_for(uint64_t serial) const {
-    return dir_ + "/conv-" + std::to_string(serial) + ".bin";
+std::string ConversationDiskStore::path_for(uint64_t serial, bool prefix) const {
+    return dir_ + "/" + kind_name(prefix) + std::to_string(serial) + ".bin";
 }
 
 // ── Stage files (a layer split's spill) ─────────────────────────────────────────────────────
@@ -358,8 +390,8 @@ uint64_t idx_checksum(const std::vector<uint8_t>& payload) {
 
 }   // anonymous namespace
 
-std::string ConversationDiskStore::path_for_idx(uint64_t serial) const {
-    return dir_ + "/conv-" + std::to_string(serial) + ".idx";
+std::string ConversationDiskStore::path_for_idx(uint64_t serial, bool prefix) const {
+    return dir_ + "/" + kind_name(prefix) + std::to_string(serial) + ".idx";
 }
 
 bool ConversationDiskStore::write_idx(const DiskEntry& e, const std::string& bin_path,
@@ -386,7 +418,14 @@ bool ConversationDiskStore::write_idx(const DiskEntry& e, const std::string& bin
     const uint64_t cs = idx_checksum(payload);
     write_le_u64(payload, cs);
     // Atomic write: temp + rename. The temp file is <idx>.tmp; on any error it is removed.
-    const std::string idx_path = path_for_idx(e.serial);
+    // The .idx path is derived from the .bin path (same name, .idx for .bin), so a prefix
+    // snapshot's sidecar lands next to its pfx-<serial>.bin as pfx-<serial>.idx.
+    std::string idx_path = bin_path;
+    if (idx_path.size() > 4 && idx_path.compare(idx_path.size() - 4, 4, ".bin") == 0) {
+        idx_path.replace(idx_path.size() - 4, 4, ".idx");
+    } else {
+        idx_path = path_for_idx(e.serial, e.prefix);   // defensive fallback: derive from the kind
+    }
     const std::string tmp_path = idx_path + ".tmp";
     try {
         std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
@@ -585,15 +624,33 @@ const DiskEntry* ConversationDiskStore::find_by_serial(uint64_t serial) const {
 }
 
 bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
-                                const SessionFileIdentity& id, const SessionWriteOptions& options) {
+                                const SessionFileIdentity& id, const SessionWriteOptions& options,
+                                bool prefix) {
     if (!enabled()) return false;
     flush_pending();   // never two writers at once; the sync path writes on the calling thread
-    return put_impl(std::move(image), serial, id, options);
+    return put_impl(std::move(image), serial, id, options, prefix);
 }
 
 bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
-                                const SessionFileIdentity& id, const SessionWriteOptions& options) {
+                                const SessionFileIdentity& id, const SessionWriteOptions& options,
+                                bool prefix) {
     if (!enabled()) return false;
+    // A prefix write whose exact prefix is already held is a SUCCESSFUL no-op: the engine spills
+    // a pin once per run, but after a restart it does not know a previous run already wrote the
+    // same file, and two identical pfx-<serial>.bin files (one per run) would waste the budget
+    // forever — the prefix protections never clean a duplicate. (Runs on the writer thread for
+    // put_async: entries_ is only mutated between flushes, which is this thread's own window.)
+    if (prefix) {
+        for (const DiskEntry& held : entries_) {
+            if (!is_prefix_entry(held) || held.cvec != image.cvec || held.ids != image.live.ids ||
+                held.imgs != image.live.imgs)
+                continue;
+            std::fprintf(stderr, "strata serve: prefix cache: the disk already holds these %zu "
+                                 "shared tokens (%s) — pfx-%llu.bin not written again\n",
+                         held.ids.size(), held.path.c_str(), (unsigned long long) serial);
+            return true;
+        }
+    }
     // If this serial is already spilled (re-park of a conversation that came back from disk
     // and got evicted again), replace it: delete the old files (.bin + .idx) and re-add the entry.
     if (DiskEntry* existing = find_by_serial(serial)) {
@@ -611,7 +668,8 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
     // image.checkpoints will hold it (and best() below consults both).
     DiskEntry e;
     e.serial = serial;
-    e.path = path_for(serial);
+    e.prefix = prefix;
+    e.path = path_for(serial, prefix);
     e.ids = image.live.ids;                  // copy: the manifest keeps these in RAM
     e.imgs = image.live.imgs;
     // Capture the deepest checkpoint's ids/imgs too — this is the turn boundary that the next
@@ -789,8 +847,13 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
     // file — the user wants conversations preserved on disk. The file will be replaced only
     // when a newer spill of the same conversation is written (drop_superseded), or evicted by
     // the LRU when the disk budget is exceeded.
-    for (size_t i = 0; i < serials_.size(); ++i) {
-        if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
+    // A shared-prefix entry is NOT consumed: many conversations branch from it (the first
+    // request of every new chat restores it), so it stays in the manifest AND on disk — the
+    // next sibling conversation finds it there instead of recomputing the system prompt.
+    if (!is_prefix_entry(*e)) {
+        for (size_t i = 0; i < serials_.size(); ++i) {
+            if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
+        }
     }
     // NO borrar el archivo. La conversación está en RAM pero el archivo se queda en disco
     // como copia de seguridad. Si el engine se reinicia, el archivo sigue ahí.
@@ -805,7 +868,7 @@ bool ConversationDiskStore::evict_oldest() {
     // first request restores one), so a budget squeeze takes an ordinary conversation first.
     // With only prefixes left, the oldest still goes: a full disk must not wedge parking.
     size_t victim = 0;
-    while (victim < entries_.size() && prefix_snapshot(entries_[victim])) ++victim;
+    while (victim < entries_.size() && is_prefix_entry(entries_[victim])) ++victim;
     if (victim >= entries_.size()) victim = 0;
     const DiskEntry e = std::move(entries_[victim]);
     bytes_ -= e.file_bytes;
@@ -836,12 +899,14 @@ void ConversationDiskStore::purge_on_startup() {
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
         if (ec) break;
         const std::string name = entry.path().filename().string();
-        // conv-<serial>.bin, its sidecar conv-<serial>.idx, and any leftover .tmp from an
-        // interrupted write (.bin.tmp or .idx.tmp). All are removed; other files (e.g. keep.txt
-        // in the test) are left alone.
-        const bool is_bin = name.rfind("conv-", 0) == 0 && name.size() > 4 &&
+        // conv-<serial>.bin / pfx-<serial>.bin (a shared-prefix snapshot), their sidecars .idx,
+        // and any leftover .tmp from an interrupted write (.bin.tmp or .idx.tmp). All are
+        // removed; other files (e.g. keep.txt in the test) are left alone.
+        const bool named_conv = name.rfind("conv-", 0) == 0;
+        const bool named_pfx = name.rfind("pfx-", 0) == 0;
+        const bool is_bin = (named_conv || named_pfx) && name.size() > 4 &&
                             name.compare(name.size() - 4, 4, ".bin") == 0;
-        const bool is_idx = name.rfind("conv-", 0) == 0 && name.size() > 4 &&
+        const bool is_idx = (named_conv || named_pfx) && name.size() > 4 &&
                             name.compare(name.size() - 4, 4, ".idx") == 0;
         const bool is_tmp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
         if (is_bin || is_idx || is_tmp) {
@@ -882,14 +947,15 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     bytes_ = 0;
     std::error_code ec;
     if (!fs::exists(dir_, ec)) return 0;
-    // Collect conv-*.bin files sorted by serial (filename sorts lexicographically the same
-    // as numeric for the decimal form std::to_string produces, so the LRU order entries_ is
-    // built oldest-first — mirrors the order put() inserts at).
-    struct SpillFile { fs::path path; uint64_t serial; };
+    // Collect conv-*.bin / pfx-*.bin files sorted by serial (filename sorts lexicographically
+    // the same as numeric for the decimal form std::to_string produces, so the LRU order entries_
+    // is built oldest-first — mirrors the order put() inserts at).
+    struct SpillFile { fs::path path; uint64_t serial; bool prefix; };
     std::vector<SpillFile> files;
     // A layer split's stage files (conv-<serial>.stage<k>.bin): collected to clean orphans and
     // to keep them from being mistaken for mains — "conv-808.stage0.bin" ends in .bin and its
-    // digits parse to 808, which would load serial 808 twice.
+    // digits parse to 808, which would load serial 808 twice. A prefix snapshot has no stages
+    // (the prefix spill is single-GPU), so a pfx-<serial>.stage* name is junk and is removed.
     std::vector<std::pair<fs::path, uint64_t>> stage_files;
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
         if (ec) break;
@@ -899,30 +965,39 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             fs::remove(entry.path(), ec);
             continue;
         }
-        if (name.rfind("conv-", 0) != 0 || name.size() <= 5) continue;
-        // conv-<digits>.<tail>: the serial runs to the first '.', the tail names the file's
-        // role — "bin" the main, "idx" the sidecar, "stage<k>.bin" a later stage's image.
-        size_t p = 5;
+        // <kind>-<digits>.<tail>: kind is "conv" (a whole conversation) or "pfx" (a shared-prefix
+        // snapshot); the serial runs to the first '.', the tail names the file's role — "bin"
+        // the main, "idx" the sidecar, "stage<k>.bin" a later stage's image.
+        const bool is_pfx = name.rfind("pfx-", 0) == 0;
+        if (!is_pfx && name.rfind("conv-", 0) != 0) continue;
+        const size_t digits0 = is_pfx ? 4 : 5;
+        if (name.size() <= digits0 + 1) continue;
+        size_t p = digits0;
         while (p < name.size() && name[p] >= '0' && name[p] <= '9') ++p;
-        if (p == 5 || p >= name.size() || name[p] != '.') {
-            // Not conv-<digits>.… — a junk conv-*.bin name (the old scan removed these): drop it
-            // with its sidecar. A conv-.bin (9 chars) is left alone, as before.
+        if (p == digits0 || p >= name.size() || name[p] != '.') {
+            // Not <kind>-<digits>.… — a junk conv-*.bin / pfx-*.bin name (the old scan removed
+            // these): drop it with its sidecar. A conv-.bin (9 chars) is left alone, as before.
             if (name.size() > 9 && name.compare(name.size() - 4, 4, ".bin") == 0)
                 remove_spill_files(entry.path().string());
             continue;
         }
         uint64_t serial = 0;
         try {
-            serial = std::stoull(name.substr(5, p - 5));
+            serial = std::stoull(name.substr(digits0, p - digits0));
         } catch (...) {
             remove_spill_files(entry.path().string());   // invalid serial: drop .bin + .idx (+ stages)
             continue;
         }
         const std::string tail = name.substr(p + 1);
         if (tail == "bin") {
-            files.push_back({entry.path(), serial});
+            files.push_back({entry.path(), serial, is_pfx});
         } else if (tail.rfind("stage", 0) == 0) {
-            stage_files.push_back({entry.path(), serial});
+            if (is_pfx) {
+                std::error_code rm;
+                fs::remove(entry.path(), rm);   // junk: a prefix snapshot has no stage files
+            } else {
+                stage_files.push_back({entry.path(), serial});
+            }
         }
         // ".idx" (and anything else) is read through path_for_idx, not scanned here
     }
@@ -946,6 +1021,7 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     for (size_t i = 0; i < files.size(); ++i) {
         const auto& path = files[i].path;
         const uint64_t serial = files[i].serial;
+        const bool is_pfx = files[i].prefix;
         const std::string bin_path = path.string();
         // ── Fast path: try the sidecar .idx first. It carries exactly the manifest data we
         // need (ids, imgs, geometry, layer carve, cvec, file_bytes) without parsing the .bin's
@@ -954,9 +1030,10 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
         // false and we fall through to the slow path (full session_file_read).
         {
             DiskEntry from_idx;
-            const std::string idx_path = path_for_idx(serial);
+            const std::string idx_path = path_for_idx(serial, is_pfx);
             if (read_idx(idx_path, from_idx, identity)) {
                 from_idx.serial = serial;
+                from_idx.prefix = is_pfx;   // the kind lives in the file name; the .idx payload does not carry it
                 // from_idx.path was set to the .bin path by read_idx
                 // Budget check: same as the slow path. evict_oldest() pops the oldest (front).
                 while (!entries_.empty() && bytes_ + from_idx.file_bytes > budget_) {
@@ -996,6 +1073,7 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             // Capture the manifest data; the heavy K/V is dropped right after.
             DiskEntry e;
             e.serial = serial;
+            e.prefix = is_pfx;
             e.path = bin_path;
             e.ids = image.live.ids;
             e.imgs = image.live.imgs;
@@ -1011,8 +1089,10 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             e.cvec = image.cvec;
             // The .bin parse covers the main image only; a layer split's stage files belong to
             // this entry too (put() counted them into its file_bytes, and the fresh .idx fast
-            // path carries that total — the slow path must arrive at the same number).
-            e.file_bytes = bytes_read + stage_files_bytes(serial);
+            // path carries that total — the slow path must arrive at the same number). A prefix
+            // snapshot has no stages (single GPU, one image), so the scan is skipped: it would
+            // look at conv-<serial>.stage* — another kind's name space.
+            e.file_bytes = bytes_read + (is_pfx ? 0 : stage_files_bytes(serial));
             e.used = next_used_++;
             { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
             // LRU evict if over budget: drop the oldest entries (the front of entries_, which
@@ -1085,7 +1165,7 @@ size_t ConversationDiskStore::dedupe_loaded() {
     for (size_t i = 0; i < entries_.size();) {
         // A pinned shared prefix is never "an older duplicate of this conversation": every
         // conversation of the same client contains it, which is exactly why it stays.
-        if (prefix_snapshot(entries_[i])) { ++i; continue; }
+        if (is_prefix_entry(entries_[i])) { ++i; continue; }
         bool superseded = false;
         for (size_t j = i + 1; j < entries_.size() && !superseded; ++j) {
             if (entries_[j].cvec != entries_[i].cvec || entries_[j].ids.empty()) continue;
@@ -1157,7 +1237,7 @@ size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& i
     for (size_t i = 0; i < entries_.size();) {
         const auto& e = entries_[i];
         if (e.cvec != cvec) { ++i; continue; }
-        if (prefix_snapshot(e)) { ++i; continue; }   // a pinned shared prefix: not this conversation's branch
+        if (is_prefix_entry(e)) { ++i; continue; }   // a pinned shared prefix: not this conversation's branch
         // The deepest checkpoint the spill file carries is the one ConversationCache handed to
         // session_checkpoints_to_save. The manifest only stores the live prefix; if the live
         // prefix itself is what the new conversation supersedes, drop. (Phase 2: store the

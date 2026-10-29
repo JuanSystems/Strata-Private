@@ -1630,19 +1630,28 @@ class SharedPrefix(unittest.TestCase):
         self.assertEqual(self.tok.decode(ids[:req["strata_prefix"]["tokens"]]).split("user\n", 1)[1], "DOC " * 40)
 
     def test_without_the_field_nothing_changes(self):
+        # The client sent no strata_prefix: its own sampling keys are untouched and the ids are
+        # the same as a req-less call. The AUTO prefix still injects itself here — MSGS is a
+        # conversation with a leading system message, which is exactly what the feature pins —
+        # but nothing else about the request changes (and a client that sends nothing is never
+        # refused).
         req = {"temperature": 0}
         ids, _, _ = self.svc.prepare(self.MSGS, None, {}, 16, req=req)
-        self.assertEqual(req, {"temperature": 0})
+        self.assertEqual(req["temperature"], 0)                      # the client's own key survives
+        self.assertIn("tokens", req.get("strata_prefix", {}), req)   # the auto prefix resolved
         self.assertEqual(ids, self.svc.prepare(self.MSGS, None, {}, 16)[0])
 
 
 class AutoPrefix(unittest.TestCase):
-    """The prefix cache: a NEW conversation's first turn (its system message(s) plus exactly one
-    more message) resolves to strata_prefix {"messages": k} even when the client said nothing —
-    an agent client re-sends the same long system prompt for every conversation, and the engine
-    pins it once so every first request restores it instead of recomputing. Everything else (a
-    mid-conversation turn, an explicit strata_prefix, a one-shot probe, no leading system
-    message, STRATA_AUTO_PREFIX=0) is left exactly as before."""
+    """The prefix cache: a conversation with leading system/developer message(s) — its FIRST turn
+    and every CONTINUING turn — resolves to strata_prefix {"messages": k} even when the client
+    said nothing. An agent client re-sends the same long system prompt for every conversation;
+    the first request arms the pin, and the later ones re-mark the SAME boundary — what recovers
+    the pin flag on a conversation restored from a spill file after a restart (the flag is not
+    serialized, but the file's deepest checkpoint IS the pin boundary, so the re-mark re-flags
+    it and the idle backup can spill the small pfx-*.bin). Everything else (an explicit
+    strata_prefix, a one-shot probe, no leading system message, STRATA_AUTO_PREFIX=0) is left
+    exactly as before."""
 
     @classmethod
     def setUpClass(cls):
@@ -1665,10 +1674,19 @@ class AutoPrefix(unittest.TestCase):
         self.assertTrue(text.endswith("agent.<|im_end|>\n"), text[-40:])   # right where the user turn starts
         self.assertEqual(self.tok.decode(ids[n:n + 1]), "<|im_start|>")
 
-    def test_later_turns_and_other_requests_are_left_alone(self):
+    def test_later_turns_remark_the_same_pin(self):
+        # A continuing turn carries the SAME pin as the first one: the rendered system part is
+        # byte-identical, so both resolve to the same boundary — the later request re-marks the
+        # pinned checkpoint instead of arming a new pin.
         req = {}
-        self.svc.prepare(self.later_turn, None, {}, 16, req=req)          # four messages: not a first turn
-        self.assertNotIn("strata_prefix", req)
+        self.svc.prepare(self.first_turn, None, {}, 16, req=req)
+        first_n = req["strata_prefix"]["tokens"]
+        req = {}
+        ids, _, _ = self.svc.prepare(self.later_turn, None, {}, 16, req=req)
+        self.assertIn("strata_prefix", req, req)              # a mid-conversation turn carries it too
+        self.assertEqual(req["strata_prefix"]["tokens"], first_n)
+        self.assertTrue(self.tok.decode(ids[:first_n], errors="replace").endswith("agent.<|im_end|>\n"))
+        # Everything that must stay exactly as before:
         req = {"strata_prefix": {"tokens": 7}}                              # an explicit one wins
         self.svc.prepare(self.first_turn, None, {}, 16, req=req)
         self.assertEqual(req["strata_prefix"], {"tokens": 7})

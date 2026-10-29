@@ -543,10 +543,148 @@ int main() {
                                                    /*resume*/ 0, /*slot_tokens*/ 0, id);
         check(from_disk.has_value(), "the escalation restored the pinned prefix, not nothing");
         check(from_disk->live.ids.size() == 150, "the restored image is the 150-token prefix");
-        check(store->size() == 0, "both entries left the manifest (one restored, one refused)");
+        // The corrupt whole left the manifest; the pinned prefix was RESTORED but not CONSUMED —
+        // a shared asset many conversations branch from stays in the manifest and on disk (the
+        // next sibling conversation restores it again instead of recomputing the system prompt).
+        check(store->size() == 1, "the prefix snapshot stayed in the manifest (a shared asset)");
+        check(fs::exists(dir / "build14" / "conv-700.bin"), "the prefix snapshot's file stayed");
         check(!from_disk->checkpoints.empty() &&
               from_disk->checkpoints.back().ids.size() == 150,
               "the restored prefix carries its pinned checkpoint (the engine re-marks pin=N)");
+    }
+
+    // ── 15. pfx-<serial>.bin: the prefix snapshot has its OWN name, dedup, and protections ───
+    // The user asked to tell the cross-conversation cache (zoocode's shared system prompt)
+    // apart from the conversations at a glance: a prefix-kind write lands as pfx-<serial>.bin
+    // (conversations stay conv-<serial>.bin), a duplicate of a prefix the disk already holds is
+    // a successful no-op (a restart's first request must not pile up identical files), take()
+    // does not consume the entry, reload recognizes the kind from the NAME on both paths, the
+    // LRU prefers to keep it, and purge_on_startup cleans it too.
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "build15").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        const fs::path d15 = dir / "build15";
+
+        // A pinned-prefix snapshot, written as the prefix kind.
+        SavedConversation prefix = sample(150);
+        prefix.checkpoints.clear();
+        prefix.checkpoints.push_back(prefix.live);   // live IS the checkpoint at the pin
+        check(store->put(std::move(prefix), 800, id, {}, true), "put the prefix snapshot (kind=prefix)");
+        check(fs::exists(d15 / "pfx-800.bin"), "the prefix snapshot is pfx-800.bin (not conv-800.bin)");
+        check(fs::exists(d15 / "pfx-800.idx"), "its sidecar is pfx-800.idx");
+        check(!fs::exists(d15 / "conv-800.bin"), "no conv-800.bin for a prefix write");
+        check(store->prefix_pin_lengths() == std::vector<int64_t>{150},
+              "prefix_pin_lengths reports the held pin (150)");
+
+        // The same prefix again (what a restart's first request would do before the engine's
+        // held-set skip): a SUCCESSFUL no-op — no duplicate file, the manifest unchanged.
+        SavedConversation again = sample(150);
+        again.checkpoints.clear();
+        again.checkpoints.push_back(again.live);
+        check(store->put(std::move(again), 801, id, {}, true), "the duplicate prefix put succeeds");
+        check(store->size() == 1, "the duplicate prefix was not written");
+        check(!fs::exists(d15 / "pfx-801.bin"), "no pfx-801.bin duplicate");
+
+        // take() does not consume it: the image is restored, the entry stays for the next
+        // sibling conversation, and the file stays as the on-disk asset.
+        std::vector<int32_t> prompt;
+        for (int i = 0; i < 150; ++i) prompt.push_back(int32_t(1000 + i));
+        prompt.push_back(9999);   // one more: conversation_prefix needs n < prompt.size()
+        const std::vector<ConversationImageKey> imgs = {{3, 0x1234567890abcdefull ^ 1ull}};
+        const auto m = store->best(prompt, imgs, false);
+        check(m.tokens == 150, "best() matches the prefix snapshot");
+        auto taken = store->take(m, id);
+        check(taken.has_value() && taken->live.ids.size() == 150, "the prefix snapshot restores");
+        check(store->size() == 1, "take() did not consume the shared prefix entry");
+        check(fs::exists(d15 / "pfx-800.bin"), "the prefix snapshot's file stayed after the take");
+
+        // Reload (a restart): the .idx fast path recognizes the kind from the NAME; the entry
+        // survives the same-conversation dedupe and reports the pin length again.
+        auto store_b = make_disk_store(cfg, &id);
+        check(store_b->reload_from_disk(id) == 1, "reload loaded the prefix snapshot");
+        check(store_b->size() == 1, "the prefix survived the reload dedupe");
+        check(store_b->prefix_pin_lengths() == std::vector<int64_t>{150},
+              "the fast path re-derived the prefix kind from the pfx- name");
+        // The slow path too: delete the sidecar so reload must parse the .bin fully.
+        fs::remove(d15 / "pfx-800.idx");
+        auto store_c = make_disk_store(cfg, &id);
+        check(store_c->reload_from_disk(id) == 1, "reload loaded the prefix snapshot (slow path)");
+        check(store_c->prefix_pin_lengths() == std::vector<int64_t>{150},
+              "the slow path re-derived the prefix kind from the pfx- name");
+        check(fs::exists(d15 / "pfx-800.idx"), "the slow path rewrote the sidecar as pfx-800.idx");
+
+        // The disk LRU prefers to keep the prefix: measure the real file sizes AND the host
+        // footprint estimate put_impl charges against the budget, then a store whose budget
+        // fits the prefix plus exactly ONE conversation — the second conversation's put must
+        // evict the older CONVERSATION (the prefix at the LRU's front is skipped), not the
+        // prefix. (The estimate and the on-disk bytes differ by the file's overhead, so the
+        // budget has to cover the larger of the two.)
+        uint64_t pfx_size = 0, conv_size = 0;
+        {
+            SpillConfig measure;
+            measure.path = (dir / "build15m").string();
+            measure.budget_gib = 1;
+            auto big = make_disk_store(measure, &id);
+            SavedConversation p = sample(150);
+            p.checkpoints.clear();
+            p.checkpoints.push_back(p.live);
+            check(big->put(std::move(p), 810, id, {}, true), "measure: put the prefix");
+            pfx_size = big->bytes();
+            SavedConversation a = sample(300);
+            for (size_t i = 0; i < a.live.ids.size(); ++i) a.live.ids[i] += 5000;   // distinct
+            for (auto& k : a.checkpoints) for (auto& t : k.ids) t += 5000;
+            const uint64_t est_a = a.bytes();
+            check(big->put(std::move(a), 811, id), "measure: put conversation A");
+            conv_size = big->bytes() - pfx_size;
+            check(pfx_size > 0 && conv_size > 0, "measured both file sizes");
+            conv_size = std::max(conv_size, est_a);   // what the budget comparison actually sees
+        }
+        {
+            const fs::path rp = dir / "build15b";
+            ConversationDiskStore keep(rp.string(), pfx_size + conv_size, &id);
+            SavedConversation p = sample(150);
+            p.checkpoints.clear();
+            p.checkpoints.push_back(p.live);
+            check(keep.put(std::move(p), 810, id, {}, true), "put the prefix in the tight store");
+            SavedConversation conv_a = sample(300);
+            for (size_t i = 0; i < conv_a.live.ids.size(); ++i) conv_a.live.ids[i] += 5000;   // distinct
+            for (auto& k : conv_a.checkpoints) for (auto& t : k.ids) t += 5000;
+            check(keep.put(std::move(conv_a), 811, id), "put conversation A (the budget exactly fits)");
+            SavedConversation conv_b = sample(300);
+            for (size_t i = 0; i < conv_b.live.ids.size(); ++i) conv_b.live.ids[i] += 9000;   // distinct
+            for (auto& k : conv_b.checkpoints) for (auto& t : k.ids) t += 9000;
+            check(keep.put(std::move(conv_b), 812, id), "put conversation B");
+            bool has_pfx = false, has_a = false, has_b = false;
+            for (size_t i = 0; i < keep.size(); ++i) {
+                has_pfx = has_pfx || keep.entry_serial(i) == 810;
+                has_a = has_a || keep.entry_serial(i) == 811;
+                has_b = has_b || keep.entry_serial(i) == 812;
+            }
+            check(has_pfx, "the prefix survived the tight budget (the LRU skipped it)");
+            check(!has_a, "the OLDER conversation was evicted for the new one");
+            check(has_b, "the newest conversation survived");
+            check(keep.prefix_pin_lengths() == std::vector<int64_t>{150},
+                  "the prefix is still reported after the LRU evictions");
+        }
+
+        // purge_on_startup cleans pfx-* like conv-*: a disabled-spill start must not leave
+        // stale prefix files behind (and keep.txt is still left alone).
+        {
+            const fs::path rp = dir / "build15c";
+            fs::create_directories(rp);
+            { std::ofstream(rp / "pfx-9.bin", std::ios::trunc) << "x";
+              std::ofstream(rp / "pfx-9.idx", std::ios::trunc) << "x";
+              std::ofstream(rp / "conv-7.bin", std::ios::trunc) << "x";
+              std::ofstream(rp / "keep.txt", std::ios::trunc) << "x"; }
+            ConversationDiskStore purged(rp.string(), 0, &id);   // budget 0: disabled, purge-only
+            purged.purge_on_startup();
+            check(!fs::exists(rp / "pfx-9.bin"), "pfx-9.bin purged");
+            check(!fs::exists(rp / "pfx-9.idx"), "pfx-9.idx purged");
+            check(!fs::exists(rp / "conv-7.bin"), "conv-7.bin purged");
+            check(fs::exists(rp / "keep.txt"), "keep.txt kept");
+        }
     }
 
     fs::remove_all(dir);

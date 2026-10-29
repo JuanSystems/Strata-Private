@@ -3991,16 +3991,22 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
-        # Prefix cache (auto): a NEW conversation's first turn — k leading system/developer message(s)
-        # plus exactly ONE more message — pins the rendered system part as the shared prefix, exactly
-        # as if the client had sent strata_prefix {"messages": k} itself (resolve_prefix below then
-        # turns it into {"tokens": N} and the request key gets pin=N). An agent client (a coding
-        # assistant) re-sends the same long system prompt for every conversation, so pinning it once
-        # lets the engine restore those tokens for each new conversation's first request instead of
-        # recomputing them. Only requests that say nothing get it (an explicit strata_prefix wins),
-        # never with images, never a one-shot strata_checkpoint:false probe, and never a mid-
-        # conversation turn (more than one non-system message): the pinned checkpoint is marked once
-        # at the conversation's start and re-used from the chain after. STRATA_AUTO_PREFIX=0 disables.
+        # Prefix cache (auto): a conversation with k leading system/developer message(s) plus at
+        # least one more — a NEW conversation's first turn (k + exactly ONE more) and every
+        # CONTINUING turn (k + more than one) — carries strata_prefix {"messages": k}, exactly
+        # as if the client had sent it itself (resolve_prefix below then turns it into
+        # {"tokens": N} and the request key gets pin=N). An agent client (a coding assistant)
+        # re-sends the same long system prompt for every conversation, so pinning it once lets
+        # the engine restore those tokens for each new conversation's first request instead of
+        # recomputing them. On a new chat the engine ARMS the pin (reads the prompt in two parts
+        # at the boundary and pins the checkpoint); on a continuing turn it can only RE-MARK the
+        # checkpoint — which is exactly what recovers the pin flag after a restart: the flag is
+        # not serialized in the spill file, but a pinned conversation's file KEEPS the pinned
+        # checkpoint as its deepest (session_deepest_checkpoint prefers it), so the restored
+        # conversation re-flags it from the request's pin=N and the idle backup can then spill
+        # the small pfx-*.bin snapshot. Only requests that say nothing get it (an explicit
+        # strata_prefix wins), never with images, never a one-shot strata_checkpoint:false probe.
+        # STRATA_AUTO_PREFIX=0 disables.
         if (req is not None and isinstance(req, dict) and req.get("strata_prefix") is None
                 and self.auto_prefix and not images and req.get("strata_checkpoint") is not False
                 and isinstance(messages, list) and len(messages) >= 2):
@@ -4008,7 +4014,7 @@ class Service:
             while (k < len(messages) and isinstance(messages[k], dict)
                    and messages[k].get("role") in ("system", "developer")):
                 k += 1
-            if 1 <= k < len(messages) and k + 1 == len(messages):
+            if 1 <= k < len(messages):
                 req["strata_prefix"] = {"messages": k}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))

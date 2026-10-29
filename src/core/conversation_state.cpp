@@ -296,6 +296,38 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     return true;
 }
 
+bool conversation_snapshot_save_from_ckpt(SavedConversation& image, const ConversationView& view,
+                                          const SessionState& session, const ModelGeometry& g,
+                                          const QsaState* draft, std::string& error) {
+    // An image cut from a checkpoint of a session that has since moved PAST the cut (the idle
+    // backup of a pinned shared prefix): the running state comes from the checkpoint — the
+    // boundary's saved state, not the session's CURRENT one, which belongs to the
+    // conversation's end — and the K/V [0, view end) from the session (every later read
+    // rewrites cells from its resume point on, so the cells below the cut never change).
+    if (view.checkpoints.empty())
+        return fail(error, "a checkpoint-cut image needs the cut checkpoint");
+    const ConversationCheckpoint& cut = view.checkpoints.back();
+    if (cut.ids.size() != view.ids.size() || cut.imgs != view.images)
+        return fail(error, "the cut checkpoint is not exactly the view");
+    if (!cut.stage_parts.empty())
+        return fail(error, "a checkpoint-cut image needs a checkpoint without stage parts");
+    if (!view_validate(view, session, g, error) || !sync(error)) return false;
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = session.layer_lo; captured.layer_hi = session.layer_hi;
+    captured.cvec = view.cvec;
+    captured.live = conversation_detail::copy_checkpoint_beating(cut);   // ids, images AND the running state at the cut
+    captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
+    const size_t layers = owned_qsa(session);
+    captured.kv.resize(layers + (draft ? 1 : 0));
+    const int64_t upto = (int64_t) view.ids.size();
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_save(captured.kv[j], owned(session, j), g, upto, true, error, 0, nullptr)) return false;
+    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error, 0, nullptr)) return false;
+    image = std::move(captured);
+    return true;
+}
+
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
                                    const QsaState& draft, std::string& error) {

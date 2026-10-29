@@ -50,6 +50,13 @@ struct DiskEntry {
     bool cvec = true;
     uint64_t file_bytes = 0;                           // for LRU byte-budget accounting
     uint64_t used = 0;                                 // LRU stamp (monotonic)
+    // A shared-prefix snapshot (the pinned system prompt's K/V, written as pfx-<serial>.bin):
+    // a cross-conversation asset, not a branch of one conversation. Set by put()/put_async()
+    // (the caller says which kind this image is) and re-derived from the file name on reload.
+    // The ids-based prefix_snapshot() predicate (live ids == the deepest checkpoint's ids)
+    // still recognizes prefix-shaped files written by older builds under the conv- name, so
+    // every protection keeps BOTH signals: e.prefix || prefix_snapshot(e).
+    bool prefix = false;
 };
 
 /// Disk-tier spill store. RAM manifest + payload-on-disk. Take = remove: when a conversation
@@ -93,8 +100,12 @@ public:
     // derived from it, so two parked conversations never collide.
     // Sync version: drains any in-flight background write first, then writes on the CALLING
     // thread. Tests and rare paths use this; the engine's park path uses put_async().
+    // `prefix = true` marks the image as a shared-prefix snapshot (pinned system prompt K/V):
+    // it is written as pfx-<serial>.bin, survives the same-conversation cleanups and the
+    // reload dedupe, is never dropped in favor of a queued conversation image, and is NOT
+    // consumed by take() (many conversations branch from it).
     bool put(SavedConversation&& image, uint64_t serial, const SessionFileIdentity& id,
-             const SessionWriteOptions& options = {});
+             const SessionWriteOptions& options = {}, bool prefix = false);
 
     // ---- Async park path (the engine's park_current_body uses this) ----
     // Enqueues the image for the background writer and returns immediately (the request's
@@ -102,8 +113,12 @@ public:
     // disabled or the enqueue fails (caller logs and drops the image, as with sync put).
     // After a successful write the writer also runs the superseded cleanup (same-branch
     // older spills are deleted), so a retry loop does not pile up conv-<serial>.bin files.
+    // `prefix = true`: a shared-prefix snapshot (see put()); the queue holds ONE conversation
+    // image plus ONE prefix image, and a prefix is never dropped in favor of a conversation
+    // image (its loss is unrecoverable this run; a dropped conversation capture is usually
+    // the superseded older capture of the same conversation anyway).
     bool put_async(SavedConversation&& image, uint64_t serial, const SessionFileIdentity& id,
-                   const SessionWriteOptions& options = {});
+                   const SessionWriteOptions& options = {}, bool prefix = false);
 
     // Wait until no background write is pending or in flight. After this returns, the
     // manifest reflects every put_async() the store has accepted. Const so best()/size()
@@ -119,6 +134,13 @@ public:
     // entry's deepest checkpoint is what equals the conversation the next park would write.
     // Drains the writer first, like every reader.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) const;
+
+    // ---- Shared-prefix snapshots ----
+    // The token lengths of every prefix-kind entry in the manifest (drains the writer first,
+    // like every reader). The engine asks once after reload_from_disk() and keeps the answer
+    // as this run's "already on disk" set, so the first request of every new conversation can
+    // skip re-capturing (GPU->host, tens of MiB) a prefix the disk already holds.
+    std::vector<int64_t> prefix_pin_lengths() const;
 
     // ---- Restore path (the new conversations.best() falls back to this) ----
     // Same contract as ConversationCache::best(): the longest prefix among the manifest's
@@ -231,6 +253,7 @@ private:
         uint64_t serial = 0;
         SessionFileIdentity id;
         SessionWriteOptions options;
+        bool prefix = false;   // a shared-prefix snapshot: queue-priority and never dropped for a conversation
         // Cheap copies for the post-write superseded cleanup (the checkpoints are NOT copied:
         // they hold K/V; the cleanup's prefix branch only needs ids/imgs/cvec).
         std::vector<int32_t> sup_ids;
@@ -247,8 +270,11 @@ private:
 
     void writer_loop();
     // The sync put()'s body, shared by put() and the writer thread. NO locking inside.
+    // A prefix=true write whose exact prefix (ids + images + cvec) is already held SUCCEEDS
+    // as a no-op (returns true, nothing written): a restart's first request must not write a
+    // duplicate pfx-<serial>.bin of what a previous run left on disk.
     bool put_impl(SavedConversation&& image, uint64_t serial, const SessionFileIdentity& id,
-                  const SessionWriteOptions& options);
+                  const SessionWriteOptions& options, bool prefix);
     // drop_superseded()'s body, shared by the public wrapper and the writer thread.
     size_t drop_superseded_impl(const std::vector<int32_t>& ids,
                                 const std::vector<ConversationImageKey>& images,
@@ -265,7 +291,10 @@ private:
         return drop_superseded_impl(ids, images, {}, cvec);
     }
 
-    std::string path_for(uint64_t serial) const;
+    // <dir>/conv-<serial>.bin — a whole conversation. `prefix`: <dir>/pfx-<serial>.bin — a
+    // shared-prefix snapshot (the pinned system prompt's K/V). One serial space (the cache's
+    // low half, the direct spills' high half): the name prefix tells the kinds apart.
+    std::string path_for(uint64_t serial, bool prefix = false) const;
     // A layer split's spill: one extra self-contained session file per later stage
     // (conv-<serial>.stage<k>.bin), written by put() BEFORE the main .bin (the main is the
     // commit point of the put) and read back by take() right after the main image. The .idx
@@ -276,8 +305,9 @@ private:
     // file_bytes: the .bin parse covers the main image only, and the .idx (when fresh)
     // already carries the put-time total, which includes the stage files.
     uint64_t stage_files_bytes(uint64_t serial) const;
-    // Sidecar .idx: <dir>/conv-<serial>.idx — small manifest metadata without parsing the .bin.
-    std::string path_for_idx(uint64_t serial) const;
+    // Sidecar .idx: <dir>/conv-<serial>.idx (or pfx-<serial>.idx for a prefix snapshot) —
+    // small manifest metadata without parsing the .bin.
+    std::string path_for_idx(uint64_t serial, bool prefix = false) const;
     // Write the .idx atomically (temp + rename). Best-effort: on failure returns false, the
     // .bin is still valid and the next start falls back to a full parse of it.
     bool write_idx(const DiskEntry& e, const std::string& bin_path, const SessionFileIdentity& id) const;

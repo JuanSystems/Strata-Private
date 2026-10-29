@@ -108,6 +108,16 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+// An image cut at the view's own deepest checkpoint, of a session that has since moved PAST
+// that point (the idle/stop backup of a pinned shared prefix): the running state comes from
+// the CHECKPOINT (the pin boundary's saved state), the K/V [0, view end) from the SESSION —
+// every later read rewrites cells from its resume point on, so the cells below the cut never
+// change. At the moment the pin is created this is byte-identical to conversation_snapshot_save
+// (the session IS the prefix then); only afterwards do the two differ. The view's ids/images
+// must be exactly the checkpoint's, and the checkpoint must carry no stage parts (single GPU).
+bool conversation_snapshot_save_from_ckpt(SavedConversation& image, const ConversationView& view,
+                                          const SessionState& session, const ModelGeometry& g,
+                                          const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

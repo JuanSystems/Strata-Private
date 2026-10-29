@@ -8207,14 +8207,21 @@ int main(int argc, char** argv) {
         // Monotonic serial for direct spills (the spill-when-cache-off path): the high half of the
         // uint64_t range, so they never collide with the cache's serials (low half, starting at 1).
         uint64_t next_direct_spill_serial = 1ull << 63;
-        // Prefix cache: the pin length (pin=N) whose prefix snapshot this run already wrote to the
-        // disk store (-1: none yet). One spill per prefix: the pinned checkpoint is captured at its
-        // creation, and that small image (the system prompt's K/V — tens of MiB, where a whole
-        // conversation runs to hundreds) restores the FIRST request of every conversation that
-        // starts with the same tokens, this session and after a restart (the file survives take()
-        // and reload; the engine's restore escalation falls back to it when a bigger image will
-        // not read).
-        int64_t prefix_spilled_pin = -1;
+        // Prefix cache: the pin lengths (pin=N) whose prefix snapshot the DISK already holds —
+        // seeded from the spill store right after the startup reload (a pfx-<serial>.bin a
+        // previous run left) and grown by every spill this run. One spill per prefix: the
+        // pinned checkpoint is captured as its own small image (the system prompt's K/V — tens
+        // of MiB, where a whole conversation runs to hundreds) and written as pfx-<serial>.bin
+        // — the file with a DIFFERENT name from the conversation spills, so a look at the spill
+        // dir tells the cross-conversation cache apart from the conversations. It restores the
+        // FIRST request of every conversation that starts with the same tokens, this session
+        // and after a restart (the file survives take() and reload; the engine's restore
+        // escalation falls back to it when a bigger image will not read). A pin length in the
+        // set is skipped WITHOUT the GPU->host capture, so a restart's first request pays nothing.
+        std::vector<int64_t> prefix_held_pins;
+        auto prefix_pin_held = [&](int64_t pin) {
+            return std::find(prefix_held_pins.begin(), prefix_held_pins.end(), pin) != prefix_held_pins.end();
+        };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -8376,6 +8383,87 @@ int main(int argc, char** argv) {
                                      "the conversation stays in RAM only\n");
             }
             return true;
+        };
+        // ── Prefix snapshot spill: the ONE block every path shares — the pin's creation during a
+        // request's prompt read, the idle backup after a DONE with no request behind it, and the
+        // shutdown spill. Captures [0, pin_len) as its own small image built FROM the pinned
+        // checkpoint (the running state at the boundary; the session may sit far past it by now)
+        // and hands it to the store's background writer as a PREFIX write: pfx-<serial>.bin, the
+        // file named differently from the conversation spills (conv-<serial>.bin) so the
+        // cross-conversation cache of zoocode's system prompt is identifiable at a glance.
+        // `what` names the path in the log. Returns true when this pin length is DONE for this
+        // run (already held on disk, enqueued now, or the store took it); false only when the
+        // capture itself failed (the pinned prefix stays in the session chain either way).
+        auto spill_prefix_snapshot = [&](int64_t pin_len, const ConvCheckpoint& pc, const char* what) -> bool {
+            if (pin_len < 1 || prefix_pin_held(pin_len)) return true;
+            static bool said_no_store = false, said_split = false;
+            if (stages.empty() && (disk_store_ptr == nullptr || !spill_attached)) {
+                if (!said_no_store) {
+                    said_no_store = true;
+                    std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
+                                         "tokens; --conversation-spill-gib would also "
+                                         "keep them across restarts\n", (long long) pin_len);
+                }
+                return false;
+            }
+            if (!stages.empty()) {
+                if (!said_split) {
+                    said_split = true;
+                    std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
+                                         "tokens; the prefix spill needs a single GPU and "
+                                         "this engine runs a layer split, so the pin "
+                                         "stays in the session chain\n", (long long) pin_len);
+                }
+                return false;
+            }
+            try {
+                // copies first: the caller's `checks` can reallocate (a later cut's
+                // checkpoint_at), and the view must not point into it
+                const std::vector<int32_t> prefix_ids = pc.ids;
+                const std::vector<strata::core::ConversationImageKey> prefix_imgs = pc.imgs;
+                std::vector<ConvCheckpoint> prefix_checks;
+                prefix_checks.push_back(pc);
+                const strata::core::ConversationView pview{prefix_ids, prefix_imgs, prefix_checks, cvec_cached};
+                const auto t0 = Clock::now();
+                std::string perr;   // its own: a failure here is not the request's
+                strata::core::SavedConversation image;
+                const bool sync_ok = cudaDeviceSynchronize() == cudaSuccess;
+                if (!sync_ok) perr = "device sync failed";
+                const bool save_ok = sync_ok && strata::core::conversation_snapshot_save_from_ckpt(
+                        image, pview, ss, g, use_mtp ? &mtp.kv_state() : nullptr, perr);
+                if (!save_ok) {
+                    std::fprintf(stderr, "strata serve: prefix cache: capture failed (%s); the "
+                                         "pinned prefix stays in the session chain\n", perr.c_str());
+                    return false;
+                }
+                const size_t prefix_bytes = image.bytes();
+                const uint64_t serial = next_direct_spill_serial++;
+                // prefix=true: the store names it pfx-<serial>.bin, dedups an identical prefix
+                // a previous run left, and never drops it for a queued conversation image.
+                if (disk_store_ptr->put_async(std::move(image), serial, spill_identity, {}, true)) {
+                    prefix_held_pins.push_back(pin_len);
+                    std::fprintf(stderr, "strata serve: prefix cache [%s]: pinned %lld shared "
+                                         "tokens, spilled %.1f MiB as pfx-%llu.bin in %.1f ms "
+                                         "(the first request of every conversation that starts "
+                                         "with these tokens — every new chat with this system "
+                                         "prompt, in this run or after a restart — restores it)\n",
+                                 what, (long long) pin_len, prefix_bytes / (1024.0 * 1024.0),
+                                 (unsigned long long) serial,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    return true;
+                }
+                std::fprintf(stderr, "strata serve: prefix cache: the disk store did not "
+                                     "take the %lld-token prefix image\n", (long long) pin_len);
+                return false;
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: prefix cache: allocation failed; the pinned "
+                                     "prefix stays in the session chain\n");
+                return false;
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata serve: prefix cache: capture failed (%s); the pinned "
+                                     "prefix stays in the session chain\n", e.what());
+                return false;
+            }
         };
         auto park_current_body = [&](size_t held) -> bool {
             // ── Spill-when-cache-off flag: when the RAM cache is OFF but the spill is on, we skip
@@ -8571,9 +8659,22 @@ int main(int argc, char** argv) {
         // ahora — nada espera por ella — y la escritura va al writer de fondo del store. La
         // conversación sigue viva: el próximo turno de ESTA conversación continúa desde la
         // sesión, sin restore. El park del request siguiente encuentra holds() y no re-captura.
+        // Antes de la conversación va el PREFIJO compartido: si la cadena viva tiene un checkpoint
+        // pineado (pin=N — creado en este run, o re-marcado en el checkpoint restaurado por el
+        // pin que el server manda en cada request) y este run aún no lo escribió, su snapshot
+        // pfx-*.bin sale AHORA también — el caché de zoocode no depende de que el pin se acabe
+        // de crear en ESTE request para llegar al disco.
         auto idle_backup_live = [&]() -> void {
             if (o.conversation_idle_spill_s < 0) return;   // apagado: solo el park del request siguiente
             if (disk_store_ptr == nullptr || !spill_attached || !live_ok || live.empty()) return;
+            // ── Prefix: el caché entre conversaciones. No gatea por wants(): el prefijo pineado
+            // ya demostró valer (el request lo creó/marcó); el mínimo de tokens del park es para
+            // conversaciones, no para este asset compartido.
+            for (const ConvCheckpoint& c : checks)
+                if (c.pinned) {
+                    (void) spill_prefix_snapshot((int64_t) c.ids.size(), c, "idle after done");
+                    break;
+                }
             if (!conversations.wants((int64_t) live.size())) return;   // el mismo mínimo que el park
             // RAM cache apagada (Kaggle, poca RAM): park_current(0) ES el spill directo — deja
             // live intacta y entrega la imagen al writer; reusa el camino probado y sus gates.
@@ -11245,13 +11346,28 @@ int main(int argc, char** argv) {
                                      n_loaded, n_loaded == 1 ? "" : "s", disk_store_ptr->size(),
                                      (double) disk_store_ptr->bytes() / (1024.0 * 1024.0));
                     }
+                    // ── Prefix held set: the pin lengths whose pfx-*.bin a previous run left on
+                    // disk (reload just put them in the manifest). Seeding the run's set here
+                    // means the first request of a new conversation SKIPS the GPU->host capture
+                    // of a prefix the disk already holds — no per-request cost for an asset that
+                    // is already there. The store's own put-side dedup is the second belt.
+                    prefix_held_pins = disk_store_ptr->prefix_pin_lengths();
+                    if (!prefix_held_pins.empty()) {
+                        std::fprintf(stderr, "strata serve: prefix cache: the disk already holds %zu shared "
+                                             "prefix snapshot%s (pin lengths:", prefix_held_pins.size(),
+                                     prefix_held_pins.size() == 1 ? "" : "s");
+                        for (int64_t p : prefix_held_pins)
+                            std::fprintf(stderr, " %lld", (long long) p);
+                        std::fprintf(stderr, ") — new conversations with these pins restore them without "
+                                             "re-capturing\n");
+                    }
                     // ── Anti-collision: lift next_direct_spill_serial above the max serial present
                     // on disk. next_direct_spill_serial starts at 1<<63 on every engine start; the
-                    // first direct spill would re-use the serial of an existing conv-*.bin and put()
-                    // would delete the older file (find_by_serial + fs::remove), losing that parked
-                    // conversation. Scan the dir for conv-<serial>.bin names (including files that
-                    // did NOT load into the manifest — bad_alloc, over-budget evicted, etc.) and
-                    // raise the counter above the max. Public API only: dir(), no new methods.
+                    // first direct spill would re-use the serial of an existing conv-*.bin or
+                    // pfx-*.bin and put() would delete the older file (find_by_serial + fs::remove),
+                    // losing that parked conversation. Scan the dir for both name kinds (including
+                    // files that did NOT load into the manifest — bad_alloc, over-budget evicted,
+                    // etc.) and raise the counter above the max. Public API only: dir(), no new methods.
                     {
                         const std::string& spill_dir = disk_store_ptr->dir();
                         if (!spill_dir.empty()) {
@@ -11263,11 +11379,14 @@ int main(int argc, char** argv) {
                                 const std::string name = entry.path().filename().string();
                                 // Skip a layer split's per-stage files (conv-<serial>.stage<k>.bin): their serial
                                 // is the main's, and the floor only needs serials that exist as mains.
-                                if (name.rfind("conv-", 0) == 0 && name.size() > 9 &&
+                                const bool named_conv = name.rfind("conv-", 0) == 0;
+                                const bool named_pfx = name.rfind("pfx-", 0) == 0;
+                                const size_t digits0 = named_pfx ? 4 : 5;
+                                if ((named_conv || named_pfx) && name.size() > digits0 + 5 &&
                                     name.compare(name.size() - 4, 4, ".bin") == 0 &&
                                     name.find(".stage") == std::string::npos) {
                                     try {
-                                        const uint64_t s = std::stoull(name.substr(5, name.size() - 9));
+                                        const uint64_t s = std::stoull(name.substr(digits0, name.size() - 4 - digits0));
                                         if (!any_seen || s > max_seen) { max_seen = s; any_seen = true; }
                                     } catch (...) {}
                                 }
@@ -12176,9 +12295,20 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld ignored: the prefix must be shorter than the prompt "
                                  "(%lld tokens)\n", (long long) req_pin, (long long) n);
                 else if (req_pin > read_from) pin_at = req_pin;
-                else if (!pin_checkpoint(req_pin))
-                    std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
-                                 "%lld)\n", (long long) req_pin, (long long) read_from);
+                else if (!pin_checkpoint(req_pin)) {
+                    // The server sends pin=N on EVERY request of a client with leading system
+                    // messages (a new chat gets it armed above; a continuing one only re-marks
+                    // the checkpoint). A conversation that resumed PAST the pin (a sibling's
+                    // stored turn boundary) has no checkpoint there and would log this every
+                    // turn — say it once and stay quiet.
+                    static bool said_unpinned = false;
+                    if (!said_unpinned) {
+                        said_unpinned = true;
+                        std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it "
+                                             "resumed from %lld; the shared prefix on disk still serves new "
+                                             "conversations)\n", (long long) req_pin, (long long) read_from);
+                    }
+                }
             }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
             if (pin_at >= 0) {
@@ -12258,80 +12388,20 @@ int main(int argc, char** argv) {
                         // or after a restart) restores it and reads only its suffix. Once per pin
                         // length per run: the file survives take() (kept as a backup) and restarts
                         // (reload), so re-spilling the same prefix adds nothing.
-                        if (pin_at != prefix_spilled_pin) {
+                        if (!prefix_pin_held(pin_at)) {
                             const ConvCheckpoint* pin_ckpt = nullptr;
                             for (const ConvCheckpoint& c : checks)
                                 if ((int64_t) c.ids.size() == pin_at && c.pinned) pin_ckpt = &c;
-                            if (pin_ckpt != nullptr) try {
-                                // copies first: a later cut's checkpoint_at can reallocate `checks`
-                                const std::vector<int32_t> prefix_ids = pin_ckpt->ids;
-                                const std::vector<strata::core::ConversationImageKey> prefix_imgs = pin_ckpt->imgs;
-                                std::vector<ConvCheckpoint> prefix_checks;
-                                prefix_checks.push_back(*pin_ckpt);
-                                if (stages.empty() && disk_store_ptr != nullptr && spill_attached) {
-                                    const strata::core::ConversationView pview{prefix_ids, prefix_imgs,
-                                                                               prefix_checks, cvec_cached};
-                                    const auto t0 = Clock::now();
-                                    std::string perr;   // its own: a failure here is not the request's
-                                    strata::core::SavedConversation image;
-                                    size_t reused_bytes = 0;
-                                    const bool sync_ok = cudaDeviceSynchronize() == cudaSuccess;
-                                    if (!sync_ok) perr = "device sync failed";
-                                    const bool save_ok = sync_ok && strata::core::conversation_snapshot_save(
-                                            image, pview, ss, g, use_mtp ? &mtp.kv_state() : nullptr, perr,
-                                            strata::core::ConversationKvReuse{}, &reused_bytes);
-                                    if (save_ok) {
-                                        const size_t prefix_bytes = image.bytes();
-                                        const uint64_t serial = next_direct_spill_serial++;
-                                        if (disk_store_ptr->put_async(std::move(image), serial, spill_identity)) {
-                                            prefix_spilled_pin = pin_at;
-                                            std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
-                                                                 "tokens, spilled %.1f MiB as conv-%llu.bin in "
-                                                                 "%.1f ms (the first request of every conversation "
-                                                                 "that starts with these tokens — every new chat "
-                                                                 "with this system prompt, in this run or after a "
-                                                                 "restart — restores it)\n",
-                                                         (long long) pin_at, prefix_bytes / (1024.0 * 1024.0),
-                                                         (unsigned long long) serial,
-                                                         std::chrono::duration<double, std::milli>(
-                                                             Clock::now() - t0).count());
-                                        } else {
-                                            std::fprintf(stderr, "strata serve: prefix cache: the disk store did not "
-                                                                 "take the %lld-token prefix image\n",
-                                                         (long long) pin_at);
-                                        }
-                                    } else {
-                                        std::fprintf(stderr, "strata serve: prefix cache: capture failed (%s); the "
-                                                             "pinned prefix stays in the session chain\n",
-                                                     perr.c_str());
-                                    }
-                                } else if (stages.empty()) {
-                                    static bool said_no_store = false;
-                                    if (!said_no_store) {
-                                        said_no_store = true;
-                                        std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
-                                                             "tokens; --conversation-spill-gib would also "
-                                                             "keep them across restarts\n", (long long) pin_at);
-                                    }
-                                } else {
-                                    static bool said_split = false;
-                                    if (!said_split) {
-                                        said_split = true;
-                                        std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
-                                                             "tokens; the prefix spill needs a single GPU and "
-                                                             "this engine runs a layer split, so the pin "
-                                                             "stays in the session chain\n",
-                                                     (long long) pin_at);
-                                    }
-                                }
-                            } catch (const std::bad_alloc&) {
-                                std::fprintf(stderr, "strata serve: prefix cache: allocation failed; the pinned "
-                                                     "prefix stays in the session chain\n");
-                            } catch (const std::exception& e) {
-                                std::fprintf(stderr, "strata serve: prefix cache: capture failed (%s); the pinned "
-                                                     "prefix stays in the session chain\n", e.what());
+                            if (pin_ckpt != nullptr) {
+                                // The ONE prefix-spill block (shared with the idle and the
+                                // shutdown backups): a small pfx-<serial>.bin to the store's
+                                // background writer. A failure is not the request's.
+                                (void) spill_prefix_snapshot(pin_at, *pin_ckpt, "pin created");
+                            } else {
+                                std::fprintf(stderr, "strata serve: prefix cache: the %lld-token pin's checkpoint "
+                                                     "was not kept\n", (long long) pin_at);
                             }
-                        }   // pin_at != prefix_spilled_pin
+                        }   // !prefix_pin_held(pin_at)
                     } else {
                         std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
                     }
@@ -13681,8 +13751,15 @@ int main(int argc, char** argv) {
         // cuando no llega nada, incluido un engine que muere SIN QUIT: un kill, un crash, una
         // sesión de Kaggle que se acaba. (3) Este spill final cubre el DONE inmediato antes de un
         // QUIT/EOF limpio. La escritura siempre corre en el writer de fondo; el camino del request
-        // solo paga la captura, y tras un DONE nadie espera por ella.
+        // solo paga la captura, y tras un DONE nadie espera por ella. El prefijo compartido va
+        // primero: igual que el idle, un checkpoint pineado que este run no escribió sale ahora
+        // como pfx-*.bin — el dtor del store drena la cola, así que llega a disco.
         if (live_ok && !live.empty() && disk_store_ptr != nullptr && spill_attached) {
+            for (const ConvCheckpoint& c : checks)
+                if (c.pinned) {
+                    (void) spill_prefix_snapshot((int64_t) c.ids.size(), c, "shutdown");
+                    break;
+                }
             std::fprintf(stderr, "[strata diag] auto-spill on shutdown: parking %zu tokens to disk...\n",
                          live.size());
             if (!park_current(0)) {
