@@ -11415,16 +11415,36 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() > ck_len) ck_len = (int64_t) c.ids.size();
                 for (const ConvCheckpoint& c : checks)
                     if (ck_len > 0 && (int64_t) c.ids.size() == ck_len) { ck_div = diverge_at(c.ids); break; }
+                // "best" = the deepest resume this chain COULD give: the longest checkpoint that
+                // is a FULL prefix of this prompt (div@-1). When none is a full prefix, the one
+                // sharing the most (its divergence position tells where the client rewrote the
+                // history: a re-rendered system/tools region shifts every position after it).
+                int64_t best_len = 0, best_div = -2;
+                for (const ConvCheckpoint& c : checks) {
+                    if (c.ids.empty()) continue;
+                    const int64_t d = diverge_at(c.ids);
+                    if (d == -1) {
+                        if (best_div != -1 || (int64_t) c.ids.size() > best_len) {
+                            best_len = (int64_t) c.ids.size();
+                            best_div = -1;
+                        }
+                    } else if (best_div != -1 && (best_len == 0 || d > best_div)) {
+                        best_len = (int64_t) c.ids.size();
+                        best_div = d;
+                    }
+                }
                 const int64_t live_div = live.empty() ? -2 : diverge_at(live);
                 std::fprintf(stderr, "[strata diag] request: prompt=%lld tok, resume=%lld (%s); live(ok=%d, %zu tok, "
-                                     "diverge@%lld); checks=%zu (longest %lld, diverge@%lld); ram_parked=%zu "
-                                     "(best match %lld); cvec=%d/%d, imgs=%zu\n",
+                                     "diverge@%lld); checks=%zu (longest %lld, diverge@%lld, best %lld div@%lld); "
+                                     "ram_parked=%zu (best match %lld); cvec=%d/%d, imgs=%zu, every=%lld tail=%d\n",
                              (long long) n, (long long) resume,
                              from_live ? "live" : (resume > 0 ? "checkpoint" : "none"),
                              live_ok ? 1 : 0, live.size(), (long long) live_div,
                              checks.size(), (long long) ck_len, (long long) ck_div,
+                             (long long) best_len, (long long) best_div,
                              conversations.size(), (long long) parked.tokens,
-                             (int) want_cvec, (int) cvec_cached, req_imgs.size());
+                             (int) want_cvec, (int) cvec_cached, req_imgs.size(),
+                             (long long) o.prompt_cache_every, o.prompt_cache_tail ? 1 : 0);
             }
             if (want_cvec != cvec_cached) {
                 live_ok = false;
@@ -12110,8 +12130,20 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+                // (req_ckpt && to == n - 1): the END-OF-PROMPT checkpoint. The whole prompt this
+                // request read is a strict prefix of the next request's prompt of the SAME
+                // conversation (the client appends the assistant's reply, the tool results and
+                // the next user message — it does not rewrite what came before), so the state at
+                // n - 1 is the deepest point the next turn can resume from: it re-reads only the
+                // new tail instead of the last user message again (the turn checkpoint below
+                // starts at the LAST <|im_start|>, one whole message earlier). Without this the
+                // inter-turn resume sat at turn_at and re-read the last user message every turn.
+                // The state here is exactly [0, n - 1): the last token is decoded by the first
+                // window below, so the checkpoint is complete and every later window rewrites
+                // cells past it. ckpt=0 keeps no checkpoint, as with every other cut.
+                if ((to == turn_at || to == root_at || to == message_at || to == pin_at || (req_ckpt && to == n - 1)) &&
+                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at &&
+                                   to != n - 1)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }

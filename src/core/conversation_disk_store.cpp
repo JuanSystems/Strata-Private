@@ -1027,7 +1027,64 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     // deletes files that don't fit, with proper accounting (drops_). Borrar en el arranque
     // asumiendo que el de mayor serial "incluye" a los anteriores era exactamente el bug:
     // conversaciones distintas conviven en disco y todas menos la última se destruían.
+    // ── Pero sí dedup de la MISMA conversación: los spills duplicados que dejaron los runs
+    // anteriores (un serial por park; el cleanup superseded no veía a través del re-render del
+    // thinking del cliente). El más nuevo de cada conversación gana; los archivos físicos
+    // de los dropeados se borran también (esto es lo que colapsa los 18-archivos-de-1-
+    // conversación al primer arranque tras el fix).
+    const size_t dup = dedupe_loaded();
+    if (dup > 0) {
+        std::fprintf(stderr, "strata serve: conversation spill: cleaned %zu duplicate spill file%s "
+                             "of the same conversation left by earlier runs (manifest=%zu, %.1f MiB)\n",
+                     dup, dup == 1 ? "" : "s", entries_.size(), (double) bytes_ / (1024.0 * 1024.0));
+    }
     return loaded;
+}
+
+// Older reload duplicates: entry i is superseded when a NEWER entry (higher index = higher
+// serial, reload pushed ascending) is the same conversation — the strict-prefix rule, or the
+// re-render rule (the old entry's deepest checkpoint is contained in the newer entry's live
+// ids). A different conversation sharing only the system root is kept, and so is an older
+// LONGER spill the newer one does not contain (a rollback branch: the client may go back).
+// Files go too: an entry not in the manifest is unreachable forever (take() reads by serial
+// through best(), and best() only sees entries_).
+size_t ConversationDiskStore::dedupe_loaded() {
+    auto contained_in = [](const std::vector<int32_t>& cid, const std::vector<int32_t>& full) {
+        if (cid.empty() || cid.size() > full.size()) return false;
+        return std::equal(cid.begin(), cid.end(), full.begin());
+    };
+    auto imgs_contained = [](const std::vector<ConversationImageKey>& from,
+                             const std::vector<ConversationImageKey>& into) {
+        if (from.size() > into.size()) return false;
+        size_t k = 0;
+        for (size_t a = 0; a < into.size() && k < from.size(); ++a)
+            if (into[a] == from[k]) ++k;
+        return k == from.size();
+    };
+    size_t dropped = 0;
+    for (size_t i = 0; i < entries_.size();) {
+        bool superseded = false;
+        for (size_t j = i + 1; j < entries_.size() && !superseded; ++j) {
+            if (entries_[j].cvec != entries_[i].cvec || entries_[j].ids.empty()) continue;
+            if (!entries_[i].ids.empty() && contained_in(entries_[i].ids, entries_[j].ids) &&
+                imgs_contained(entries_[i].imgs, entries_[j].imgs)) {
+                superseded = true;   // the plain "grew" case (or an exact retry)
+                continue;
+            }
+            if (!entries_[i].ckpt_ids.empty() && contained_in(entries_[i].ckpt_ids, entries_[j].ids) &&
+                imgs_contained(entries_[i].ckpt_imgs, entries_[j].imgs)) {
+                superseded = true;   // the re-rendered same-conversation case
+            }
+        }
+        if (!superseded) { ++i; continue; }
+        const std::string drop_path = entries_[i].path;
+        const uint64_t drop_bytes = entries_[i].file_bytes;
+        erase(i);
+        bytes_ -= drop_bytes;
+        remove_spill_files(drop_path);
+        ++dropped;
+    }
+    return dropped;
 }
 
 size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
@@ -1058,6 +1115,21 @@ size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& i
         if (cid.empty() || cid.size() > longer.size()) return false;
         return std::equal(cid.begin(), cid.end(), longer.begin());
     };
+    // cid is contained in full at its start (prefix, strict OR equal): the "grew" and the
+    // "identical retry" cases in one predicate.
+    auto contained_in = [](const std::vector<int32_t>& cid, const std::vector<int32_t>& full) {
+        if (cid.empty() || cid.size() > full.size()) return false;
+        return std::equal(cid.begin(), cid.end(), full.begin());
+    };
+    // every image of `from` appears in `into`, in order (a prefix of the image list)
+    auto imgs_contained = [](const std::vector<ConversationImageKey>& from,
+                             const std::vector<ConversationImageKey>& into) {
+        if (from.size() > into.size()) return false;
+        size_t k = 0;
+        for (size_t a = 0; a < into.size() && k < from.size(); ++a)
+            if (into[a] == from[k]) ++k;
+        return k == from.size();
+    };
     size_t dropped = 0;
     for (size_t i = 0; i < entries_.size();) {
         const auto& e = entries_[i];
@@ -1080,15 +1152,7 @@ size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& i
         // snapshots of an earlier turn of the SAME conversation, now included in the longer one.
         // This is the "20 messages replaces 10 messages" case.
         if (!e.ids.empty() && is_prefix_of(e.ids, ids)) {
-            bool imgs_ok = true;
-            for (const auto& im : e.imgs) {
-                bool found = false;
-                for (const auto& pim : images) {
-                    if (pim == im) { found = true; break; }
-                }
-                if (!found) { imgs_ok = false; break; }
-            }
-            if (imgs_ok) {
+            if (imgs_contained(e.imgs, images)) {
                 const std::string drop_path = e.path;
                 const uint64_t drop_bytes = e.file_bytes;
                 erase(i);
@@ -1097,6 +1161,26 @@ size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& i
                 ++dropped;
                 continue;
             }
+        }
+        // ── Same conversation, re-rendered. The client rewrites every assistant turn without
+        // its thinking tokens, so two successive spills of the SAME conversation match NEITHER
+        // rule above: the old live ids end inside the reasoning of a turn the new spill
+        // re-rendered empty, so old ⊄ new, and one spill per park piles up (measured: 18 files
+        // for 1 conversation, ~1 GiB each). The identity that DOES survive the re-render is
+        // the old entry's DEEPEST CHECKPOINT — the last turn boundary of the client's own
+        // render, a region every later prompt of this conversation still contains verbatim.
+        // When the new conversation contains that boundary, the old spill holds nothing the
+        // new one does not: drop it. A different conversation of the same client does NOT
+        // contain this conversation's boundary (it shares only the system root), so it stays.
+        // The "larger size replaces the existing one" rule the user asked for.
+        if (!e.ckpt_ids.empty() && contained_in(e.ckpt_ids, ids) && imgs_contained(e.ckpt_imgs, images)) {
+            const std::string drop_path = e.path;
+            const uint64_t drop_bytes = e.file_bytes;
+            erase(i);
+            bytes_ -= drop_bytes;
+            remove_spill_files(drop_path);   // BORRAR: misma conversación, re-render más nuevo
+            ++dropped;
+            continue;
         }
         ++i;
     }

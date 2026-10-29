@@ -100,6 +100,18 @@ bool same(const SavedConversation& a, const SavedConversation& b) {
     return true;
 }
 
+// sample() shifted to a different token range: a DIFFERENT conversation of the same client
+// (distinct history, same system root shape). Used by the reload tests that must keep several
+// conversations side by side — under the same-conversation dedupe, plain sample(100/200/300)
+// all describe ONE growing conversation and only the newest would survive.
+SavedConversation shifted(size_t n, int32_t base) {
+    SavedConversation s = sample(n);
+    for (auto& t : s.live.ids) t += base;
+    for (auto& k : s.checkpoints)
+        for (auto& t : k.ids) t += base;
+    return s;
+}
+
 } // namespace
 
 int main() {
@@ -358,18 +370,19 @@ int main() {
     }
 
     // ── 11b. reload_from_disk with multiple spills: all are loaded (no unconditional deletion) ─
-    // The fix: when the dir has multiple spills (conversations from multiple sessions, or
-    // growing snapshots of the same one), reload_from_disk() validates and loads ALL of them.
-    // The disk budget is enforced by evict_oldest() (the real LRU); older spills are NOT
-    // unconditionally deleted on startup. With an ample budget, all 3 should survive.
+    // The fix: when the dir has multiple spills (conversations from multiple sessions),
+    // reload_from_disk() validates and loads ALL of them. The disk budget is enforced by
+    // evict_oldest() (the real LRU); older spills are NOT unconditionally deleted on startup.
+    // Three DIFFERENT conversations with an ample budget: all 3 survive (the same-conversation
+    // dedupe keeps exactly one set per conversation — block 23 covers that path).
     {
         const auto rdir = dir / "reload_multi";
         // Engine A writes 3 spills with growing serials.
         {
             ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
-            check(store_a.put(std::move(sample(100)), 100, id), "put serial 100");
-            check(store_a.put(std::move(sample(200)), 101, id), "put serial 101");
-            check(store_a.put(std::move(sample(300)), 102, id), "put serial 102");
+            check(store_a.put(shifted(100, 0), 100, id), "put serial 100");
+            check(store_a.put(shifted(200, 4000), 101, id), "put serial 101 (another conversation)");
+            check(store_a.put(shifted(300, 8000), 102, id), "put serial 102 (a third conversation)");
             check(store_a.size() == 3, "store A has 3 entries");
             check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin on disk");
             check(fs::exists(rdir / "conv-101.bin"), "conv-101.bin on disk");
@@ -405,9 +418,9 @@ int main() {
         // Engine A writes 3 spills with a huge budget, just to populate the dir.
         {
             ConversationDiskStore store_a(rdir.string(), 1ull << 30, &id);
-            check(store_a.put(std::move(sample(100)), 100, id), "put serial 100");
-            check(store_a.put(std::move(sample(200)), 101, id), "put serial 101");
-            check(store_a.put(std::move(sample(300)), 102, id), "put serial 102");
+            check(store_a.put(shifted(100, 0), 100, id), "put serial 100");
+            check(store_a.put(shifted(200, 4000), 101, id), "put serial 101 (another conversation)");
+            check(store_a.put(shifted(300, 8000), 102, id), "put serial 102 (a third conversation)");
             check(store_a.size() == 3, "store A has 3 entries");
             check(fs::exists(rdir / "conv-100.bin"), "conv-100.bin on disk");
             check(fs::exists(rdir / "conv-101.bin"), "conv-101.bin on disk");
@@ -725,6 +738,110 @@ int main() {
         check(!fs::exists(rdir / "conv-2.idx.tmp"), "conv-2.idx.tmp purged");
         check(!fs::exists(rdir / "conv-3.bin.tmp"), "conv-3.bin.tmp purged");
         check(fs::exists(rdir / "keep.txt"), "keep.txt kept");
+    }
+
+    // ── 22. Same conversation, re-rendered (the client strips the assistant thinking): the old
+    // spill's ids are NOT a prefix of the new ones (they end inside the reasoning of a turn the
+    // new one re-rendered empty), so the exact/prefix rules never match and one spill per park
+    // piled up (the "18 files for 1 conversation" report). The old entry's DEEPEST CHECKPOINT —
+    // the last turn boundary of the client's own render — IS contained in the new conversation:
+    // the writer's cleanup must drop the old spill (files included). A DIFFERENT conversation
+    // sharing only the system root is kept.
+    {
+        ConversationDiskStore store(dir.string() + "/rerender", 1ull << 30, &id);
+        // A: the old turn's spill — live 1000..1999 (its "thinking" included), boundary 1000..1499.
+        const auto turn_spill = [&](int tail_base, size_t shared) {
+            SavedConversation s = sample(1000);
+            s.live.imgs.clear();
+            s.checkpoints.clear();
+            for (size_t i = 0; i < shared; ++i) s.live.ids.push_back(int32_t(1000 + i));  // the shared render
+            for (int i = 0; i < 300; ++i) s.live.ids.push_back(int32_t(tail_base + i));  // the re-rendered turn
+            ConversationCheckpoint b;   // the deepest checkpoint: the turn boundary the client keeps
+            b.ids.assign(s.live.ids.begin(), s.live.ids.begin() + (std::ptrdiff_t) shared);
+            s.checkpoints.push_back(std::move(b));
+            return s;
+        };
+        SavedConversation a = turn_spill(1500, 500);   // live 1000..1799: the render + A's own "thinking"
+        check(store.put(std::move(a), 100, id), "22: put A (the old turn's spill)");
+        // C: a DIFFERENT conversation (ids 5000..) — must never be dropped by B's cleanup.
+        SavedConversation c = sample(1000);
+        for (auto& t : c.live.ids) t += 4000;
+        for (auto& k : c.checkpoints) for (auto& t : k.ids) t += 4000;
+        check(store.put_async(std::move(c), 102, id), "22: put C (a different conversation)");
+        store.flush_pending();
+        check(store.size() == 2, "22: A and C both on disk");
+        // B: the next turn of A's conversation, RE-RENDERED — the prompt keeps A's client-render
+        // region [0, 500) verbatim, then diverges inside what A rendered as thinking. B's live is
+        // not a superset of A's and shares no clean prefix with it (800 < 1000 tokens).
+        SavedConversation b = turn_spill(7000, 500);
+        check(store.put_async(std::move(b), 101, id), "22: put B (the re-rendered next turn)");
+        store.flush_pending();
+        check(store.size() == 2, "22: B replaced A; C survives (manifest = B + C)");
+        bool has_a = false, has_b = false, has_c = false;
+        for (size_t i = 0; i < store.size(); ++i) {
+            has_a = has_a || store.entry_serial(i) == 100;
+            has_b = has_b || store.entry_serial(i) == 101;
+            has_c = has_c || store.entry_serial(i) == 102;
+        }
+        check(!has_a, "22: A dropped as superseded (same conversation, re-rendered)");
+        check(has_b, "22: B kept (the newest state)");
+        check(has_c, "22: C kept (a different conversation is never dropped)");
+        check(!fs::exists(dir / "rerender" / "conv-100.bin"), "22: A's .bin deleted");
+        check(!fs::exists(dir / "rerender" / "conv-100.idx"), "22: A's .idx deleted");
+        check(fs::exists(dir / "rerender" / "conv-102.bin"), "22: C's .bin still there");
+    }
+
+    // ── 23. reload_from_disk dedupes the duplicates earlier runs left behind: the FIRST start
+    // after this fix collapses the pile (one serial per park, none superseded through the
+    // re-render) back to one set per conversation. The newest serial wins; the loser's files
+    // are deleted; a different conversation and a not-contained (rolled-back) older spill stay.
+    {
+        const auto rdir = dir / "dedupe";
+        const auto turn_spill = [&](int tail_base) {
+            SavedConversation s = sample(1000);
+            s.live.imgs.clear();
+            s.checkpoints.clear();
+            for (int i = 0; i < 500; ++i) s.live.ids.push_back(int32_t(1000 + i));  // the shared render
+            for (int i = 0; i < 300; ++i) s.live.ids.push_back(int32_t(tail_base + i));  // re-rendered
+            ConversationCheckpoint b;
+            b.ids.assign(s.live.ids.begin(), s.live.ids.begin() + 500);
+            s.checkpoints.push_back(std::move(b));
+            return s;
+        };
+        {
+            ConversationDiskStore writer(rdir.string(), 4ull << 30, &id);
+            // Three successive re-rendered turns of ONE conversation + one unrelated spill,
+            // all written with sync put() (no cleanup runs there — that is exactly the state
+            // the old builds left behind: 4 sets of files in the dir).
+            check(writer.put(turn_spill(1500), 200, id), "23: put turn 1 (serial 200, live 1000..1799)");
+            check(writer.put(turn_spill(7000), 201, id), "23: put turn 2 re-rendered (serial 201)");
+            check(writer.put(turn_spill(8000), 202, id), "23: put turn 3 re-rendered (serial 202)");
+            SavedConversation other = sample(1000);
+            for (auto& t : other.live.ids) t += 4000;
+            for (auto& k : other.checkpoints) for (auto& t : k.ids) t += 4000;
+            check(writer.put(std::move(other), 300, id), "23: put an unrelated conversation (serial 300)");
+            check(writer.size() == 4, "23: four sets of files on disk before the restart");
+        }
+        // A fresh engine start over the same dir: the reload loads all four, then the new
+        // dedupe keeps only the newest turn of the conversation (202) plus the unrelated one.
+        ConversationDiskStore store(rdir.string(), 4ull << 30, &id);
+        const size_t loaded = store.reload_from_disk(id);
+        check(loaded == 4, "23: all four spills were read and pushed");
+        check(store.size() == 2, "23: dedupe collapsed the conversation to its newest spill");
+        check(store.entry_serial(0) == 202, "23: the newest turn (202) is the survivor");
+        check(store.entry_serial(1) == 300, "23: the unrelated conversation (300) survives");
+        check(!fs::exists(rdir / "conv-200.bin"), "23: turn 1's .bin cleaned");
+        check(!fs::exists(rdir / "conv-200.idx"), "23: turn 1's .idx cleaned");
+        check(!fs::exists(rdir / "conv-201.bin"), "23: turn 2's .bin cleaned");
+        check(fs::exists(rdir / "conv-202.bin"), "23: turn 3's .bin kept");
+        check(fs::exists(rdir / "conv-300.bin"), "23: the unrelated spill kept");
+        // best() still restores the surviving conversation from its turn boundary (the
+        // re-render rule works through the .idx fast path: ckpt_ids round-trips in the sidecar).
+        std::vector<int32_t> next_prompt;
+        for (int i = 0; i < 500; ++i) next_prompt.push_back(int32_t(1000 + i));
+        next_prompt.push_back(1);
+        const auto m = store.best(next_prompt, {}, /*cvec=*/false);
+        check(m.tokens == 500 && m.serial == 202, "23: best() still matches the turn boundary");
     }
 
     fs::remove_all(dir);

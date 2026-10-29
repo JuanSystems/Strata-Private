@@ -253,6 +253,12 @@ private:
     size_t drop_superseded_impl(const std::vector<int32_t>& ids,
                                 const std::vector<ConversationImageKey>& images,
                                 const std::vector<ConversationCheckpoint>& checkpoints, bool cvec);
+    // Post-reload cleanup: same-conversation duplicates left by earlier runs (one serial per
+    // park, none of them superseded because the client re-renders the assistant thinking).
+    // The newest serial of each conversation wins; the older files are deleted. Called at
+    // the end of reload_from_disk(), so the FIRST start after this fix collapses the
+    // accumulated duplicates (measured: 18 files for 1 conversation) back to one set.
+    size_t dedupe_loaded();
     // Post-write cleanup the writer runs: same-branch older spills go (prefix of the new live).
     size_t drop_superseded_light(const std::vector<int32_t>& ids,
                                  const std::vector<ConversationImageKey>& images, bool cvec) {
