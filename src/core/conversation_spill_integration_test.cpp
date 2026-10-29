@@ -472,6 +472,83 @@ int main() {
         check(fs::exists(dir / "build12" / "conv-42.stage0.bin"), "corrupt stage file kept for diagnostics");
     }
 
+    // ── 13. The prefix cache's snapshot survives the same-conversation cleanups ──────────────
+    // The engine captures a pinned shared prefix (pin=N) as its own image: live == its single
+    // checkpoint. To drop_superseded's rules that shape reads as "an earlier turn of this
+    // conversation" (its ids are a strict prefix of every conversation sharing the system
+    // prompt), so without the guard the first park after its creation would delete it.
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "build13").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+
+        // A pinned-prefix snapshot: the shape the engine's prefix cache captures at pin=N.
+        SavedConversation prefix = sample(150);
+        prefix.checkpoints.clear();
+        prefix.checkpoints.push_back(prefix.live);   // live IS the checkpoint at the pin
+        check(store->put(std::move(prefix), 900, id), "spill the pinned prefix snapshot");
+        // An ordinary earlier turn for comparison: a strict prefix that is NOT a prefix snapshot.
+        SavedConversation old_turn = sample(100);   // ids 1000..1099
+        check(store->put(std::move(old_turn), 901, id), "spill an ordinary earlier turn");
+        check(store->size() == 2, "both spills are in the manifest");
+
+        // The engine parks a conversation that CONTAINS both (ids 1000..1399): the ordinary
+        // turn is superseded and goes; the pinned prefix is a shared asset and stays.
+        std::vector<int32_t> longer;
+        for (int i = 0; i < 400; ++i) longer.push_back(int32_t(1000 + i));
+        const std::vector<ConversationImageKey> park_imgs = {{3, 0x1234567890abcdefull ^ 1ull}};
+        const size_t dropped = spill_drop_superseded(store.get(), longer, park_imgs, {}, false);
+        check(dropped == 1, "only the ordinary earlier turn was dropped");
+        check(store->size() == 1, "the pinned prefix snapshot stayed in the manifest");
+        check(fs::exists(dir / "build13" / "conv-900.bin"), "the prefix snapshot's file stayed");
+        check(fs::exists(dir / "build13" / "conv-900.idx"), "the prefix snapshot's .idx stayed");
+        check(!fs::exists(dir / "build13" / "conv-901.bin"), "the ordinary turn's file went");
+
+        // Reload (an engine restart) runs the same-conversation dedupe: the prefix is contained
+        // in the longer conversation written below the same way, and must survive that too.
+        SavedConversation whole = sample(400);   // ids 1000..1399, a deeper checkpoint than live
+        check(store->put(std::move(whole), 902, id), "spill the whole conversation");
+        auto store_b = make_disk_store(cfg, &id);
+        const size_t loaded = store_b->reload_from_disk(id);
+        check(loaded == 2, "reload loaded both spills");
+        check(store_b->size() == 2, "the prefix snapshot survived the reload dedupe");
+        check(fs::exists(dir / "build13" / "conv-900.bin"), "the prefix snapshot survived on disk");
+    }
+
+    // ── 14. restore_from_disk_or_ram escalates to the next match when the best one will not read
+    // The whole-conversation image is the best match but its file is corrupt; without the
+    // escalation the engine recomputed from zero. With it, the smaller pinned-prefix image is
+    // restored instead — the exact case a RAM-tight host cares about.
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "build14").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        SavedConversation prefix = sample(150);
+        prefix.checkpoints.clear();
+        prefix.checkpoints.push_back(prefix.live);
+        check(store->put(std::move(prefix), 700, id), "spill the pinned prefix");
+        SavedConversation whole = sample(400);   // contains the prefix, so best() prefers it
+        check(store->put(std::move(whole), 701, id), "spill the whole conversation");
+        { std::ofstream(dir / "build14" / "conv-701.bin", std::ios::trunc) << "corrupted"; }
+        std::vector<int32_t> prompt;
+        for (int i = 0; i < 400; ++i) prompt.push_back(int32_t(1000 + i));
+        prompt.push_back(9999);   // one more: the next turn's token
+        const std::vector<ConversationImageKey> imgs = {{3, 0x1234567890abcdefull ^ 1ull}};
+        const ConversationCache::Match none;   // the RAM cache has no match (that is why disk runs)
+        const auto m = store->best(prompt, imgs, false);
+        check(m.tokens == 400, "best() prefers the whole conversation");
+        auto from_disk = restore_from_disk_or_ram(none, store.get(), prompt, imgs, false,
+                                                   /*resume*/ 0, /*slot_tokens*/ 0, id);
+        check(from_disk.has_value(), "the escalation restored the pinned prefix, not nothing");
+        check(from_disk->live.ids.size() == 150, "the restored image is the 150-token prefix");
+        check(store->size() == 0, "both entries left the manifest (one restored, one refused)");
+        check(!from_disk->checkpoints.empty() &&
+              from_disk->checkpoints.back().ids.size() == 150,
+              "the restored prefix carries its pinned checkpoint (the engine re-marks pin=N)");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_spill_integration_test: %d checks passed\n", checks);
     return 0;

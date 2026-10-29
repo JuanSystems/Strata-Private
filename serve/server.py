@@ -3047,6 +3047,12 @@ class Service:
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
+        # Prefix cache (auto): a conversation's FIRST turn (its system message(s) + exactly one more
+        # message) resolves to strata_prefix {"messages": k}, so the engine pins the rendered system
+        # part as a shared prefix (pin=N) — every later conversation that starts with the same
+        # tokens restores that K/V instead of recomputing the long system prompt. STRATA_AUTO_PREFIX=0
+        # restores the old behavior (no injection when the request says nothing).
+        self.auto_prefix = os.getenv("STRATA_AUTO_PREFIX", "1") != "0"
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
         self.codex_thread_titles = False              # #923 (opt-in): answer Codex's thread-title turns without the engine
         self.sampling_defaults = dict(sampling_defaults or {})   # the run config's `sampling` block
@@ -3978,6 +3984,25 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
+        # Prefix cache (auto): a NEW conversation's first turn — k leading system/developer message(s)
+        # plus exactly ONE more message — pins the rendered system part as the shared prefix, exactly
+        # as if the client had sent strata_prefix {"messages": k} itself (resolve_prefix below then
+        # turns it into {"tokens": N} and the request key gets pin=N). An agent client (a coding
+        # assistant) re-sends the same long system prompt for every conversation, so pinning it once
+        # lets the engine restore those tokens for each new conversation's first request instead of
+        # recomputing them. Only requests that say nothing get it (an explicit strata_prefix wins),
+        # never with images, never a one-shot strata_checkpoint:false probe, and never a mid-
+        # conversation turn (more than one non-system message): the pinned checkpoint is marked once
+        # at the conversation's start and re-used from the chain after. STRATA_AUTO_PREFIX=0 disables.
+        if (req is not None and isinstance(req, dict) and req.get("strata_prefix") is None
+                and self.auto_prefix and not images and req.get("strata_checkpoint") is not False
+                and isinstance(messages, list) and len(messages) >= 2):
+            k = 0
+            while (k < len(messages) and isinstance(messages[k], dict)
+                   and messages[k].get("role") in ("system", "developer")):
+                k += 1
+            if 1 <= k < len(messages) and k + 1 == len(messages):
+                req["strata_prefix"] = {"messages": k}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
         return ids, kwargs.get("enable_thinking", True) is not False, max_new

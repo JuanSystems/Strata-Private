@@ -29,6 +29,20 @@ void spill_evict_one(ConversationDiskStore& store, const SessionFileIdentity& id
 
 // ── Background writer (Phase 2) ────────────────────────────────────────────────────────────
 
+// ── Prefix snapshots ───────────────────────────────────────────────────────────────────────
+// An image captured at a PINNED shared prefix (pin=N): its live ids ARE its deepest (and only)
+// checkpoint — the state was cut exactly at the pin boundary. A whole-conversation park NEVER
+// has this shape: the live state always runs past every checkpoint by at least the response
+// generated after them. Such an entry is a shared asset that many conversations branch from,
+// not a branch of one conversation, so the same-conversation cleanups (drop_superseded's prefix
+// rules, the reload dedupe) must KEEP it: to them its ids look like "an earlier turn of this
+// conversation" — a strict prefix of every conversation sharing the system prompt — and it would
+// be deleted by the first park after its creation. The disk LRU also prefers to keep it.
+static bool prefix_snapshot(const DiskEntry& e) {
+    return !e.ids.empty() && e.ids.size() == e.ckpt_ids.size() &&
+           std::equal(e.ids.begin(), e.ids.end(), e.ckpt_ids.begin());
+}
+
 bool ConversationDiskStore::holds(const std::vector<int32_t>& ids,
                                   const std::vector<ConversationImageKey>& imgs, bool cvec) const {
     if (!enabled() || ids.empty()) return false;
@@ -786,11 +800,17 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
 
 bool ConversationDiskStore::evict_oldest() {
     if (entries_.empty()) return false;
-    // entries_ is oldest-first (LRU). The front is the one to drop.
-    const DiskEntry e = std::move(entries_.front());
+    // entries_ is oldest-first (LRU). The front is the one to drop — unless it is a pinned
+    // shared prefix: those are the smallest and most-reused entries (every new conversation's
+    // first request restores one), so a budget squeeze takes an ordinary conversation first.
+    // With only prefixes left, the oldest still goes: a full disk must not wedge parking.
+    size_t victim = 0;
+    while (victim < entries_.size() && prefix_snapshot(entries_[victim])) ++victim;
+    if (victim >= entries_.size()) victim = 0;
+    const DiskEntry e = std::move(entries_[victim]);
     bytes_ -= e.file_bytes;
-    entries_.pop_front();
-    serials_.pop_front();
+    entries_.erase(entries_.begin() + (std::ptrdiff_t) victim);
+    serials_.erase(serials_.begin() + (std::ptrdiff_t) victim);
     remove_spill_files(e.path);   // .bin + .idx + .idx.tmp — best-effort, all three
     ++drops_;
     return true;
@@ -1063,6 +1083,9 @@ size_t ConversationDiskStore::dedupe_loaded() {
     };
     size_t dropped = 0;
     for (size_t i = 0; i < entries_.size();) {
+        // A pinned shared prefix is never "an older duplicate of this conversation": every
+        // conversation of the same client contains it, which is exactly why it stays.
+        if (prefix_snapshot(entries_[i])) { ++i; continue; }
         bool superseded = false;
         for (size_t j = i + 1; j < entries_.size() && !superseded; ++j) {
             if (entries_[j].cvec != entries_[i].cvec || entries_[j].ids.empty()) continue;
@@ -1134,6 +1157,7 @@ size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& i
     for (size_t i = 0; i < entries_.size();) {
         const auto& e = entries_[i];
         if (e.cvec != cvec) { ++i; continue; }
+        if (prefix_snapshot(e)) { ++i; continue; }   // a pinned shared prefix: not this conversation's branch
         // The deepest checkpoint the spill file carries is the one ConversationCache handed to
         // session_checkpoints_to_save. The manifest only stores the live prefix; if the live
         // prefix itself is what the new conversation supersedes, drop. (Phase 2: store the

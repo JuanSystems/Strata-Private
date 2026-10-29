@@ -497,7 +497,19 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
         }
         return std::nullopt;
     }
-    return const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits);
+    // ── Escalation: the best disk match is not always readable — a multi-hundred-MiB whole-
+    // conversation image can fail under RAM pressure (session_file_read's preflight / bad_alloc)
+    // or a corrupt .bin. take() removes the failed entry from the manifest (its file stays on
+    // disk), so instead of falling straight back to a full recompute, try the NEXT-best match:
+    // a smaller pinned-prefix snapshot usually still fits and covers the system prompt, which is
+    // the part worth saving. Bounded: three attempts, each a manifest scan and (on failure) a
+    // cheap refused read — never a long drain of a big manifest.
+    for (int attempt = 0; attempt < 3 && disk_match.tokens > ram_floor; ++attempt) {
+        if (auto image = const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits))
+            return image;
+        disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);
+    }
+    return std::nullopt;
 }
 
 } // namespace strata::core

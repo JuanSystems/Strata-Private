@@ -646,6 +646,13 @@ struct Options {
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
     int64_t conversation_cache_min_tokens = 0;
+    /// --prefix-sibling-tokens N: a request that resumes EXACTLY at a pinned shared prefix (pin=N,
+    /// a sibling query of the last one) does not park the branch it leaves when what that branch
+    /// added past the pin is at most this many tokens (re-reading a short tail is cheaper than
+    /// copying the prefix's whole K/V to the host — the pin's original RAG design). A longer
+    /// suffix is a conversation worth keeping: it parks (and spills) as before, so returning to
+    /// it is a restore, not a re-read of its whole history.
+    int64_t prefix_sibling_tokens = 512;
     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
     int64_t memory_limit_mib = -1;
@@ -2116,11 +2123,13 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
                  a == "--conversation-spill-gib" || a == "--conversation-spill-min-tokens" ||
+                 a == "--prefix-sibling-tokens" ||
                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
-            const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens")
+            const int64_t limit = (a == "--conversation-cache-slots" || a == "--conversation-cache-min-tokens" ||
+                                  a == "--prefix-sibling-tokens")
                                       ? INT32_MAX : INT64_MAX / (1024 * 1024);
             if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || number < 0 || number > limit) {
                 std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
@@ -2129,6 +2138,7 @@ int main(int argc, char** argv) {
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
+            else if (a == "--prefix-sibling-tokens") o.prefix_sibling_tokens = number;
             else if (a == "--conversation-spill-gib") o.conversation_spill_gib = number;
             else if (a == "--conversation-spill-min-tokens") o.conversation_spill_min_tokens = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
@@ -8187,6 +8197,14 @@ int main(int argc, char** argv) {
         // Monotonic serial for direct spills (the spill-when-cache-off path): the high half of the
         // uint64_t range, so they never collide with the cache's serials (low half, starting at 1).
         uint64_t next_direct_spill_serial = 1ull << 63;
+        // Prefix cache: the pin length (pin=N) whose prefix snapshot this run already wrote to the
+        // disk store (-1: none yet). One spill per prefix: the pinned checkpoint is captured at its
+        // creation, and that small image (the system prompt's K/V — tens of MiB, where a whole
+        // conversation runs to hundreds) restores the FIRST request of every conversation that
+        // starts with the same tokens, this session and after a restart (the file survives take()
+        // and reload; the engine's restore escalation falls back to it when a bigger image will
+        // not read).
+        int64_t prefix_spilled_pin = -1;
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -11259,8 +11277,13 @@ int main(int argc, char** argv) {
             // dozen tokens, cheaper to read than the prefix's whole K/V is to copy to the host - so it is not parked:
             // N queries keep one prefix.  A request without pin=, or one that resumes anywhere else, parks as before.
             bool pin_sibling = false;
+            // --prefix-sibling-tokens: the no-park shortcut is for a SHORT private suffix (the RAG
+            // shape the pin was designed for). An agent conversation's past-pin suffix is its whole
+            // history; dropping that to save one park would make returning to it re-read everything,
+            // so a long suffix parks (and spills) as any other request does.
             if (req_pin > 0 && req_ckpt && o.prompt_cache >= 3 && !from_live && !incoming && slot_source < 0 &&
-                resume == req_pin && live_ok)
+                resume == req_pin && live_ok &&
+                std::max<int64_t>(0, (int64_t) live.size() - resume) <= o.prefix_sibling_tokens)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
             if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
@@ -12147,8 +12170,93 @@ int main(int argc, char** argv) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
-                if (to == pin_at && !pin_checkpoint(pin_at))
-                    std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
+                if (to == pin_at) {
+                    if (pin_checkpoint(pin_at)) {
+                        // ── Prefix cache: the pinned checkpoint was JUST created — this request read past
+                        // pin_at for the first time (later conversations with the same leading tokens
+                        // re-mark the checkpoint instead of re-reading). Right here the session IS the
+                        // prefix: at == to == pin_at, its cells [0, pin_at) valid and stable. Capture
+                        // that as its own small image — the system prompt's K/V, tens of MiB where a
+                        // whole conversation's park runs to hundreds — and hand it to the disk
+                        // store's background writer. A later conversation's FIRST request (this run
+                        // or after a restart) restores it and reads only its suffix. Once per pin
+                        // length per run: the file survives take() (kept as a backup) and restarts
+                        // (reload), so re-spilling the same prefix adds nothing.
+                        if (pin_at != prefix_spilled_pin) {
+                            const ConvCheckpoint* pin_ckpt = nullptr;
+                            for (const ConvCheckpoint& c : checks)
+                                if ((int64_t) c.ids.size() == pin_at && c.pinned) pin_ckpt = &c;
+                            if (pin_ckpt != nullptr) try {
+                                // copies first: a later cut's checkpoint_at can reallocate `checks`
+                                const std::vector<int32_t> prefix_ids = pin_ckpt->ids;
+                                const std::vector<ConversationImageKey> prefix_imgs = pin_ckpt->imgs;
+                                std::vector<ConvCheckpoint> prefix_checks;
+                                prefix_checks.push_back(*pin_ckpt);
+                                if (stages.empty() && disk_store_ptr != nullptr && spill_attached) {
+                                    const strata::core::ConversationView pview{prefix_ids, prefix_imgs,
+                                                                               prefix_checks, cvec_cached};
+                                    const auto t0 = Clock::now();
+                                    std::string perr;   // its own: a failure here is not the request's
+                                    strata::core::SavedConversation image;
+                                    size_t reused_bytes = 0;
+                                    const bool sync_ok = cudaDeviceSynchronize() == cudaSuccess;
+                                    if (!sync_ok) perr = "device sync failed";
+                                    const bool save_ok = sync_ok && strata::core::conversation_snapshot_save(
+                                            image, pview, ss, g, use_mtp ? &mtp.kv_state() : nullptr, perr,
+                                            strata::core::ConversationKvReuse{}, &reused_bytes);
+                                    if (save_ok) {
+                                        const size_t prefix_bytes = image.bytes();
+                                        const uint64_t serial = next_direct_spill_serial++;
+                                        if (disk_store_ptr->put_async(std::move(image), serial, spill_identity)) {
+                                            prefix_spilled_pin = pin_at;
+                                            std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
+                                                                 "tokens, spilled %.1f MiB to disk in %.1f ms "
+                                                                 "(the first request of every conversation that "
+                                                                 "starts with these tokens restores it)\n",
+                                                         (long long) pin_at, prefix_bytes / (1024.0 * 1024.0),
+                                                         std::chrono::duration<double, std::milli>(
+                                                             Clock::now() - t0).count());
+                                        } else {
+                                            std::fprintf(stderr, "strata serve: prefix cache: the disk store did not "
+                                                                 "take the %lld-token prefix image\n",
+                                                         (long long) pin_at);
+                                        }
+                                    } else {
+                                        std::fprintf(stderr, "strata serve: prefix cache: capture failed (%s); the "
+                                                             "pinned prefix stays in the session chain\n",
+                                                     perr.c_str());
+                                    }
+                                } else if (stages.empty()) {
+                                    static bool said_no_store = false;
+                                    if (!said_no_store) {
+                                        said_no_store = true;
+                                        std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
+                                                             "tokens; --conversation-spill-gib would also "
+                                                             "keep them across restarts\n", (long long) pin_at);
+                                    }
+                                } else {
+                                    static bool said_split = false;
+                                    if (!said_split) {
+                                        said_split = true;
+                                        std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
+                                                             "tokens; the prefix spill needs a single GPU and "
+                                                             "this engine runs a layer split, so the pin "
+                                                             "stays in the session chain\n",
+                                                     (long long) pin_at);
+                                    }
+                                }
+                            } catch (const std::bad_alloc&) {
+                                std::fprintf(stderr, "strata serve: prefix cache: allocation failed; the pinned "
+                                                     "prefix stays in the session chain\n");
+                            } catch (const std::exception& e) {
+                                std::fprintf(stderr, "strata serve: prefix cache: capture failed (%s); the pinned "
+                                                     "prefix stays in the session chain\n", e.what());
+                            }
+                        }   // pin_at != prefix_spilled_pin
+                    } else {
+                        std::fprintf(stderr, "strata serve: pin=%lld: its checkpoint was not kept\n", (long long) pin_at);
+                    }
+                }
                 if (trace && to == message_at)
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));

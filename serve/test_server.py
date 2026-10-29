@@ -1636,6 +1636,59 @@ class SharedPrefix(unittest.TestCase):
         self.assertEqual(ids, self.svc.prepare(self.MSGS, None, {}, 16)[0])
 
 
+class AutoPrefix(unittest.TestCase):
+    """The prefix cache: a NEW conversation's first turn (its system message(s) plus exactly one
+    more message) resolves to strata_prefix {"messages": k} even when the client said nothing —
+    an agent client re-sends the same long system prompt for every conversation, and the engine
+    pins it once so every first request restores it instead of recomputing. Everything else (a
+    mid-conversation turn, an explicit strata_prefix, a one-shot probe, no leading system
+    message, STRATA_AUTO_PREFIX=0) is left exactly as before."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.tok = tok
+        cls.first_turn = [{"role": "system", "content": "You are a coding agent."},
+                          {"role": "user", "content": "hello"}]
+        cls.later_turn = [{"role": "system", "content": "You are a coding agent."},
+                          {"role": "user", "content": "hello"},
+                          {"role": "assistant", "content": "hi there"},
+                          {"role": "user", "content": "and now?"}]
+
+    def test_first_turn_pins_the_system_message(self):
+        req = {}
+        ids, _, _ = self.svc.prepare(self.first_turn, None, {}, 16, req=req)
+        self.assertIn("tokens", req["strata_prefix"], req)   # {"messages": 1} resolved to a pin
+        n = req["strata_prefix"]["tokens"]
+        text = self.tok.decode(ids[:n], errors="replace")
+        self.assertTrue(text.endswith("agent.<|im_end|>\n"), text[-40:])   # right where the user turn starts
+        self.assertEqual(self.tok.decode(ids[n:n + 1]), "<|im_start|>")
+
+    def test_later_turns_and_other_requests_are_left_alone(self):
+        req = {}
+        self.svc.prepare(self.later_turn, None, {}, 16, req=req)          # four messages: not a first turn
+        self.assertNotIn("strata_prefix", req)
+        req = {"strata_prefix": {"tokens": 7}}                              # an explicit one wins
+        self.svc.prepare(self.first_turn, None, {}, 16, req=req)
+        self.assertEqual(req["strata_prefix"], {"tokens": 7})
+        req = {"strata_checkpoint": False}                                  # a one-shot probe pins nothing
+        self.svc.prepare(self.first_turn, None, {}, 16, req=req)
+        self.assertNotIn("strata_prefix", req)
+        req = {}
+        self.svc.prepare([{"role": "user", "content": "hello"}], None, {}, 16, req=req)   # no system message
+        self.assertNotIn("strata_prefix", req)
+        self.svc.prepare(self.first_turn, None, {}, 16)                    # req=None (the web app): unchanged
+
+    def test_env_turns_it_off(self):
+        with mock.patch.dict(os.environ, {"STRATA_AUTO_PREFIX": "0"}):
+            fresh = Service(MockEngine(self.tok, "ok", max_context=CTX), self.tok,
+                            ChatTemplate(ROOT / "serve/chat_template.jinja"))
+            req = {}
+            fresh.prepare(self.first_turn, None, {}, 16, req=req)
+            self.assertNotIn("strata_prefix", req)
+
+
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
