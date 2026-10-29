@@ -51,6 +51,28 @@ std::string ConversationDiskStore::path_for(uint64_t serial) const {
     return dir_ + "/conv-" + std::to_string(serial) + ".bin";
 }
 
+// ── Stage files (a layer split's spill) ─────────────────────────────────────────────────────
+// Each later stage's image is a self-contained SavedConversation (its own layer carve and K/V),
+// so each one is written as its own v1 session file next to the main .bin. The main .bin is the
+// commit point: it is renamed into place LAST, so a crash mid-put leaves orphan stage files
+// without a main (cleaned by reload_from_disk), never a main whose stages are missing.
+std::string ConversationDiskStore::path_for_stage(uint64_t serial, size_t k) const {
+    return dir_ + "/conv-" + std::to_string(serial) + ".stage" + std::to_string(k) + ".bin";
+}
+
+uint64_t ConversationDiskStore::stage_files_bytes(uint64_t serial) const {
+    uint64_t total = 0;
+    for (size_t k = 0; ; ++k) {
+        std::error_code ec;
+        const std::string spath = path_for_stage(serial, k);
+        if (!fs::exists(spath, ec) || ec) break;
+        const uint64_t sb = fs::file_size(spath, ec);
+        if (ec) break;
+        total += sb;
+    }
+    return total;
+}
+
 // ── Sidecar .idx: cheap manifest metadata without parsing the .bin ──────────────────────────
 // The .idx is a small (few hundred bytes) sidecar file written next to each conv-<serial>.bin.
 // It carries exactly the fields DiskEntry needs (ids, imgs, geometry, layer_lo/hi, cvec,
@@ -345,9 +367,10 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
 }
 
 void ConversationDiskStore::remove_spill_files(const std::string& bin_path) {
-    // Best-effort removal of a spill's .bin, .idx and .idx.tmp. The .bin path is the input; the
-    // .idx path replaces the .bin suffix with .idx (NOT .bin + ".idx"). Any of the three may
-    // not exist; all errors are swallowed. Used by every site that today does fs::remove(.bin).
+    // Best-effort removal of a spill's every file: .bin, .idx, .idx.tmp, and a layer split's
+    // conv-<serial>.stage<k>.bin (+ .tmp). The .bin path is the input; the .idx path replaces
+    // the .bin suffix with .idx (NOT .bin + ".idx"). Any of them may not exist; all errors are
+    // swallowed. Used by every site that today does fs::remove(.bin).
     std::error_code ec;
     fs::remove(bin_path, ec);
     // Derive conv-<serial>.idx from conv-<serial>.bin (replace the last 4 chars ".bin" with ".idx").
@@ -357,6 +380,23 @@ void ConversationDiskStore::remove_spill_files(const std::string& bin_path) {
     }
     fs::remove(idx_path, ec);
     fs::remove(idx_path + ".tmp", ec);
+    // Stage files: everything sharing the serial's prefix "conv-<serial>." — the '.' right after
+    // the serial keeps it from matching a longer serial (conv-808. never matches conv-8081.bin).
+    // A directory scan is fine: spill dirs hold a few dozen files and removals are rare.
+    const size_t slash = bin_path.find_last_of('/');
+    const std::string dir = slash == std::string::npos ? std::string() : bin_path.substr(0, slash);
+    const std::string fname = slash == std::string::npos ? bin_path : bin_path.substr(slash + 1);
+    if (!dir.empty() && fname.size() > 4 && fname.compare(fname.size() - 4, 4, ".bin") == 0 &&
+        fname.rfind("conv-", 0) == 0) {
+        const std::string prefix = fname.substr(0, fname.size() - 4) + '.';   // "conv-<serial>."
+        std::error_code it_ec;
+        for (const auto& entry : fs::directory_iterator(dir, it_ec)) {
+            if (it_ec) break;
+            const std::string name = entry.path().filename().string();
+            if (name.size() > prefix.size() && name.compare(0, prefix.size(), prefix) == 0)
+                fs::remove(entry.path(), ec);
+        }
+    }
 }
 
 void ConversationDiskStore::erase(size_t index) {
@@ -434,6 +474,31 @@ bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
         // Leave a sane default headroom: 256 MiB. A full disk degrades to today's behavior.
         opts.min_free_bytes = 256ull * 1024 * 1024;
     }
+    // ── Stage files (a layer split's later stages), written BEFORE the main .bin. The main is
+    // the put's commit point: renamed into place last, so a crash mid-put leaves orphan stage
+    // files without a main (cleaned by reload_from_disk), never a published main whose stages
+    // are missing — an entry that would restore as 0 stages and be discarded by the engine.
+    // On a stage write failure nothing is published: remove this attempt's stage files.
+    const size_t n_stages = image.stage_images.size();
+    uint64_t stage_bytes = 0;
+    for (size_t k = 0; k < n_stages; ++k) {
+        size_t s_written = 0;
+        std::string s_error;
+        SessionStatus s_status;
+        const std::string spath = path_for_stage(serial, k);
+        if (!session_file_write(spath, image.stage_images[k], id, s_written, s_error, opts, &s_status)) {
+            std::fprintf(stderr, "strata serve: conversation spill: stage %zu/%zu file write failed "
+                                 "(%s); spill aborted, nothing published\n",
+                         k, n_stages, s_error.c_str());
+            std::error_code ec;
+            for (size_t j = 0; j <= k; ++j) {
+                fs::remove(path_for_stage(serial, j), ec);          // the ones that published
+                fs::remove(path_for_stage(serial, j) + ".tmp", ec); // the one that failed
+            }
+            return false;
+        }
+        stage_bytes += s_written;
+    }
     const bool ok = session_file_write(e.path, image, id, written, error, opts, &status);
     // image is consumed conceptually by the write (it reads its K/V); we move it to discard.
     // The disk store does NOT keep a copy in RAM — that's the whole point of the disk tier.
@@ -441,14 +506,21 @@ bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
     if (!ok) {
         // Disk full / I/O error / RAM refusal (shouldn't happen on the write side, but preflight
         // can refuse on min_free_bytes). The file was never published (rename did not happen).
-        // Clean up any leftover temp file.
+        // Clean up any leftover temp file and the stage files just written (their main never
+        // published, so they would be orphans).
         std::error_code ec;
         fs::remove(e.path + ".tmp", ec);   // best-effort
+        for (size_t k = 0; k < n_stages; ++k) {
+            fs::remove(path_for_stage(serial, k), ec);
+            fs::remove(path_for_stage(serial, k) + ".tmp", ec);
+        }
         return false;
     }
-    e.file_bytes = written;
+    // The entry's disk footprint is the main .bin plus its stage files — the budget and the LRU
+    // must see the true cost of the spill (a layer split doubles it).
+    e.file_bytes = written + stage_bytes;
     e.used = next_used_++;
-    bytes_ += written;
+    bytes_ += e.file_bytes;   // main + stage files: erase()/evict_oldest() subtract the same total
     entries_.push_back(std::move(e));
     serials_.push_back(serial);
     ++writes_;
@@ -511,6 +583,32 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
             if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
         }
         return std::nullopt;
+    }
+    // ── Stage files: read back a layer split's later stages (conv-<serial>.stage<k>.bin, k=0..).
+    // Stop at the first MISSING k (a single-session engine's spill has none). A stage file
+    // that exists but fails to read fails the whole take — a partial image would restore as
+    // fewer stages than the engine has and be discarded by its stage count check anyway; keep
+    // the files (same policy as a failed main read) and let the engine recompute.
+    for (size_t k = 0; ; ++k) {
+        std::error_code ec;
+        const std::string spath = path_for_stage(m.serial, k);
+        if (!fs::exists(spath, ec) || ec) break;
+        SavedConversation stage_img;
+        size_t s_read = 0;
+        std::string s_error;
+        SessionStatus s_status;
+        if (!session_file_read(spath, id, stage_img, s_read, s_error, limits, &s_status)) {
+            std::fprintf(stderr, "[strata diag] spill take: SKIP %s (stage %zu read failed, KEPT on disk): "
+                                 "error=%s, status=%d\n",
+                         spath.c_str(), k, s_error.c_str(), (int) s_status.error);
+            // Same as a failed main read: remove from the manifest (not usable right now),
+            // keep every file, return nothing.
+            for (size_t i = 0; i < serials_.size(); ++i) {
+                if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
+            }
+            return std::nullopt;
+        }
+        back.stage_images.push_back(std::move(stage_img));
     }
     // Success: the conversation is back in RAM. Remove from the manifest but DON'T delete the
     // file — the user wants conversations preserved on disk. The file will be replaced only
@@ -607,22 +705,53 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     // built oldest-first — mirrors the order put() inserts at).
     struct SpillFile { fs::path path; uint64_t serial; };
     std::vector<SpillFile> files;
+    // A layer split's stage files (conv-<serial>.stage<k>.bin): collected to clean orphans and
+    // to keep them from being mistaken for mains — "conv-808.stage0.bin" ends in .bin and its
+    // digits parse to 808, which would load serial 808 twice.
+    std::vector<std::pair<fs::path, uint64_t>> stage_files;
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
         if (ec) break;
         const std::string name = entry.path().filename().string();
-        if (name.rfind("conv-", 0) == 0 && name.size() > 9 &&
-            name.compare(name.size() - 4, 4, ".bin") == 0) {
-            uint64_t serial = 0;
-            try {
-                serial = std::stoull(name.substr(5, name.size() - 9));
-            } catch (...) {
-                remove_spill_files(entry.path().string());   // invalid conv-<serial>.bin name: drop .bin + .idx
-                continue;
-            }
-            files.push_back({entry.path(), serial});
-        } else if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) {
             // Leftover .tmp from an interrupted write (.bin.tmp or .idx.tmp): clean it up.
             fs::remove(entry.path(), ec);
+            continue;
+        }
+        if (name.rfind("conv-", 0) != 0 || name.size() <= 5) continue;
+        // conv-<digits>.<tail>: the serial runs to the first '.', the tail names the file's
+        // role — "bin" the main, "idx" the sidecar, "stage<k>.bin" a later stage's image.
+        size_t p = 5;
+        while (p < name.size() && name[p] >= '0' && name[p] <= '9') ++p;
+        if (p == 5 || p >= name.size() || name[p] != '.') {
+            // Not conv-<digits>.… — a junk conv-*.bin name (the old scan removed these): drop it
+            // with its sidecar. A conv-.bin (9 chars) is left alone, as before.
+            if (name.size() > 9 && name.compare(name.size() - 4, 4, ".bin") == 0)
+                remove_spill_files(entry.path().string());
+            continue;
+        }
+        uint64_t serial = 0;
+        try {
+            serial = std::stoull(name.substr(5, p - 5));
+        } catch (...) {
+            remove_spill_files(entry.path().string());   // invalid serial: drop .bin + .idx (+ stages)
+            continue;
+        }
+        const std::string tail = name.substr(p + 1);
+        if (tail == "bin") {
+            files.push_back({entry.path(), serial});
+        } else if (tail.rfind("stage", 0) == 0) {
+            stage_files.push_back({entry.path(), serial});
+        }
+        // ".idx" (and anything else) is read through path_for_idx, not scanned here
+    }
+    // Orphan stage files: a later stage's image whose main .bin is gone (an interrupted put
+    // whose main never published, or a removal by a build that did not know about stage files).
+    // Unreachable — take() only reads stages of a serial whose main read succeeded — remove.
+    {
+        std::error_code ec2;
+        for (const auto& sf : stage_files) {
+            const std::string main_path = path_for(sf.second);
+            if (!fs::exists(main_path, ec2) || ec2) fs::remove(sf.first, ec2);
         }
     }
     if (files.empty()) return 0;
@@ -698,7 +827,10 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             e.layer_lo = image.layer_lo;
             e.layer_hi = image.layer_hi;
             e.cvec = image.cvec;
-            e.file_bytes = bytes_read;
+            // The .bin parse covers the main image only; a layer split's stage files belong to
+            // this entry too (put() counted them into its file_bytes, and the fresh .idx fast
+            // path carries that total — the slow path must arrive at the same number).
+            e.file_bytes = bytes_read + stage_files_bytes(serial);
             e.used = next_used_++;
             { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
             // LRU evict if over budget: drop the oldest entries (the front of entries_, which
@@ -710,7 +842,7 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             if (e.file_bytes > budget_) continue;   // single file bigger than the whole budget
             entries_.push_back(std::move(e));
             serials_.push_back(serial);
-            bytes_ += bytes_read;
+            bytes_ += e.file_bytes;   // main + stage files (put()'s accounting, restored here)
             ++loaded;
             // Re-write the .idx that was missing/stale — best-effort, same as put().
             // On failure the slow path runs again next start; no data loss.

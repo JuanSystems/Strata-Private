@@ -8332,15 +8332,32 @@ int main(int argc, char** argv) {
                     strata::core::ConversationKvReuse empty_reuse;
                     if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
                             std::move(empty_reuse), &reused_bytes)) return false;
+                    // A layer split parks one image per stage: without the later stages' K/V the
+                    // spill restores as 0 stage images and the engine discards it (the stage count
+                    // check) — the conversation would recompute on every restart. Capture each
+                    // stage exactly like the RAM park below, so put() can write conv-*.stage<k>.bin.
+                    for (size_t k = 0; k < n_st; ++k) {
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                        strata::core::SavedConversation part;
+                        if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                                strata::core::ConversationKvReuse{}, &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
+                    }
                     const size_t spill_tokens = image.live.ids.size();
                     const size_t spill_bytes = image.bytes();
                     const uint64_t spill_serial = next_direct_spill_serial++;
                     if (disk_store_ptr->put(std::move(image), spill_serial, spill_identity)) {
                         const double spill_ms = std::chrono::duration<double, std::milli>(
                             Clock::now() - t0).count();
-                        std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB) "
-                                             "to disk in %.1f ms (auto-spill after response; the next restart restores it)\n",
-                                     spill_tokens, spill_bytes / (1024.0 * 1024.0), spill_ms);
+                        std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB, "
+                                             "%zu stage image%s) to disk in %.1f ms (auto-spill after response; "
+                                             "the next restart restores it)\n",
+                                     spill_tokens, spill_bytes / (1024.0 * 1024.0), n_st,
+                                     n_st == 1 ? "" : "s", spill_ms);
                     } else {
                         std::fprintf(stderr, "strata serve: conversation cache: disk spill write failed "
                                              "(%zu tokens); the conversation stays in RAM only\n", spill_tokens);
@@ -11129,8 +11146,11 @@ int main(int argc, char** argv) {
                             for (const auto& entry : std::filesystem::directory_iterator(spill_dir, ec)) {
                                 if (ec) break;
                                 const std::string name = entry.path().filename().string();
+                                // Skip a layer split's per-stage files (conv-<serial>.stage<k>.bin): their serial
+                                // is the main's, and the floor only needs serials that exist as mains.
                                 if (name.rfind("conv-", 0) == 0 && name.size() > 9 &&
-                                    name.compare(name.size() - 4, 4, ".bin") == 0) {
+                                    name.compare(name.size() - 4, 4, ".bin") == 0 &&
+                                    name.find(".stage") == std::string::npos) {
                                     try {
                                         const uint64_t s = std::stoull(name.substr(5, name.size() - 9));
                                         if (!any_seen || s > max_seen) { max_seen = s; any_seen = true; }
@@ -11153,12 +11173,14 @@ int main(int argc, char** argv) {
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
+            bool incoming_from_disk = false;   // the disk restore fallback filled `incoming`?
             if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             // ── Restore-path fallback: when the RAM cache has no usable prefix, consult the disk store.
             if (!incoming && disk_store_ptr != nullptr) {
                 if (auto from_disk = strata::core::restore_from_disk_or_ram(
                         parked, disk_store_ptr, ids, req_imgs, want_cvec, resume, slot_tokens, spill_identity)) {
                     incoming.emplace(std::move(*from_disk));
+                    incoming_from_disk = true;
                     std::fprintf(stderr, "strata serve: conversation spill: restored %zu tokens from disk "
                                          "(RAM cache had no match)\n", incoming->live.ids.size());
                 }
@@ -11177,6 +11199,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "[strata diag] DISCARD: stage count mismatch (image has %zu stages, "
                                      "engine has %zu)\n",
                              incoming->stage_images.size(), stages.size());
+                if (incoming_from_disk && incoming->stage_images.empty() && !stages.empty())
+                    std::fprintf(stderr, "[strata diag]   the spill file predates per-stage spill files "
+                                         "(written by an older build without conv-*.stage<k>.bin); it "
+                                         "cannot restore under this layer split and will be superseded\n");
                 std::fprintf(stderr, "strata serve: conversation cache: discard snapshot (stage count)\n");
                 incoming.reset();
             }

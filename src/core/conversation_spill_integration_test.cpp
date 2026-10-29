@@ -371,6 +371,107 @@ int main() {
         check(cache.put(std::move(b)), "park B evicts A (drops, no spill)");
     }
 
+    // ── 10. Stage files (a layer split's spill): put writes conv-<s>.stage<k>.bin, take reads
+    // them back, and the manifest's bytes() counts them. The main .bin alone would restore as
+    // 0 stage images and the engine's stage-count check would discard it — the exact bug this
+    // round-trip guards against.
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "build10").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        SavedConversation s = sample(400);
+        // Two later stages, each a self-contained image (its own carve and K/V).
+        SavedConversation stage_a = sample(400);
+        stage_a.layer_lo = 24; stage_a.layer_hi = 48;
+        for (auto& kv : stage_a.kv) kv.cells = 2048;   // distinct K/V contents per stage
+        SavedConversation stage_b = sample(400);
+        stage_b.layer_lo = 48; stage_b.layer_hi = 48;
+        for (auto& kv : stage_b.kv) kv.cells = 4096;
+        s.stage_images.push_back(std::move(stage_a));
+        s.stage_images.push_back(std::move(stage_b));
+        check(store->put(std::move(s), 77, id), "put with two stage images");
+        check(fs::exists(dir / "build10" / "conv-77.bin"), "main spill file exists");
+        check(fs::exists(dir / "build10" / "conv-77.stage0.bin"), "stage 0 file exists");
+        check(fs::exists(dir / "build10" / "conv-77.stage1.bin"), "stage 1 file exists");
+        const uint64_t main_sz = fs::file_size(dir / "build10" / "conv-77.bin");
+        const uint64_t s0_sz = fs::file_size(dir / "build10" / "conv-77.stage0.bin");
+        const uint64_t s1_sz = fs::file_size(dir / "build10" / "conv-77.stage1.bin");
+        check(store->bytes() == main_sz + s0_sz + s1_sz, "bytes() counts main + stage files");
+        // take() restores the whole image: main + both stages, contents intact.
+        ConversationCache::Match m;
+        m.serial = 77; m.tokens = 400; m.live = true;
+        auto back = store->take(m, id);
+        check(back.has_value(), "take returned the image");
+        check(back->stage_images.size() == 2, "both stage images restored");
+        check(back->stage_images[0].kv[0].cells == 2048, "stage 0 K/V survived the round-trip");
+        check(back->stage_images[1].kv[0].cells == 4096, "stage 1 K/V survived the round-trip");
+        check(back->layer_lo == 0 && back->layer_hi == 48, "main image carve intact");
+        check(back->stage_images[0].layer_lo == 24 && back->stage_images[0].layer_hi == 48,
+              "stage 0 carve survived");
+        check(fs::exists(dir / "build10" / "conv-77.bin"), "files kept on disk after take (policy)");
+        // A second spill with stages, then evict_oldest: main, .idx AND stage files all go.
+        // (conv-77's files stay: take() keeps them on disk by policy.)
+        SavedConversation s2 = sample(300);
+        s2.stage_images.push_back(sample(300));
+        check(store->put(std::move(s2), 78, id), "second spill with one stage");
+        check(store->evict_oldest(), "evict_oldest dropped the oldest entry");
+        check(!fs::exists(dir / "build10" / "conv-78.bin"), "evict removed the evicted main .bin");
+        check(!fs::exists(dir / "build10" / "conv-78.idx"), "evict removed the evicted .idx");
+        check(!fs::exists(dir / "build10" / "conv-78.stage0.bin"), "evict removed the evicted stage file");
+        check(fs::exists(dir / "build10" / "conv-77.stage0.bin"), "the taken spill's files are untouched");
+    }
+
+    // ── 11. reload_from_disk: stage bytes counted, orphan stage files cleaned, and a stage
+    // file never loads as a second conversation (conv-808.stage0.bin must not be serial 808's
+    // duplicate — the old name scan parsed its digits to the main's serial).
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "build11").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        SavedConversation s = sample(300);
+        s.stage_images.push_back(sample(300));
+        check(store->put(std::move(s), 5, id), "spill with one stage image");
+        // An orphan stage file: its main conv-99.bin does not exist.
+        fs::copy_file(dir / "build11" / "conv-5.stage0.bin", dir / "build11" / "conv-99.stage0.bin");
+        // A fresh store on the same dir replays the directory as an engine restart would.
+        auto store2 = make_disk_store(cfg, &id);
+        const size_t loaded = store2->reload_from_disk(id);
+        check(loaded == 1, "reload loaded exactly one conversation");
+        check(store2->size() == 1, "stage file was not loaded as a second conversation");
+        const uint64_t main_sz = fs::file_size(dir / "build11" / "conv-5.bin");
+        const uint64_t st0_sz = fs::file_size(dir / "build11" / "conv-5.stage0.bin");
+        check(store2->bytes() == main_sz + st0_sz, "reload accounted main + stage bytes");
+        check(!fs::exists(dir / "build11" / "conv-99.stage0.bin"), "orphan stage file removed");
+        // The reloaded entry still round-trips its stage through take().
+        ConversationCache::Match m;
+        m.serial = 5; m.tokens = 300; m.live = true;
+        auto back = store2->take(m, id);
+        check(back.has_value() && back->stage_images.size() == 1,
+              "reload -> take restored the stage image");
+    }
+
+    // ── 12. A corrupt stage file fails the whole take (no partial image out of the disk tier),
+    // and every file is kept for diagnostics — the engine recomputes instead.
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "build12").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        SavedConversation s = sample(200);
+        s.stage_images.push_back(sample(200));
+        check(store->put(std::move(s), 42, id), "spill with one stage for the corrupt test");
+        { std::ofstream(dir / "build12" / "conv-42.stage0.bin", std::ios::trunc) << "corrupted"; }
+        ConversationCache::Match m;
+        m.serial = 42; m.tokens = 200; m.live = true;
+        auto back = store->take(m, id);
+        check(!back.has_value(), "take refused a corrupt stage file (no partial restore)");
+        check(store->size() == 0, "the entry left the manifest");
+        check(fs::exists(dir / "build12" / "conv-42.bin"), "main file kept after the failed take");
+        check(fs::exists(dir / "build12" / "conv-42.stage0.bin"), "corrupt stage file kept for diagnostics");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_spill_integration_test: %d checks passed\n", checks);
     return 0;
