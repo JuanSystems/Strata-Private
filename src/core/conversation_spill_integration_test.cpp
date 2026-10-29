@@ -687,6 +687,90 @@ int main() {
         }
     }
 
+    // ── 16. A LAYER SPLIT's prefix snapshot: pfx-<serial>.stage<k>.bin round-trip ────────────
+    // Kaggle runs 2 GPUs and the engine a layer split; the prefix spill used to bail out on
+    // a split (single-GPU only), so the cross-conversation cache never reached the disk there.
+    // Now the prefix writes one image per stage under its own name: the files must exist,
+    // count toward the budget, restore through take() WITHOUT consuming the entry (a shared
+    // asset), reload on both paths (the .idx fast one rewrites after a removed sidecar too),
+    // clean orphan pfx stage files, and purge on a disabled start.
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "build16").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        const fs::path d16 = dir / "build16";
+
+        // A pinned-prefix snapshot WITH one later stage (what a 2-GPU engine captures).
+        SavedConversation prefix = sample(150);
+        prefix.checkpoints.clear();
+        prefix.checkpoints.push_back(prefix.live);   // live IS the checkpoint at the pin
+        SavedConversation stage0 = sample(150);
+        stage0.layer_lo = 24; stage0.layer_hi = 48;   // the second GPU's carve
+        for (auto& kv : stage0.kv) kv.cells = 2048;   // distinct K/V contents
+        prefix.stage_images.push_back(std::move(stage0));
+        check(store->put(std::move(prefix), 850, id, {}, true),
+              "put the layer-split prefix snapshot (kind=prefix)");
+        check(fs::exists(d16 / "pfx-850.bin"), "the main is pfx-850.bin");
+        check(fs::exists(d16 / "pfx-850.stage0.bin"), "the stage file is pfx-850.stage0.bin");
+        check(!fs::exists(d16 / "conv-850.bin"), "no conv-850.bin for a prefix write");
+        const uint64_t main_sz = fs::file_size(d16 / "pfx-850.bin");
+        const uint64_t st0_sz = fs::file_size(d16 / "pfx-850.stage0.bin");
+        check(store->bytes() == main_sz + st0_sz, "bytes() counts the prefix's main + stage file");
+
+        // take(): the image comes back with its stage, and the shared entry is NOT consumed.
+        ConversationCache::Match m;
+        m.serial = 850; m.tokens = 150; m.live = true;
+        auto back = store->take(m, id);
+        check(back.has_value() && back->live.ids.size() == 150, "the split prefix restored");
+        check(back->stage_images.size() == 1, "its stage image restored with it");
+        check(back->stage_images[0].kv[0].cells == 2048, "the stage K/V survived the round-trip");
+        check(back->stage_images[0].layer_lo == 24 && back->stage_images[0].layer_hi == 48,
+              "the stage carve survived");
+        check(store->size() == 1, "take() did not consume the shared split prefix");
+        check(fs::exists(d16 / "pfx-850.stage0.bin"), "the split prefix's files stayed on disk");
+
+        // Reload (a restart), the .idx fast path first: the stage bytes count, the kind is
+        // re-derived from the pfx- name, and the pfx-*.stage* name is NOT junk anymore.
+        auto store_b = make_disk_store(cfg, &id);
+        check(store_b->reload_from_disk(id) == 1, "reload loaded the split prefix (fast path)");
+        check(store_b->bytes() == main_sz + st0_sz, "reload counted main + stage bytes");
+        check(store_b->prefix_pin_lengths() == std::vector<int64_t>{150},
+              "the fast path re-derived the prefix kind from the pfx- name");
+        // The slow path too: delete the sidecar so reload must parse the .bin fully.
+        fs::remove(d16 / "pfx-850.idx");
+        auto store_c = make_disk_store(cfg, &id);
+        check(store_c->reload_from_disk(id) == 1, "reload loaded the split prefix (slow path)");
+        check(store_c->bytes() == main_sz + st0_sz, "the slow path also counted the stage bytes");
+        check(store_c->prefix_pin_lengths() == std::vector<int64_t>{150},
+              "the slow path re-derived the prefix kind from the pfx- name");
+        check(fs::exists(d16 / "pfx-850.idx"), "the slow path rewrote the sidecar");
+
+        // An orphan pfx stage file (its main pfx-999.bin does not exist): cleaned on reload,
+        // and NEVER mistaken for a conversation or a second prefix.
+        fs::copy_file(d16 / "pfx-850.stage0.bin", d16 / "pfx-999.stage0.bin");
+        auto store_d = make_disk_store(cfg, &id);
+        check(store_d->reload_from_disk(id) == 1, "the orphan added no entry");
+        check(store_d->size() == 1, "still exactly the one split prefix in the manifest");
+        check(!fs::exists(d16 / "pfx-999.stage0.bin"), "the orphan pfx stage file was removed");
+
+        // purge_on_startup cleans the split prefix's every file — main, sidecar AND stage.
+        {
+            const fs::path rp = dir / "build16c";
+            fs::create_directories(rp);
+            { std::ofstream(rp / "pfx-9.bin", std::ios::trunc) << "x";
+              std::ofstream(rp / "pfx-9.idx", std::ios::trunc) << "x";
+              std::ofstream(rp / "pfx-9.stage0.bin", std::ios::trunc) << "x";
+              std::ofstream(rp / "keep.txt", std::ios::trunc) << "x"; }
+            ConversationDiskStore purged(rp.string(), 0, &id);   // budget 0: disabled, purge-only
+            purged.purge_on_startup();
+            check(!fs::exists(rp / "pfx-9.bin"), "pfx-9.bin purged");
+            check(!fs::exists(rp / "pfx-9.idx"), "pfx-9.idx purged");
+            check(!fs::exists(rp / "pfx-9.stage0.bin"), "pfx-9.stage0.bin purged");
+            check(fs::exists(rp / "keep.txt"), "keep.txt kept");
+        }
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_spill_integration_test: %d checks passed\n", checks);
     return 0;

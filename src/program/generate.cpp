@@ -8391,13 +8391,20 @@ int main(int argc, char** argv) {
         // and hands it to the store's background writer as a PREFIX write: pfx-<serial>.bin, the
         // file named differently from the conversation spills (conv-<serial>.bin) so the
         // cross-conversation cache of zoocode's system prompt is identifiable at a glance.
+        // A LAYER SPLIT captures one image per stage — pfx-<serial>.stage<k>.bin, exactly like a
+        // conversation spill's conv-<serial>.stage<k>.bin — because the restore path rejects an
+        // image whose stage count differs from the engine's; without the stage files the prefix
+        // would restore as 0 stages under a split and be discarded. Each stage's image is cut from
+        // that stage's OWN running state (the pin checkpoint's stage_parts, moved apart by the
+        // same conversation_checkpoints_split the conversation park uses) with the K/V [0, pin)
+        // of that stage's session (the cells below the cut never change).
         // `what` names the path in the log. Returns true when this pin length is DONE for this
         // run (already held on disk, enqueued now, or the store took it); false only when the
         // capture itself failed (the pinned prefix stays in the session chain either way).
         auto spill_prefix_snapshot = [&](int64_t pin_len, const ConvCheckpoint& pc, const char* what) -> bool {
             if (pin_len < 1 || prefix_pin_held(pin_len)) return true;
-            static bool said_no_store = false, said_split = false;
-            if (stages.empty() && (disk_store_ptr == nullptr || !spill_attached)) {
+            static bool said_no_store = false;
+            if (disk_store_ptr == nullptr || !spill_attached) {
                 if (!said_no_store) {
                     said_no_store = true;
                     std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
@@ -8406,31 +8413,71 @@ int main(int argc, char** argv) {
                 }
                 return false;
             }
-            if (!stages.empty()) {
-                if (!said_split) {
-                    said_split = true;
-                    std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
-                                         "tokens; the prefix spill needs a single GPU and "
-                                         "this engine runs a layer split, so the pin "
-                                         "stays in the session chain\n", (long long) pin_len);
-                }
-                return false;
-            }
             try {
                 // copies first: the caller's `checks` can reallocate (a later cut's
                 // checkpoint_at), and the view must not point into it
                 const std::vector<int32_t> prefix_ids = pc.ids;
                 const std::vector<strata::core::ConversationImageKey> prefix_imgs = pc.imgs;
+                const size_t n_st = stages.size();
+                // Single GPU: the pin checkpoint itself is the cut. Layer split: split a COPY of
+                // it apart (the split MOVES its input's running state — `pc` belongs to the
+                // session chain and stays intact) into per-stage parts, each carrying the same
+                // ids/imgs and that stage's own state. `stage0` holds the first stage's cut with
+                // stage_parts cleared — exactly what conversation_snapshot_save_from_ckpt wants.
                 std::vector<ConvCheckpoint> prefix_checks;
-                prefix_checks.push_back(pc);
-                const strata::core::ConversationView pview{prefix_ids, prefix_imgs, prefix_checks, cvec_cached};
+                strata::core::ConversationCheckpointSplit pfx_cs;
+                if (n_st == 0) {
+                    prefix_checks.push_back(pc);
+                } else {
+                    std::vector<ConvCheckpoint> one{pc};   // copy: the split moves `one`, never `pc`
+                    pfx_cs = strata::core::conversation_checkpoints_split(std::move(one), n_st);
+                    if (pfx_cs.stage0.empty()) {
+                        std::fprintf(stderr, "strata serve: prefix cache: the %lld-token pin's "
+                                             "checkpoint is not split for %zu stages; the pin "
+                                             "stays in the session chain\n",
+                                     (long long) pin_len, n_st);
+                        return false;
+                    }
+                }
                 const auto t0 = Clock::now();
                 std::string perr;   // its own: a failure here is not the request's
                 strata::core::SavedConversation image;
+                // Main image (the first stage's cells [0, pin)): the same draft rule as the
+                // conversation park — mtp_first keeps the draft on the first session; a split
+                // with !mtp_first parks it with the LAST stage below.
+                const strata::core::QsaState* draft0 =
+                    use_mtp && (n_st == 0 || mtp_first) ? &mtp.kv_state() : nullptr;
+                const strata::core::ConversationView pview{prefix_ids, prefix_imgs,
+                                                            n_st == 0 ? prefix_checks : pfx_cs.stage0,
+                                                            cvec_cached};
                 const bool sync_ok = cudaDeviceSynchronize() == cudaSuccess;
                 if (!sync_ok) perr = "device sync failed";
-                const bool save_ok = sync_ok && strata::core::conversation_snapshot_save_from_ckpt(
-                        image, pview, ss, g, use_mtp ? &mtp.kv_state() : nullptr, perr);
+                bool save_ok = sync_ok && strata::core::conversation_snapshot_save_from_ckpt(
+                        image, pview, ss, g, draft0, perr);
+                // Later stages: each stage's session holds its own cells [0, pin). The K/V read
+                // must run on that stage's device (OnDevice), same as the conversation park.
+                if (save_ok) {
+                    for (size_t k = 0; k < n_st; ++k) {
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        strata::core::SavedConversation part;
+                        const strata::core::ConversationView view_k{prefix_ids, prefix_imgs,
+                                                                   pfx_cs.parts[k], cvec_cached};
+                        const strata::core::QsaState* draft_k =
+                            use_mtp && !mtp_first && k + 1 == n_st ? &mtp.kv_state() : nullptr;
+                        if (cudaDeviceSynchronize() != cudaSuccess) {
+                            perr = "stage sync failed";
+                            save_ok = false;
+                            break;
+                        }
+                        if (!strata::core::conversation_snapshot_save_from_ckpt(
+                                part, view_k, st->ss, g, draft_k, perr)) {
+                            save_ok = false;
+                            break;
+                        }
+                        image.stage_images.push_back(std::move(part));
+                    }
+                }
                 if (!save_ok) {
                     std::fprintf(stderr, "strata serve: prefix cache: capture failed (%s); the "
                                          "pinned prefix stays in the session chain\n", perr.c_str());
@@ -8438,17 +8485,19 @@ int main(int argc, char** argv) {
                 }
                 const size_t prefix_bytes = image.bytes();
                 const uint64_t serial = next_direct_spill_serial++;
-                // prefix=true: the store names it pfx-<serial>.bin, dedups an identical prefix
-                // a previous run left, and never drops it for a queued conversation image.
+                // prefix=true: the store names it pfx-<serial>.bin (+ pfx-<serial>.stage<k>.bin
+                // under a layer split), dedups an identical prefix a previous run left, and
+                // never drops it for a queued conversation image.
                 if (disk_store_ptr->put_async(std::move(image), serial, spill_identity, {}, true)) {
                     prefix_held_pins.push_back(pin_len);
                     std::fprintf(stderr, "strata serve: prefix cache [%s]: pinned %lld shared "
-                                         "tokens, spilled %.1f MiB as pfx-%llu.bin in %.1f ms "
+                                         "tokens, spilled %.1f MiB as pfx-%llu.bin%s in %.1f ms "
                                          "(the first request of every conversation that starts "
                                          "with these tokens — every new chat with this system "
                                          "prompt, in this run or after a restart — restores it)\n",
                                  what, (long long) pin_len, prefix_bytes / (1024.0 * 1024.0),
                                  (unsigned long long) serial,
+                                 n_st == 0 ? "" : " + stage files",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                     return true;
                 }

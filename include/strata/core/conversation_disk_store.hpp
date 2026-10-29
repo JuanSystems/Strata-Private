@@ -296,15 +296,16 @@ private:
     // low half, the direct spills' high half): the name prefix tells the kinds apart.
     std::string path_for(uint64_t serial, bool prefix = false) const;
     // A layer split's spill: one extra self-contained session file per later stage
-    // (conv-<serial>.stage<k>.bin), written by put() BEFORE the main .bin (the main is the
-    // commit point of the put) and read back by take() right after the main image. The .idx
-    // sidecar does not describe them; a stage file's bytes count toward DiskEntry::file_bytes.
-    std::string path_for_stage(uint64_t serial, size_t k) const;
+    // (conv-<serial>.stage<k>.bin; a shared-prefix snapshot's is pfx-<serial>.stage<k>.bin),
+    // written by put() BEFORE the main .bin (the main is the commit point of the put) and
+    // read back by take() right after the main image. The .idx sidecar does not describe
+    // them; a stage file's bytes count toward DiskEntry::file_bytes.
+    std::string path_for_stage(uint64_t serial, size_t k, bool prefix = false) const;
     // Total size of serial's stage files on disk (0 when the spill has none; a stat error
     // ends the sum, never throws). reload_from_disk's slow path adds this to the entry's
     // file_bytes: the .bin parse covers the main image only, and the .idx (when fresh)
     // already carries the put-time total, which includes the stage files.
-    uint64_t stage_files_bytes(uint64_t serial) const;
+    uint64_t stage_files_bytes(uint64_t serial, bool prefix = false) const;
     // Sidecar .idx: <dir>/conv-<serial>.idx (or pfx-<serial>.idx for a prefix snapshot) —
     // small manifest metadata without parsing the .bin.
     std::string path_for_idx(uint64_t serial, bool prefix = false) const;

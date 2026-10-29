@@ -255,15 +255,15 @@ std::string ConversationDiskStore::path_for(uint64_t serial, bool prefix) const 
 // so each one is written as its own v1 session file next to the main .bin. The main .bin is the
 // commit point: it is renamed into place LAST, so a crash mid-put leaves orphan stage files
 // without a main (cleaned by reload_from_disk), never a main whose stages are missing.
-std::string ConversationDiskStore::path_for_stage(uint64_t serial, size_t k) const {
-    return dir_ + "/conv-" + std::to_string(serial) + ".stage" + std::to_string(k) + ".bin";
+std::string ConversationDiskStore::path_for_stage(uint64_t serial, size_t k, bool prefix) const {
+    return dir_ + "/" + kind_name(prefix) + std::to_string(serial) + ".stage" + std::to_string(k) + ".bin";
 }
 
-uint64_t ConversationDiskStore::stage_files_bytes(uint64_t serial) const {
+uint64_t ConversationDiskStore::stage_files_bytes(uint64_t serial, bool prefix) const {
     uint64_t total = 0;
     for (size_t k = 0; ; ++k) {
         std::error_code ec;
-        const std::string spath = path_for_stage(serial, k);
+        const std::string spath = path_for_stage(serial, k, prefix);
         if (!fs::exists(spath, ec) || ec) break;
         const uint64_t sb = fs::file_size(spath, ec);
         if (ec) break;
@@ -586,14 +586,18 @@ void ConversationDiskStore::remove_spill_files(const std::string& bin_path) {
     }
     fs::remove(idx_path, ec);
     fs::remove(idx_path + ".tmp", ec);
-    // Stage files: everything sharing the serial's prefix "conv-<serial>." — the '.' right after
-    // the serial keeps it from matching a longer serial (conv-808. never matches conv-8081.bin).
-    // A directory scan is fine: spill dirs hold a few dozen files and removals are rare.
+    // Stage files: everything sharing the serial's prefix "conv-<serial>." or "pfx-<serial>." —
+    // the '.' right after the serial keeps it from matching a longer serial (conv-808. never
+    // matches conv-8081.bin). A directory scan is fine: spill dirs hold a few dozen files and
+    // removals are rare. Both kinds can carry stage files: a layer split's conversation AND its
+    // shared-prefix snapshot.
     const size_t slash = bin_path.find_last_of('/');
     const std::string dir = slash == std::string::npos ? std::string() : bin_path.substr(0, slash);
     const std::string fname = slash == std::string::npos ? bin_path : bin_path.substr(slash + 1);
-    if (!dir.empty() && fname.size() > 4 && fname.compare(fname.size() - 4, 4, ".bin") == 0 &&
-        fname.rfind("conv-", 0) == 0) {
+    const bool kind_ok = !dir.empty() && fname.size() > 4 &&
+        fname.compare(fname.size() - 4, 4, ".bin") == 0 &&
+        (fname.rfind("conv-", 0) == 0 || fname.rfind("pfx-", 0) == 0);
+    if (kind_ok) {
         const std::string prefix = fname.substr(0, fname.size() - 4) + '.';   // "conv-<serial>."
         std::error_code it_ec;
         for (const auto& entry : fs::directory_iterator(dir, it_ec)) {
@@ -717,15 +721,15 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
         size_t s_written = 0;
         std::string s_error;
         SessionStatus s_status;
-        const std::string spath = path_for_stage(serial, k);
+        const std::string spath = path_for_stage(serial, k, prefix);
         if (!session_file_write(spath, image.stage_images[k], id, s_written, s_error, opts, &s_status)) {
             std::fprintf(stderr, "strata serve: conversation spill: stage %zu/%zu file write failed "
                                  "(%s); spill aborted, nothing published\n",
                          k, n_stages, s_error.c_str());
             std::error_code ec;
             for (size_t j = 0; j <= k; ++j) {
-                fs::remove(path_for_stage(serial, j), ec);          // the ones that published
-                fs::remove(path_for_stage(serial, j) + ".tmp", ec); // the one that failed
+                fs::remove(path_for_stage(serial, j, prefix), ec);          // the ones that published
+                fs::remove(path_for_stage(serial, j, prefix) + ".tmp", ec); // the one that failed
             }
             return false;
         }
@@ -743,8 +747,8 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
         std::error_code ec;
         fs::remove(e.path + ".tmp", ec);   // best-effort
         for (size_t k = 0; k < n_stages; ++k) {
-            fs::remove(path_for_stage(serial, k), ec);
-            fs::remove(path_for_stage(serial, k) + ".tmp", ec);
+            fs::remove(path_for_stage(serial, k, prefix), ec);
+            fs::remove(path_for_stage(serial, k, prefix) + ".tmp", ec);
         }
         return false;
     }
@@ -817,14 +821,16 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
         }
         return std::nullopt;
     }
-    // ── Stage files: read back a layer split's later stages (conv-<serial>.stage<k>.bin, k=0..).
-    // Stop at the first MISSING k (a single-session engine's spill has none). A stage file
-    // that exists but fails to read fails the whole take — a partial image would restore as
-    // fewer stages than the engine has and be discarded by its stage count check anyway; keep
-    // the files (same policy as a failed main read) and let the engine recompute.
+    // ── Stage files: read back a layer split's later stages (conv-<serial>.stage<k>.bin for a
+    // conversation, pfx-<serial>.stage<k>.bin for a shared prefix; k=0..). Stop at the first
+    // MISSING k (a single-GPU engine's spill has none). A stage file that exists but fails to
+    // read fails the whole take — a partial image would restore as fewer stages than the engine
+    // has and be discarded by its stage count check anyway; keep the files (same policy as a
+    // failed main read) and let the engine recompute.
+    const bool entry_pfx = is_prefix_entry(*e);
     for (size_t k = 0; ; ++k) {
         std::error_code ec;
-        const std::string spath = path_for_stage(m.serial, k);
+        const std::string spath = path_for_stage(m.serial, k, entry_pfx);
         if (!fs::exists(spath, ec) || ec) break;
         SavedConversation stage_img;
         size_t s_read = 0;
@@ -952,11 +958,11 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     // is built oldest-first — mirrors the order put() inserts at).
     struct SpillFile { fs::path path; uint64_t serial; bool prefix; };
     std::vector<SpillFile> files;
-    // A layer split's stage files (conv-<serial>.stage<k>.bin): collected to clean orphans and
+    // A layer split's stage files (conv-<serial>.stage<k>.bin for a conversation,
+    // pfx-<serial>.stage<k>.bin for a shared-prefix snapshot): collected to clean orphans and
     // to keep them from being mistaken for mains — "conv-808.stage0.bin" ends in .bin and its
-    // digits parse to 808, which would load serial 808 twice. A prefix snapshot has no stages
-    // (the prefix spill is single-GPU), so a pfx-<serial>.stage* name is junk and is removed.
-    std::vector<std::pair<fs::path, uint64_t>> stage_files;
+    // digits parse to 808, which would load serial 808 twice. Both kinds can carry stages.
+    std::vector<SpillFile> stage_files;
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
         if (ec) break;
         const std::string name = entry.path().filename().string();
@@ -992,12 +998,7 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
         if (tail == "bin") {
             files.push_back({entry.path(), serial, is_pfx});
         } else if (tail.rfind("stage", 0) == 0) {
-            if (is_pfx) {
-                std::error_code rm;
-                fs::remove(entry.path(), rm);   // junk: a prefix snapshot has no stage files
-            } else {
-                stage_files.push_back({entry.path(), serial});
-            }
+            stage_files.push_back({entry.path(), serial, is_pfx});
         }
         // ".idx" (and anything else) is read through path_for_idx, not scanned here
     }
@@ -1007,8 +1008,8 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     {
         std::error_code ec2;
         for (const auto& sf : stage_files) {
-            const std::string main_path = path_for(sf.second);
-            if (!fs::exists(main_path, ec2) || ec2) fs::remove(sf.first, ec2);
+            const std::string main_path = path_for(sf.serial, sf.prefix);
+            if (!fs::exists(main_path, ec2) || ec2) fs::remove(sf.path, ec2);
         }
     }
     if (files.empty()) return 0;
@@ -1089,10 +1090,9 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             e.cvec = image.cvec;
             // The .bin parse covers the main image only; a layer split's stage files belong to
             // this entry too (put() counted them into its file_bytes, and the fresh .idx fast
-            // path carries that total — the slow path must arrive at the same number). A prefix
-            // snapshot has no stages (single GPU, one image), so the scan is skipped: it would
-            // look at conv-<serial>.stage* — another kind's name space.
-            e.file_bytes = bytes_read + (is_pfx ? 0 : stage_files_bytes(serial));
+            // path carries that total — the slow path must arrive at the same number). Both
+            // kinds can carry stages (a conversation and a shared-prefix snapshot alike).
+            e.file_bytes = bytes_read + stage_files_bytes(serial, is_pfx);
             e.used = next_used_++;
             { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
             // LRU evict if over budget: drop the oldest entries (the front of entries_, which
