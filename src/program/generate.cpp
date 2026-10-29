@@ -12189,7 +12189,7 @@ int main(int argc, char** argv) {
                             if (pin_ckpt != nullptr) try {
                                 // copies first: a later cut's checkpoint_at can reallocate `checks`
                                 const std::vector<int32_t> prefix_ids = pin_ckpt->ids;
-                                const std::vector<ConversationImageKey> prefix_imgs = pin_ckpt->imgs;
+                                const std::vector<strata::core::ConversationImageKey> prefix_imgs = pin_ckpt->imgs;
                                 std::vector<ConvCheckpoint> prefix_checks;
                                 prefix_checks.push_back(*pin_ckpt);
                                 if (stages.empty() && disk_store_ptr != nullptr && spill_attached) {
