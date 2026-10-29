@@ -2614,6 +2614,13 @@ def engine_args(cfg: dict) -> list[str]:
         if isinstance(spill.get("min_tokens"), int) and not isinstance(spill["min_tokens"], bool) \
                 and spill["min_tokens"] > 0 and "--conversation-spill-min-tokens" not in args:
             args += ["--conversation-spill-min-tokens", str(spill["min_tokens"])]
+        # Idle backup: after a request's DONE, wait this many seconds for the next request before
+        # backing the live conversation up to disk (a client STOP backs up at once — grace 0;
+        # negative disables it — the backup then waits for the next request's park). Engine
+        # default: 5.
+        if isinstance(spill.get("idle_seconds"), int) and not isinstance(spill["idle_seconds"], bool) \
+                and "--conversation-idle-spill-seconds" not in args:
+            args += ["--conversation-idle-spill-seconds", str(spill["idle_seconds"])]
     args += parallel_args(cfg, args)
     return learned_profile_args(cfg, args)
 

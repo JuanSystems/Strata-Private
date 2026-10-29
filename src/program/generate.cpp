@@ -642,6 +642,14 @@ struct Options {
     int64_t conversation_spill_gib = 0;
     std::string conversation_spill_path;
     int64_t conversation_spill_min_tokens = 0;
+    /// --conversation-idle-spill-seconds N (default 5): after a request's DONE, the engine waits
+    /// N seconds for the next request; when none arrives, it backs the live conversation up to
+    /// the disk store at once (the capture runs while nothing waits on it; the write runs on
+    /// the store's background writer). A kill, a crash or a session that simply ends then
+    /// loses nothing past the last DONE, and the next request's park finds holds() and skips
+    /// the re-capture. A request ended by the client's STOP backs up at once (grace 0).
+    /// Negative: off — the backup waits for the next request's park, as before.
+    int64_t conversation_idle_spill_s = 5;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
@@ -2146,6 +2154,8 @@ int main(int argc, char** argv) {
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--conversation-spill-path") o.conversation_spill_path = next("--conversation-spill-path");
+        else if (a == "--conversation-idle-spill-seconds")
+            o.conversation_idle_spill_s = std::atoll(next("--conversation-idle-spill-seconds"));
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -8289,6 +8299,84 @@ int main(int argc, char** argv) {
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
+        // ── Disk spill of the LIVE conversation — the one block two paths share: the park at the
+        // start of the NEXT request (park_current_body, "park") and the idle backup after a DONE
+        // with no request behind it (idle_backup_live, "idle after done"). SIEMPRE que el
+        // disk_store esté activo, encendida o apagada la RAM cache: la CAPTURA (GPU→host) es
+        // síncrona — la sesión sigue en uso y su K/V hay que copiarlo AHORA — y la ESCRITURA a
+        // disco (cientos de MiB; en Kaggle decenas de segundos) corre en el hilo writer del
+        // store, no en el camino de ningún request. Sin ese hilo, cada switch de conversación
+        // estancaba el prompt read del request siguiente tras el DONE anterior.
+        // `view`/`cs`/`draft0` llegan preparados por el llamador (un layer split parte los
+        // checkpoints por etapa: el park lo hace para su captura en RAM, el idle para sí mismo).
+        // false solo si la captura falló: el park lo sube como su error, el idle solo lo loguea.
+        auto spill_live_to_disk = [&](const strata::core::ConversationView& view,
+                                      const strata::core::ConversationCheckpointSplit& cs,
+                                      const strata::core::QsaState* draft0, const char* what) -> bool {
+            if (disk_store_ptr == nullptr || !spill_attached || !live_ok || live.empty()) return true;
+            // ── Skip cuando el disco ya la tiene: en el loop de stop/retry el mismo park vuelve
+            // a entrar con la MISMA conversación; re-capturar y re-escribir ~800 MiB otra vez no
+            // agrega nada (el entry en disco restaura igual o mejor). holds(): igual o más
+            // largo, misma rama (best() no sirve aquí: es match de prefijo ESTRICTO, y el caso
+            // igual — el del retry, o el park que sigue a un respaldo idle — nunca matchea).
+            if (disk_store_ptr->holds(live, live_imgs, cvec_cached)) {
+                std::fprintf(stderr, "strata serve: conversation spill: skip capture (%zu tokens; "
+                                     "the disk already holds this conversation equal or longer)\n",
+                             live.size());
+                return true;
+            }
+            const size_t n_st = stages.size();
+            auto draft_of = [&](size_t k) -> const strata::core::QsaState* {
+                return use_mtp && !mtp_first && k + 1 == n_st ? &mtp.kv_state() : nullptr;
+            };
+            const auto t0 = Clock::now();
+            try {
+                strata::core::SavedConversation image;
+                size_t reused_bytes = 0;
+                strata::core::ConversationKvReuse empty_reuse;
+                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                        std::move(empty_reuse), &reused_bytes)) return false;
+                // A layer split parks one image per stage: without the later stages' K/V the
+                // spill restores as 0 stage images and the engine discards it (the stage count
+                // check) — the conversation would recompute on every restart. Capture each
+                // stage exactly like the RAM park's stage captures, so put() can write
+                // conv-*.stage<k>.bin.
+                for (size_t k = 0; k < n_st; ++k) {
+                    auto& st = stages[k];
+                    const strata::core::OnDevice on(st->dev);
+                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                    strata::core::SavedConversation part;
+                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                            strata::core::ConversationKvReuse{}, &reused_bytes))
+                        return false;
+                    image.stage_images.push_back(std::move(part));
+                }
+                const size_t spill_tokens = image.live.ids.size();
+                const size_t spill_bytes = image.bytes();
+                const uint64_t spill_serial = next_direct_spill_serial++;
+                // put_async: la escritura a disco corre en el writer del store; el request sigue
+                // YA. El store drena la cola en flush (take/best/put síncrono/destructor), así
+                // que el spill del shutdown también llega a disco.
+                if (disk_store_ptr->put_async(std::move(image), spill_serial, spill_identity)) {
+                    const double spill_ms = std::chrono::duration<double, std::milli>(
+                        Clock::now() - t0).count();
+                    std::fprintf(stderr, "strata serve: conversation spill [%s]: captured %zu tokens "
+                                         "(%.1f MiB, %zu stage image%s) in %.1f ms; conv-%llu.bin goes to "
+                                         "the background disk writer (no request is stalled; a restart "
+                                         "restores it)\n", what, spill_tokens,
+                                 spill_bytes / (1024.0 * 1024.0), n_st, n_st == 1 ? "" : "s", spill_ms,
+                                 (unsigned long long) spill_serial);
+                } else {
+                    std::fprintf(stderr, "strata serve: conversation cache: disk spill enqueue failed "
+                                         "(%zu tokens); the conversation stays in RAM only\n", spill_tokens);
+                }
+            } catch (const std::bad_alloc&) {
+                std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill; "
+                                     "the conversation stays in RAM only\n");
+            }
+            return true;
+        };
         auto park_current_body = [&](size_t held) -> bool {
             // ── Spill-when-cache-off flag: when the RAM cache is OFF but the spill is on, we skip
             // the early return below and let the code run until draft0/view are declared, then do
@@ -8335,77 +8423,11 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            // ── Disk spill: SIEMPRE que el disk_store esté activo, sin importar si la RAM cache
-            // está encendida o apagada. Aprovecha la pausa después de que el modelo terminó de
-            // responder para escribir una copia de seguridad en disco. Si el engine se reinicia,
-            // el siguiente request restaura desde disco en vez de recomputar todo.
-            // Si la RAM cache está apagada (spill_when_cache_off), este spill es el único destino
-            // de la conversación. Si está encendida, la conversación también se guarda en RAM
-            // abajo (parking normal), pero el disco es la copia de seguridad.
-            //
-            // Phase 2 (escritura en background): la CAPTURA del snapshot (GPU→host) es síncrona
-            // — el próximo request reescribe la sesión, así que el K/V hay que copiarlo AHORA —
-            // pero la ESCRITURA a disco (cientos de MiB; en Kaggle tarda decenas de segundos)
-            // corre en el hilo writer del store, no en el camino del request. Sin esto, cada
-            // switch de conversación estancaba el prompt read del request siguiente tras el DONE
-            // anterior: "done → escribe en disco → vuelve y computa" era exactamente este stall.
-            if (disk_store_ptr != nullptr && spill_attached && live_ok && !live.empty()) {
-                // ── Skip cuando el disco ya la tiene: en el loop de stop/retry el mismo park
-                // vuelve a entrar con la MISMA conversación; re-capturar y re-escribir
-                // ~800 MiB otra vez no agrega nada (el entry en disco restaura igual o mejor).
-                // holds(): igual o más largo, misma rama (best() no sirve aquí: es match de
-                // prefijo ESTRICTO, y el caso igual — el del retry — nunca matchea).
-                if (disk_store_ptr->holds(live, live_imgs, cvec_cached)) {
-                    std::fprintf(stderr, "strata serve: conversation spill: skip capture (%zu tokens; "
-                                         "the disk already holds this conversation equal or longer)\n",
-                                 live.size());
-                } else {
-                const auto t0 = Clock::now();
-                try {
-                    strata::core::SavedConversation image;
-                    size_t reused_bytes = 0;
-                    strata::core::ConversationKvReuse empty_reuse;
-                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                            std::move(empty_reuse), &reused_bytes)) return false;
-                    // A layer split parks one image per stage: without the later stages' K/V the
-                    // spill restores as 0 stage images and the engine discards it (the stage count
-                    // check) — the conversation would recompute on every restart. Capture each
-                    // stage exactly like the RAM park below, so put() can write conv-*.stage<k>.bin.
-                    for (size_t k = 0; k < n_st; ++k) {
-                        auto& st = stages[k];
-                        const strata::core::OnDevice on(st->dev);
-                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                        const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                        strata::core::SavedConversation part;
-                        if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                                strata::core::ConversationKvReuse{}, &reused_bytes))
-                            return false;
-                        image.stage_images.push_back(std::move(part));
-                    }
-                    const size_t spill_tokens = image.live.ids.size();
-                    const size_t spill_bytes = image.bytes();
-                    const uint64_t spill_serial = next_direct_spill_serial++;
-                    // put_async: la escritura a disco corre en el writer del store; el request
-                    // sigue YA. El store drena la cola en flush (take/best/put síncrono/destructor),
-                    // así que el spill del shutdown también llega a disco.
-                    if (disk_store_ptr->put_async(std::move(image), spill_serial, spill_identity)) {
-                        const double spill_ms = std::chrono::duration<double, std::milli>(
-                            Clock::now() - t0).count();
-                        std::fprintf(stderr, "strata serve: conversation spill: captured %zu tokens (%.1f MiB, "
-                                             "%zu stage image%s) in %.1f ms; writing to disk in the background "
-                                             "(the next request is not stalled, and the next restart restores it)\n",
-                                     spill_tokens, spill_bytes / (1024.0 * 1024.0), n_st,
-                                     n_st == 1 ? "" : "s", spill_ms);
-                    } else {
-                        std::fprintf(stderr, "strata serve: conversation cache: disk spill enqueue failed "
-                                             "(%zu tokens); the conversation stays in RAM only\n", spill_tokens);
-                    }
-                } catch (const std::bad_alloc&) {
-                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill; "
-                                         "the conversation stays in RAM only\n");
-                }
-                }
-            }
+            // ── Disk spill: SIEMPRE que el disk_store esté activo (RAM cache on u off): la
+            // captura (GPU→host) corre aquí y la escritura en el writer de fondo del store. Con
+            // la cache apagada (spill_when_cache_off) es el único destino de la conversación;
+            // con la encendida es la copia de seguridad que precede al parking en RAM de abajo.
+            if (!spill_live_to_disk(view, cs, draft0, "park")) return false;
             // Si la RAM cache está apagada, el spill al disco fue lo único que pudimos hacer.
             if (spill_when_cache_off) {
                 return true;
@@ -8543,6 +8565,36 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
                 return true;
             }
+        };
+        // ── Idle backup: tras el DONE de un request sin otro request detrás (o tras su STOP), el
+        // loop respalda la conversación VIVA al disco sin tocarla: la captura (GPU→host) corre
+        // ahora — nada espera por ella — y la escritura va al writer de fondo del store. La
+        // conversación sigue viva: el próximo turno de ESTA conversación continúa desde la
+        // sesión, sin restore. El park del request siguiente encuentra holds() y no re-captura.
+        auto idle_backup_live = [&]() -> void {
+            if (o.conversation_idle_spill_s < 0) return;   // apagado: solo el park del request siguiente
+            if (disk_store_ptr == nullptr || !spill_attached || !live_ok || live.empty()) return;
+            if (!conversations.wants((int64_t) live.size())) return;   // el mismo mínimo que el park
+            // RAM cache apagada (Kaggle, poca RAM): park_current(0) ES el spill directo — deja
+            // live intacta y entrega la imagen al writer; reusa el camino probado y sus gates.
+            if (!conversations.enabled()) {
+                (void) park_current(0);
+                return;
+            }
+            // RAM cache encendida: SOLO disco — estacionar en RAM aquí obligaría al próximo turno
+            // de esta conversación a un restore que hoy no paga (la sesión sigue viva).
+            const size_t n_st = stages.size();
+            const strata::core::QsaState* draft0 = (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state();
+            strata::core::ConversationCheckpointSplit cs;
+            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);
+            struct IdleMergeBack {
+                strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
+                ~IdleMergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
+            } idle_merge_back{cs, checks, n_st > 0};
+            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
+            if (!spill_live_to_disk(view, cs, draft0, "idle after done"))
+                std::fprintf(stderr, "strata serve: conversation spill: the idle backup capture failed (%s); "
+                                     "the conversation stays in RAM only\n", err.c_str());
         };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
@@ -9653,6 +9705,30 @@ int main(int argc, char** argv) {
             in_lines.pop_front();
             return true;
         };
+        // ── Idle-spill window: tras el DONE de un request (normal o por el STOP del cliente) el
+        // loop vuelve aquí por la siguiente línea. Con un request recién terminado espera solo
+        // <grace> segundos; si nada llega, respalda la conversación viva al disco (idle_backup_live:
+        // captura ahora, escritura en el writer de fondo) y vuelve al wait de siempre. Un request
+        // que llega dentro de la ventana no nota nada: se toma y se procesa igual, y es su park el
+        // que respalda, como siempre. -1: no hay request recién terminado (arranque) o la opción
+        // está apagada — el wait es el bloqueante de siempre, costo cero.
+        double idle_grace_s = -1.0;
+        auto next_line_idle = [&](std::string& out) -> bool {
+            if (idle_grace_s < 0.0) return next_line(out);
+            const double grace = idle_grace_s;
+            idle_grace_s = -1.0;
+            std::unique_lock<std::mutex> lk(in_mu);
+            if (!in_cv.wait_for(lk, std::chrono::duration<double>(grace),
+                                [&] { return !in_lines.empty() || in_eof; })) {
+                lk.unlock();
+                idle_backup_live();   // la ventana pasó sin request: respaldo, y el write en fondo
+                return next_line(out);   // y el wait bloqueante de siempre
+            }
+            if (in_lines.empty()) return false;   // EOF dentro de la ventana: el spill del cierre corre igual
+            out = std::move(in_lines.front());
+            in_lines.pop_front();
+            return true;
+        };
         sp.should_stop = [&] { return stop_req.load(); };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
@@ -10476,7 +10552,7 @@ int main(int argc, char** argv) {
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
                 if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
-            } else if (!next_line(line)) {
+            } else if (!next_line_idle(line)) {
                 break;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
@@ -12210,10 +12286,13 @@ int main(int argc, char** argv) {
                                         if (disk_store_ptr->put_async(std::move(image), serial, spill_identity)) {
                                             prefix_spilled_pin = pin_at;
                                             std::fprintf(stderr, "strata serve: prefix cache: pinned %lld shared "
-                                                                 "tokens, spilled %.1f MiB to disk in %.1f ms "
-                                                                 "(the first request of every conversation that "
-                                                                 "starts with these tokens restores it)\n",
+                                                                 "tokens, spilled %.1f MiB as conv-%llu.bin in "
+                                                                 "%.1f ms (the first request of every conversation "
+                                                                 "that starts with these tokens — every new chat "
+                                                                 "with this system prompt, in this run or after a "
+                                                                 "restart — restores it)\n",
                                                          (long long) pin_at, prefix_bytes / (1024.0 * 1024.0),
+                                                         (unsigned long long) serial,
                                                          std::chrono::duration<double, std::milli>(
                                                              Clock::now() - t0).count());
                                         } else {
@@ -13395,6 +13474,11 @@ int main(int argc, char** argv) {
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt);
             std::fflush(stdout);
+            // Idle backup arm: DONE ya salió — si el próximo request no llega en
+            // --conversation-idle-spill-seconds, el loop respalda la conversación viva al disco
+            // antes de quedarse esperando (next_line_idle). Un request terminado por el STOP del
+            // cliente arma 0: el respaldo corre enseguida, sin esperar nada.
+            idle_grace_s = cancelled ? 0.0 : (double) o.conversation_idle_spill_s;
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
@@ -13590,12 +13674,14 @@ int main(int argc, char** argv) {
                 helper_bytes_before = bytes;
             }
         }
-        // ── Auto-spill al CERRAR el engine (QUIT o EOF en stdin).
-        // Durante la ejecución normal, el spill al disco se hace en park_current_body al inicio
-        // del siguiente request (cuando se parquea la conversación saliente). Pero si el engine
-        // se cierra sin que llegue un siguiente request, la conversación del último turno se
-        // pierde. Este spill final la guarda.
-        // NO se hace después de cada DONE (eso agregaría ~3s de latencia a cada turno).
+        // ── Auto-spill al CERRAR el engine (QUIT o EOF en stdin) — el tercer y último camino al
+        // disco. (1) El park al inicio del request siguiente (park_current_body). (2) El respaldo
+        // idle tras un DONE sin nuevo request en --conversation-idle-spill-seconds
+        // (idle_backup_live; el STOP del cliente lo arma a 0) — es el que cubre el último turno
+        // cuando no llega nada, incluido un engine que muere SIN QUIT: un kill, un crash, una
+        // sesión de Kaggle que se acaba. (3) Este spill final cubre el DONE inmediato antes de un
+        // QUIT/EOF limpio. La escritura siempre corre en el writer de fondo; el camino del request
+        // solo paga la captura, y tras un DONE nadie espera por ella.
         if (live_ok && !live.empty() && disk_store_ptr != nullptr && spill_attached) {
             std::fprintf(stderr, "[strata diag] auto-spill on shutdown: parking %zu tokens to disk...\n",
                          live.size());
