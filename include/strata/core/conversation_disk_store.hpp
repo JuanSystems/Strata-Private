@@ -14,13 +14,17 @@
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -51,8 +55,18 @@ struct DiskEntry {
 /// Disk-tier spill store. RAM manifest + payload-on-disk. Take = remove: when a conversation
 /// comes back from disk, its file is deleted (no orphan copies of what's already in RAM).
 /// All operations are fail-soft: a full or corrupt disk degrades to today's behavior, never
-/// worse. Phase 1 is synchronous (put blocks the calling park path). Phase 2 will add a
-/// background writer (StageThreads pattern does not apply; needs a queue-based thread).
+/// worse.
+///
+/// Phase 2 (async writes): the request path CAPTURES the snapshot synchronously (the GPU→host
+/// copy must happen before the next request rewrites the session) but the disk write — hundreds
+/// of MiB on a slow disk, tens of seconds on Kaggle-class hardware — runs on a background
+/// writer thread. Queue depth is 1 (plus the image in the writer's hands): each image is
+/// hundreds of MiB of host RAM, and the back-to-back parks that overflow the queue are the
+/// retry loop's earlier capture of the SAME conversation, superseded by the newer one anyway.
+/// Readers (take/best/size/…) and the sync put() first DRAIN the queue via flush_pending(), so
+/// after any public call returns, the manifest is exactly what is on disk and no two threads
+/// touch entries_ — the writer only mutates it between flushes, while the main thread is
+/// blocked inside flush_pending().
 class ConversationDiskStore {
 public:
     /// `dir` is created (with parents) if missing. `budget_bytes = 0` disables the store
@@ -62,10 +76,11 @@ public:
                           const SessionFileIdentity* identity = nullptr);
     ~ConversationDiskStore();
 
+    // The store is held by unique_ptr everywhere (make_disk_store); it is NOT movable since
+    // Phase 2 — the background writer thread, its mutex and its condition_variable are
+    // non-movable, and no call site ever moved the store by value.
     ConversationDiskStore(const ConversationDiskStore&) = delete;
     ConversationDiskStore& operator=(const ConversationDiskStore&) = delete;
-    ConversationDiskStore(ConversationDiskStore&&) noexcept;
-    ConversationDiskStore& operator=(ConversationDiskStore&&) noexcept;
 
     bool enabled() const { return budget_ != 0; }
     const std::string& dir() const { return dir_; }
@@ -75,10 +90,35 @@ public:
     // using session_file_write (atomic temp+rename+fsync). On a full disk or I/O error returns
     // false: the caller then drops the image as today (the spill only ever improves the
     // current state). `serial` is the cache's serial for this entry — the file name is
-    // derived from it, so two parked conversations never collide. Phase 2: this becomes the
-    // enqueue point for the background writer.
+    // derived from it, so two parked conversations never collide.
+    // Sync version: drains any in-flight background write first, then writes on the CALLING
+    // thread. Tests and rare paths use this; the engine's park path uses put_async().
     bool put(SavedConversation&& image, uint64_t serial, const SessionFileIdentity& id,
              const SessionWriteOptions& options = {});
+
+    // ---- Async park path (the engine's park_current_body uses this) ----
+    // Enqueues the image for the background writer and returns immediately (the request's
+    // prompt read is not stalled by the disk write). Returns false only when the store is
+    // disabled or the enqueue fails (caller logs and drops the image, as with sync put).
+    // After a successful write the writer also runs the superseded cleanup (same-branch
+    // older spills are deleted), so a retry loop does not pile up conv-<serial>.bin files.
+    bool put_async(SavedConversation&& image, uint64_t serial, const SessionFileIdentity& id,
+                   const SessionWriteOptions& options = {});
+
+    // Wait until no background write is pending or in flight. After this returns, the
+    // manifest reflects every put_async() the store has accepted. Const so best()/size()
+    // can drain before reading entries_ (the queue members are mutable).
+    void flush_pending() const;
+
+    // ---- Skip-check for the park path ----
+    // True when the disk already holds THIS conversation equal or longer (same branch, same
+    // cvec, images lined up), so a new capture+write would add nothing. best() cannot express
+    // this: conversation_prefix() is a STRICT-prefix match (n >= prompt.size() returns 0), so
+    // an entry exactly the length of the conversation — the retry-loop case — never matches.
+    // Also consults ckpt_ids: when the client strips the assistant's thinking tokens, the
+    // entry's deepest checkpoint is what equals the conversation the next park would write.
+    // Drains the writer first, like every reader.
+    bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) const;
 
     // ---- Restore path (the new conversations.best() falls back to this) ----
     // Same contract as ConversationCache::best(): the longest prefix among the manifest's
@@ -100,8 +140,14 @@ public:
                                           const SessionReadLimits& limits = {});
 
     // ---- Management ----
-    size_t size() const { return entries_.size(); }
-    uint64_t bytes() const { return bytes_; }
+    size_t size() const {
+        flush_pending();
+        return entries_.size();
+    }
+    uint64_t bytes() const {
+        flush_pending();
+        return bytes_;
+    }
     uint64_t budget() const { return budget_; }
     size_t writes() const { return writes_; }
     size_t restores() const { return restores_; }
@@ -110,7 +156,8 @@ public:
 
     // LRU eviction of the disk tier itself: when put() would exceed budget_, the oldest entry
     // is deleted. Returns false only when the manifest is empty (or all entries are pinned,
-    // which Phase 1 does not have). Called by put().
+    // which Phase 1 does not have). Called by put() internally — NO flush here (put() and the
+    // writer already hold the single-thread invariant; flushing would deadlock the writer).
     bool evict_oldest();
 
     // #879 (non-finite logits poison): purge every spill file and clear the manifest.
@@ -176,6 +223,41 @@ private:
     bool identity_bound_ = false;
     std::deque<DiskEntry> entries_;   // oldest-first (LRU)
     std::deque<uint64_t> serials_;   // entries_[i]'s serial, mirrors ConversationCache
+
+    // ── Background writer (Phase 2) ── queue + one thread. The queue holds at most 2 images;
+    // every public reader drains it first (flush_pending), so entries_ is single-threaded.
+    struct PendingWrite {
+        SavedConversation image;
+        uint64_t serial = 0;
+        SessionFileIdentity id;
+        SessionWriteOptions options;
+        // Cheap copies for the post-write superseded cleanup (the checkpoints are NOT copied:
+        // they hold K/V; the cleanup's prefix branch only needs ids/imgs/cvec).
+        std::vector<int32_t> sup_ids;
+        std::vector<ConversationImageKey> sup_imgs;
+        bool sup_cvec = true;
+    };
+    mutable std::mutex writer_mu_;
+    mutable std::condition_variable writer_cv_;   // writer waits for work; flush waits for idle
+    std::thread writer_;
+    bool writer_stop_ = false;                    // set by the destructor
+    bool writer_busy_ = false;                    // writer moved an image out and is writing it
+    std::deque<PendingWrite> pending_;
+    size_t async_dropped_ = 0;                    // queue-overflowed images (logged)
+
+    void writer_loop();
+    // The sync put()'s body, shared by put() and the writer thread. NO locking inside.
+    bool put_impl(SavedConversation&& image, uint64_t serial, const SessionFileIdentity& id,
+                  const SessionWriteOptions& options);
+    // drop_superseded()'s body, shared by the public wrapper and the writer thread.
+    size_t drop_superseded_impl(const std::vector<int32_t>& ids,
+                                const std::vector<ConversationImageKey>& images,
+                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec);
+    // Post-write cleanup the writer runs: same-branch older spills go (prefix of the new live).
+    size_t drop_superseded_light(const std::vector<int32_t>& ids,
+                                 const std::vector<ConversationImageKey>& images, bool cvec) {
+        return drop_superseded_impl(ids, images, {}, cvec);
+    }
 
     std::string path_for(uint64_t serial) const;
     // A layer split's spill: one extra self-contained session file per later stage
@@ -306,6 +388,7 @@ ConversationCache::Match ConversationDiskStore::best(const std::vector<Token>& p
                                                      bool cvec) const {
     ConversationCache::Match best;
     if (!enabled() || prompt.empty()) return best;
+    flush_pending();   // a queued (not yet written) spill is invisible until it lands
     // Convert the prompt to int32_t once: the engine holds ids as `long` on Linux x86_64, but
     // tokens are always <= INT32_MAX (a 32-bit model vocab fits in int32_t). The conversion is
     // a single pass and avoids forcing the caller to copy.

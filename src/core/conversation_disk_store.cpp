@@ -19,9 +19,139 @@ namespace fs = std::filesystem;
 // avoid a circular include with conversation_file.hpp; this translation unit includes the
 // full definition, so it can call put() directly. Fail-soft: a full disk or I/O error
 // leaves the entry lost (today's behavior — the spill only ever improves the state).
+// Phase 2: the eviction path also writes in the BACKGROUND — make_room() runs inside the
+// park, which is on the request path, and a ~hundreds-of-MiB sync write there stalls the
+// next request's prompt read exactly like the park-spill did.
 void spill_evict_one(ConversationDiskStore& store, const SessionFileIdentity& identity,
                      SavedConversation&& image, uint64_t serial) {
-    (void) store.put(std::move(image), serial, identity);
+    (void) store.put_async(std::move(image), serial, identity);
+}
+
+// ── Background writer (Phase 2) ────────────────────────────────────────────────────────────
+
+bool ConversationDiskStore::holds(const std::vector<int32_t>& ids,
+                                  const std::vector<ConversationImageKey>& imgs, bool cvec) const {
+    if (!enabled() || ids.empty()) return false;
+    flush_pending();
+    auto ids_equal = [&](const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+        return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+    };
+    auto ids_prefix = [&](const std::vector<int32_t>& pre, const std::vector<int32_t>& full) {
+        return pre.size() < full.size() &&
+               std::equal(pre.begin(), pre.end(), full.begin());
+    };
+    auto imgs_prefix = [&](const std::vector<ConversationImageKey>& pre,
+                           const std::vector<ConversationImageKey>& full) {
+        if (pre.size() > full.size()) return false;
+        for (size_t i = 0; i < pre.size(); ++i)
+            if (!(pre[i] == full[i])) return false;
+        return true;
+    };
+    for (const auto& e : entries_) {
+        if (e.cvec != cvec || e.ids.empty()) continue;
+        const bool equal = ids_equal(e.ids, ids);
+        const bool longer = ids_prefix(ids, e.ids);
+        if (!equal && !longer) continue;
+        // the conversation's own images must line up with the entry's, in order (the
+        // conversation `ids` is the SHORTER or equal side of the branch)
+        if (imgs_prefix(imgs, e.imgs)) return true;
+    }
+    // The client may re-render the history without the assistant's thinking tokens: the
+    // entry's deepest checkpoint is then what the next park would write. Equal-length counts
+    // (the checkpoint IS the conversation); longer does not apply through ckpt_ids.
+    for (const auto& e : entries_) {
+        if (e.cvec != cvec || e.ckpt_ids.empty()) continue;
+        if (ids_equal(e.ckpt_ids, ids) && imgs_prefix(imgs, e.ckpt_imgs)) return true;
+    }
+    return false;
+}
+
+void ConversationDiskStore::flush_pending() const {
+    std::unique_lock<std::mutex> lk(writer_mu_);
+    writer_cv_.wait(lk, [&] { return pending_.empty() && !writer_busy_; });
+}
+
+bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial,
+                                      const SessionFileIdentity& id, const SessionWriteOptions& options) {
+    if (!enabled()) return false;
+    PendingWrite p;
+    p.serial = serial;
+    p.id = id;
+    p.options = options;
+    p.sup_ids = image.live.ids;        // cheap copies for the post-write superseded cleanup
+    p.sup_imgs = image.live.imgs;
+    p.sup_cvec = image.cvec;
+    p.image = std::move(image);
+    bool inline_write = false;   // thread creation failed: write on the calling thread
+    {
+        std::lock_guard<std::mutex> lk(writer_mu_);
+        // Queue depth 1 (plus the one in the writer's hands): each queued image is hundreds of
+        // MiB of host RAM and Kaggle-class boxes run close to the floor. A second park before
+        // the first lands is the retry loop — the queued (older) capture of the SAME
+        // conversation is superseded by this one, so dropping it is the intent, not a loss.
+        if (!pending_.empty()) {
+            ++async_dropped_;
+            std::fprintf(stderr, "strata serve: conversation spill: background write queue full; "
+                                 "dropping the oldest queued image (%.1f MiB) for this one\n",
+                         (double) pending_.front().image.bytes() / (1024.0 * 1024.0));
+            pending_.pop_front();
+        }
+        if (!writer_.joinable()) {
+            try {
+                writer_ = std::thread([this] { writer_loop(); });
+            } catch (...) {
+                // resource exhaustion (a cgroup thread cap): degrade to a synchronous write so
+                // the spill still lands; the queue stays empty in this mode
+                inline_write = true;
+            }
+        }
+        if (!inline_write) pending_.push_back(std::move(p));
+    }
+    if (inline_write) {
+        // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded runs
+        // before put). AFTER the write the new entry's ids equal the cleanup's `ids` and the
+        // exact-match branch would delete the file we just wrote.
+        const size_t superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
+        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options);
+        if (ok && superseded > 0)
+            std::fprintf(stderr, "strata serve: conversation spill: write landed (serial %llu) "
+                                 "and dropped %zu superseded spill file%s\n",
+                         (unsigned long long) p.serial, superseded, superseded == 1 ? "" : "s");
+        return ok;
+    }
+    writer_cv_.notify_all();
+    return true;
+}
+
+void ConversationDiskStore::writer_loop() {
+    std::unique_lock<std::mutex> lk(writer_mu_);
+    for (;;) {
+        writer_cv_.wait(lk, [&] { return writer_stop_ || !pending_.empty(); });
+        if (pending_.empty()) {
+            if (writer_stop_) return;   // idle and stopping: exit (the dtor drains leftovers)
+            continue;                   // spurious wakeup
+        }
+        PendingWrite p = std::move(pending_.front());
+        pending_.pop_front();
+        writer_busy_ = true;
+        lk.unlock();
+        // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded runs
+        // before put). AFTER the write the new entry's ids equal the cleanup's `ids` and the
+        // exact-match branch would delete the file we just wrote (the async test caught this).
+        const size_t superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
+        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options);
+        lk.lock();
+        writer_busy_ = false;
+        if (!ok)
+            std::fprintf(stderr, "strata serve: conversation spill: background write FAILED "
+                                 "(serial %llu); the conversation stays in RAM only\n",
+                         (unsigned long long) p.serial);
+        else if (superseded > 0)
+            std::fprintf(stderr, "strata serve: conversation spill: background write landed "
+                                 "(serial %llu) and dropped %zu superseded spill file%s\n",
+                         (unsigned long long) p.serial, superseded, superseded == 1 ? "" : "s");
+        writer_cv_.notify_all();   // a flusher may be waiting for this write to land
+    }
 }
 
 ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_bytes,
@@ -42,10 +172,33 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
     fs::permissions(dir_, fs::perms::owner_all, ec);   // best-effort; ignore if unsupported
 }
 
-ConversationDiskStore::~ConversationDiskStore() = default;
+// The dtor DRAINS: the engine's shutdown auto-spill is queued microseconds before main()
+// returns, and it is the whole point of that spill — it must land on disk. The writer thread
+// processes queued images even after writer_stop_ (it exits only when the queue is empty), so
+// join() usually waits for the last write; the direct put_impl below is the belt-and-braces
+// path for an image the thread never picked up (a thread-start failure, an exception).
+ConversationDiskStore::~ConversationDiskStore() {
+    if (writer_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lk(writer_mu_);
+            writer_stop_ = true;
+        }
+        writer_cv_.notify_all();
+        writer_.join();
+    }
+    while (!pending_.empty()) {
+        PendingWrite p = std::move(pending_.front());
+        pending_.pop_front();
+        // same order as the writer: the superseded cleanup runs BEFORE the write
+        (void) drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
+        if (!put_impl(std::move(p.image), p.serial, p.id, p.options))
+            std::fprintf(stderr, "strata serve: conversation spill: shutdown drain write FAILED "
+                                 "(serial %llu)\n", (unsigned long long) p.serial);
+    }
+}
 
-ConversationDiskStore::ConversationDiskStore(ConversationDiskStore&&) noexcept = default;
-ConversationDiskStore& ConversationDiskStore::operator=(ConversationDiskStore&&) noexcept = default;
+// Not movable since Phase 2 (the writer thread + mutex + cv); no call site ever moved the
+// store by value — everything holds it as unique_ptr.
 
 std::string ConversationDiskStore::path_for(uint64_t serial) const {
     return dir_ + "/conv-" + std::to_string(serial) + ".bin";
@@ -420,6 +573,13 @@ const DiskEntry* ConversationDiskStore::find_by_serial(uint64_t serial) const {
 bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
                                 const SessionFileIdentity& id, const SessionWriteOptions& options) {
     if (!enabled()) return false;
+    flush_pending();   // never two writers at once; the sync path writes on the calling thread
+    return put_impl(std::move(image), serial, id, options);
+}
+
+bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
+                                const SessionFileIdentity& id, const SessionWriteOptions& options) {
+    if (!enabled()) return false;
     // If this serial is already spilled (re-park of a conversation that came back from disk
     // and got evicted again), replace it: delete the old files (.bin + .idx) and re-add the entry.
     if (DiskEntry* existing = find_by_serial(serial)) {
@@ -562,6 +722,7 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
                                                               const SessionFileIdentity& id,
                                                               const SessionReadLimits& limits) {
     if (!enabled() || m.tokens <= 0) return std::nullopt;
+    flush_pending();   // a queued spill is not readable yet; wait for the writer to land it
     // Resolve the manifest entry by serial (m.serial survives cache changes; m.index does not).
     const DiskEntry* e = find_by_serial(m.serial);
     if (!e) return std::nullopt;
@@ -636,6 +797,7 @@ bool ConversationDiskStore::evict_oldest() {
 }
 
 size_t ConversationDiskStore::clear() {
+    flush_pending();   // a queued image may be the poisoned one: let it land, then purge it too
     const size_t n = entries_.size();
     for (const auto& e : entries_) remove_spill_files(e.path);   // .bin + .idx + .idx.tmp
     entries_.clear();
@@ -869,6 +1031,14 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
 }
 
 size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
+                                              const std::vector<ConversationImageKey>& images,
+                                              const std::vector<ConversationCheckpoint>& checkpoints,
+                                              bool cvec) {
+    flush_pending();
+    return drop_superseded_impl(ids, images, checkpoints, cvec);
+}
+
+size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& ids,
                                               const std::vector<ConversationImageKey>& images,
                                               const std::vector<ConversationCheckpoint>& checkpoints,
                                               bool cvec) {

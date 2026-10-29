@@ -8324,7 +8324,24 @@ int main(int argc, char** argv) {
             // Si la RAM cache está apagada (spill_when_cache_off), este spill es el único destino
             // de la conversación. Si está encendida, la conversación también se guarda en RAM
             // abajo (parking normal), pero el disco es la copia de seguridad.
+            //
+            // Phase 2 (escritura en background): la CAPTURA del snapshot (GPU→host) es síncrona
+            // — el próximo request reescribe la sesión, así que el K/V hay que copiarlo AHORA —
+            // pero la ESCRITURA a disco (cientos de MiB; en Kaggle tarda decenas de segundos)
+            // corre en el hilo writer del store, no en el camino del request. Sin esto, cada
+            // switch de conversación estancaba el prompt read del request siguiente tras el DONE
+            // anterior: "done → escribe en disco → vuelve y computa" era exactamente este stall.
             if (disk_store_ptr != nullptr && spill_attached && live_ok && !live.empty()) {
+                // ── Skip cuando el disco ya la tiene: en el loop de stop/retry el mismo park
+                // vuelve a entrar con la MISMA conversación; re-capturar y re-escribir
+                // ~800 MiB otra vez no agrega nada (el entry en disco restaura igual o mejor).
+                // holds(): igual o más largo, misma rama (best() no sirve aquí: es match de
+                // prefijo ESTRICTO, y el caso igual — el del retry — nunca matchea).
+                if (disk_store_ptr->holds(live, live_imgs, cvec_cached)) {
+                    std::fprintf(stderr, "strata serve: conversation spill: skip capture (%zu tokens; "
+                                         "the disk already holds this conversation equal or longer)\n",
+                                 live.size());
+                } else {
                 const auto t0 = Clock::now();
                 try {
                     strata::core::SavedConversation image;
@@ -8350,21 +8367,25 @@ int main(int argc, char** argv) {
                     const size_t spill_tokens = image.live.ids.size();
                     const size_t spill_bytes = image.bytes();
                     const uint64_t spill_serial = next_direct_spill_serial++;
-                    if (disk_store_ptr->put(std::move(image), spill_serial, spill_identity)) {
+                    // put_async: la escritura a disco corre en el writer del store; el request
+                    // sigue YA. El store drena la cola en flush (take/best/put síncrono/destructor),
+                    // así que el spill del shutdown también llega a disco.
+                    if (disk_store_ptr->put_async(std::move(image), spill_serial, spill_identity)) {
                         const double spill_ms = std::chrono::duration<double, std::milli>(
                             Clock::now() - t0).count();
-                        std::fprintf(stderr, "strata serve: conversation spill: wrote %zu tokens (%.1f MiB, "
-                                             "%zu stage image%s) to disk in %.1f ms (auto-spill after response; "
-                                             "the next restart restores it)\n",
+                        std::fprintf(stderr, "strata serve: conversation spill: captured %zu tokens (%.1f MiB, "
+                                             "%zu stage image%s) in %.1f ms; writing to disk in the background "
+                                             "(the next request is not stalled, and the next restart restores it)\n",
                                      spill_tokens, spill_bytes / (1024.0 * 1024.0), n_st,
                                      n_st == 1 ? "" : "s", spill_ms);
                     } else {
-                        std::fprintf(stderr, "strata serve: conversation cache: disk spill write failed "
+                        std::fprintf(stderr, "strata serve: conversation cache: disk spill enqueue failed "
                                              "(%zu tokens); the conversation stays in RAM only\n", spill_tokens);
                     }
                 } catch (const std::bad_alloc&) {
                     std::fprintf(stderr, "strata serve: conversation cache: allocation failed during spill; "
                                          "the conversation stays in RAM only\n");
+                }
                 }
             }
             // Si la RAM cache está apagada, el spill al disco fue lo único que pudimos hacer.
@@ -11347,6 +11368,38 @@ int main(int argc, char** argv) {
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes());
             }
+            // ── DIAGNÓSTICO (fork): una línea por request que dice DE DÓNDE salió el resume y,
+            // cuando resume==0, POR QUÉ falló cada fuente: la posición del primer token donde
+            // live y el checkpoint más largo divergen de ESTE prompt. Sin esto, un "done → vuelve
+            // y computa todo" tras un cancel era inexplicable desde el log del wrapper (que solo
+            // muestra "X of Y tokens"). diverge=-1: coincide en todo el solapamiento; -2: vacío.
+            // OJO: NO consultar el disk store aquí — un best()/size() drena la cola del writer
+            // (flush) y justo acabo de encolar el spill del park: esperaría su escritura y
+            // reintroduciría el stall que la escritura async elimina. El lado disco ya tiene sus
+            // propios logs ("no usable disk match", "background write landed").
+            {
+                auto diverge_at = [&](const std::vector<int32_t>& pre) -> int64_t {
+                    const int64_t m = std::min<int64_t>((int64_t) pre.size(), n);
+                    for (int64_t i = 0; i < m; ++i)
+                        if ((int64_t) pre[(size_t) i] != ids[(size_t) i]) return i;
+                    return -1;
+                };
+                int64_t ck_len = 0, ck_div = -2;   // the longest checkpoint's size / its divergence
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() > ck_len) ck_len = (int64_t) c.ids.size();
+                for (const ConvCheckpoint& c : checks)
+                    if (ck_len > 0 && (int64_t) c.ids.size() == ck_len) { ck_div = diverge_at(c.ids); break; }
+                const int64_t live_div = live.empty() ? -2 : diverge_at(live);
+                std::fprintf(stderr, "[strata diag] request: prompt=%lld tok, resume=%lld (%s); live(ok=%d, %zu tok, "
+                                     "diverge@%lld); checks=%zu (longest %lld, diverge@%lld); ram_parked=%zu "
+                                     "(best match %lld); cvec=%d/%d, imgs=%zu\n",
+                             (long long) n, (long long) resume,
+                             from_live ? "live" : (resume > 0 ? "checkpoint" : "none"),
+                             live_ok ? 1 : 0, live.size(), (long long) live_div,
+                             checks.size(), (long long) ck_len, (long long) ck_div,
+                             conversations.size(), (long long) parked.tokens,
+                             (int) want_cvec, (int) cvec_cached, req_imgs.size());
+            }
             if (want_cvec != cvec_cached) {
                 live_ok = false;
                 checks.clear();
@@ -13027,6 +13080,19 @@ int main(int argc, char** argv) {
                 live_ok = true;
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
+            }
+            // ── DIAGNÓSTICO (fork): el cancel del cliente (STOP / desconexión del navegador) es
+            // el disparador del "done → vuelve y computa": este log dice si el request cancelado
+            // conservó SU lectura (la rama #1620 de arriba) o si el siguiente request tendrá
+            // que resumir solo desde checkpoints (o releer desde 0 si tampoco hay). Si el usuario
+            // vuelve a ver "0 reused", esta línea dice exactamente qué condición falló.
+            if (cancelled && !live_ok && !nf_hit) {
+                std::fprintf(stderr, "[strata diag] cancelled request kept NOTHING of its read "
+                                     "(pp_exact=%d, pp_reached=%lld, prompt=%lld, prompt_cache=%d, "
+                                     "req_ckpt=%d, live_was=%zu, checks_kept=%zu): the next request "
+                                     "resumes from a checkpoint or reads from token 0\n",
+                             pp_exact ? 1 : 0, (long long) pp_reached, (long long) cur.size(),
+                             (int) o.prompt_cache, req_ckpt, live.size(), checks.size());
             }
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
