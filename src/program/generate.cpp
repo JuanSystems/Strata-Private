@@ -11164,9 +11164,19 @@ int main(int argc, char** argv) {
                 }
             }
             if (incoming) slot_source = -1;
+            // DIAGNOSTIC: log what happens to the restored image after the restore.
+            if (incoming) {
+                std::fprintf(stderr, "[strata diag] restored image: stage_images=%zu stages=%zu live_ids=%zu "
+                                     "checkpoints=%zu\n",
+                             incoming->stage_images.size(), stages.size(), incoming->live.ids.size(),
+                             incoming->checkpoints.size());
+            }
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
             if (incoming && incoming->stage_images.size() != stages.size()) {
+                std::fprintf(stderr, "[strata diag] DISCARD: stage count mismatch (image has %zu stages, "
+                                     "engine has %zu)\n",
+                             incoming->stage_images.size(), stages.size());
                 std::fprintf(stderr, "strata serve: conversation cache: discard snapshot (stage count)\n");
                 incoming.reset();
             }
@@ -11174,6 +11184,7 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on(stages[i]->dev);
                 if (!strata::core::conversation_snapshot_validate(incoming->stage_images[i], stages[i]->ss, g,
                         use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err)) {   // the draft: the last stage's
+                    std::fprintf(stderr, "[strata diag] DISCARD: stage %zu invalid: %s\n", i, err.c_str());
                     std::fprintf(stderr, "strata serve: conversation cache: discard invalid stage snapshot (%s)\n",
                                  err.c_str());
                     incoming.reset();
@@ -11183,9 +11194,16 @@ int main(int argc, char** argv) {
             }
             if (incoming && !strata::core::conversation_snapshot_validate(*incoming, ss, g,
                     use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err)) {
+                std::fprintf(stderr, "[strata diag] DISCARD: main snapshot invalid: %s\n", err.c_str());
                 std::fprintf(stderr, "strata serve: conversation cache: discard invalid snapshot (%s)\n", err.c_str());
                 incoming.reset();
                 err.clear();
+            }
+            if (incoming) {
+                std::fprintf(stderr, "[strata diag] restored image SURVIVED validation, will be used "
+                                     "(live_ids=%zu)\n", incoming->live.ids.size());
+            } else if (disk_store_ptr != nullptr) {
+                std::fprintf(stderr, "[strata diag] restored image was DISCARDED, engine will recompute\n");
             }
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
