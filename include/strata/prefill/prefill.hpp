@@ -146,7 +146,10 @@ public:
     /// mid-prompt checkpoint takes each stage's part.  Runs on that stage's thread, with its device current.
     std::function<bool(int64_t done, std::string& err)> on_stage_chunk;
 
-    /// Checked before every chunk: true stops the prompt early (`run` returns false with err "cancelled").
+    /// Checked before every chunk AND before every layer of the batched read: true stops the prompt early
+    /// (`run` returns false with err "cancelled").  The layer check keeps a STOP to about a layer's work on a
+    /// slow card (a whole chunk can run to tens of seconds); both leave the session mid-chunk, which the
+    /// request's cancel path already handles (pp_exact=false, the next request re-reads from its checkpoint).
     std::function<bool()> should_stop;
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token

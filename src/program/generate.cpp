@@ -9880,6 +9880,10 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
+        // A layer split's stages each check should_stop themselves (every chunk AND - since the fork - every layer
+        // of the batched read): without this a STOP only reached stage 0, and the deeper stages read their part
+        // of every chunk to the end while the request that replaced this one waited behind them.
+        for (auto& st_ : stages) st_->sp.should_stop = sp.should_stop;
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {

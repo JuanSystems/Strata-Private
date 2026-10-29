@@ -3109,6 +3109,16 @@ class Service:
         self.started_at = time.time()
         self.status_lock = threading.Lock()
         self.active_cancels: set[threading.Event] = set()   # POST /v1/cancel: the cancel Events of the requests in flight
+        # The generation requests in flight (their cancel Events): every request that reached Service.run, whether
+        # it holds the engine's turn or still waits for it.  supersede_previous (the config's key of that name,
+        # default true; STRATA_SUPERSEDE_PREVIOUS=0): with the engine one request at a time, a request that arrives
+        # while another one runs is its replacement - the client stopped the old one (a stop the server may never
+        # see: a retry's proxy or the client itself can leave the old socket open) or sent it again after an error
+        # (the old connection is dead the same way).  The new request cancels every other in-flight generation, so
+        # the engine is STOPped at once instead of finishing a request nobody reads while the new one waits behind
+        # it.  Never with --batch, whose slots run requests concurrently.
+        self.gen_requests: set[threading.Event] = set()
+        self.supersede_previous = os.getenv("STRATA_SUPERSEDE_PREVIOUS", "1") != "0"
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         # sharing the GPU with other programs (all off by default): unload the engine after this many idle seconds,
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
@@ -4222,6 +4232,16 @@ class Service:
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
             self.status["queued"] += 1
+            self.gen_requests.add(cancel)
+        # supersede_previous (see __init__): the newest request wins the engine.  With the engine one request at
+        # a time, cancel every OTHER in-flight generation now: the one in the engine gets its STOP (honoured at
+        # its next verify window, prompt layer or chunk), and a queued one ends as "cancel" without taking the
+        # turn.  The old request's client has gone or stopped asking - this one is what the client wants now.
+        if self.supersede_previous and not par:
+            with self.status_lock:
+                others = [c for c in self.gen_requests if c is not cancel and not c.is_set()]
+            for c in others:
+                c.set()
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
@@ -4586,6 +4606,8 @@ class Service:
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
         finally:
+            with self.status_lock:
+                self.gen_requests.discard(cancel)   # supersede_previous: this request can no longer be replaced
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
@@ -5594,8 +5616,16 @@ def make_handler(svc: Service):
                     if not self._own_page("the running request can be cancelled"):
                         return
                     t = req.get("timeout_s")
-                    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t < 0):
-                        raise ValueError("timeout_s: a number of seconds (0 or more), or null for the engine's stop_wait_s")
+                    if t is None:                             # the query string: /v1/cancel?timeout_s=2.5
+                        q = parse_qs(urlsplit(self.path).query).get("timeout_s", [None])[0]
+                        if q is not None:
+                            try:
+                                t = float(q)
+                            except ValueError:
+                                t = q                          # not a number: the check below answers 400
+                    if t is not None and (isinstance(t, bool) or not isinstance(t, (int, float)) or t <= 0):
+                        raise ValueError("timeout_s: a positive number of seconds (0 waits for nothing and always "
+                                         "times out), or null for the engine's stop_wait_s")
                     self._json(200, svc.cancel_running(None if t is None else float(t)))
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
@@ -6973,6 +7003,16 @@ def main() -> int:
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
+    # supersede_previous: a request that arrives while another generation runs cancels it (the engine is one
+    # request at a time, and the old one's client has stopped asking - a stop the proxy may never deliver).
+    # false restores the old queue; the env disables it regardless of the config.
+    sup = cfg.get("supersede_previous", True)
+    if not isinstance(sup, bool):
+        raise SystemExit(f"[strata] config \"supersede_previous\" must be true or false, not {sup!r}")
+    svc.supersede_previous = sup and os.getenv("STRATA_SUPERSEDE_PREVIOUS", "1") != "0"
+    if svc.supersede_previous and not getattr(engine, "batch", 0):
+        print("[strata] supersede_previous: a new request cancels the generation request it replaces "
+              "(\"supersede_previous\": false, or STRATA_SUPERSEDE_PREVIOUS=0, restores the queue)", flush=True)
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:

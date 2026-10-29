@@ -2739,6 +2739,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         };
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            // The client's STOP, a layer at a time and not a chunk at a time (see the CUDA twin for the details).
+            if (should_stop && should_stop()) { err = "cancelled"; return false; }
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);

@@ -4205,6 +4205,9 @@ class StatusHandover(unittest.TestCase):
 
         svc = Service(Engine(tok, "</think>\n\n" + "y" * 40, max_context=CTX), tok,
                       ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        # This test is about the queue's release accounting, so it needs the queue itself:
+        # supersede_previous (default on) would cancel the first request when the second queues.
+        svc.supersede_previous = False
         svc.fifo = SlowRelease()
         ids = tok.encode("hi")
         first = svc.run(ids, True, None, 30, {}, threading.Event())
