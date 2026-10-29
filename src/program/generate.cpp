@@ -11355,8 +11355,34 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
-                resume = parked.tokens;
-                from_live = parked.live;
+                if (incoming_from_disk) {
+                    // ── A disk-restored image arrives with parked.tokens == 0 (that is exactly
+                    // why the disk path ran: the RAM cache had no match), and when it beat an
+                    // in-session resume, parked.tokens was below that too. The old
+                    // `resume = parked.tokens` left resume=0 here, so the `resume == 0` branch
+                    // below zeroed the freshly restored session (801 MiB read from disk,
+                    // validated, mounted - all for nothing), cleared the restored checkpoints
+                    // and the engine re-read the whole prompt from token 0 despite a perfect
+                    // checkpoint match (log: "restored 23961 tokens from disk" followed by
+                    // "resume=0 (none); checks=3 (longest 22667, diverge@-1)"). Re-derive the
+                    // resume point from the state we JUST mounted: same selection as the top
+                    // of the request — the live if it is a strict prefix of this prompt, else
+                    // the longest restored checkpoint that is (the turn boundary survives the
+                    // client stripping the assistant's thinking tokens; live does not).
+                    resume = 0;
+                    from_live = false;
+                    if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
+                        if (starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
+                        for (const ConvCheckpoint& c : checks)
+                            if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
+                                resume = (int64_t) c.ids.size();
+                                from_live = false;
+                            }
+                    }
+                } else {
+                    resume = parked.tokens;   // the RAM cache's match — unchanged behavior
+                    from_live = parked.live;
+                }
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
