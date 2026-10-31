@@ -11,6 +11,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#if !defined(_WIN32)
+#include <unistd.h>
+#define jsetenv(n, v) ::setenv(n, v, 1)
+#define junsetenv(n) ::unsetenv(n)
+#else
+#define jsetenv(n, v) _putenv_s(n, v)
+#define junsetenv(n) _putenv_s(n, "")
+#endif
 #include <fstream>
 #include <optional>
 #include <string>
@@ -92,6 +100,105 @@ bool same(const SavedConversation& a, const SavedConversation& b) {
     for (size_t i = 0; i < a.checkpoints.size(); ++i)
         if (!same_checkpoint(a.checkpoints[i], b.checkpoints[i])) return false;
     return true;
+}
+
+
+// ── Delta-journal builders (same shape as conversation_disk_store_test's): capture-consistent
+// images so a journal record can chain onto them.
+constexpr int64_t JPage = 64, JHeads = 2, JHeadDim = 64, JIdxDim = 32, JIdxBlock = 4;
+
+int64_t jcells(size_t tokens) { return ((int64_t) tokens + JPage - 1) / JPage * JPage; }
+
+ConversationBuffer jfill(size_t n, uint8_t seed) {
+    ConversationBuffer b;
+    b.resize(n);
+    b.visit(0, n, [&](uint8_t* p, size_t c, size_t at) {
+        for (size_t i = 0; i < c; ++i) p[i] = uint8_t((at + i) * 131u + seed * 7u);
+        return true;
+    });
+    return b;
+}
+
+ConversationCheckpoint jckpt(const std::vector<int32_t>& ids, uint8_t seed) {
+    ConversationCheckpoint c;
+    c.ids = ids;
+    c.gdn = {uint8_t(seed), uint8_t(seed + 1)};
+    c.ple = {uint8_t(seed + 2)};
+    c.tails = {uint8_t(seed + 3), uint8_t(seed + 4), uint8_t(seed + 5)};
+    c.dead = {uint8_t(seed + 6)};
+    c.block_pos = {uint8_t(seed + 7), uint8_t(seed + 8)};
+    c.used = seed;
+    return c;
+}
+
+SavedConversation conv_image(size_t tokens, uint8_t seed) {
+    SavedConversation s;
+    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(200 + i);
+    s.layer_lo = 0; s.layer_hi = 40;
+    s.cvec = false;
+    std::vector<int32_t> ids;
+    for (size_t i = 0; i < tokens; ++i) ids.push_back(int32_t(3000 + i));
+    s.live = jckpt(ids, seed);
+    s.live.imgs = {{7, 0xabcd0000ull + seed}};
+    s.checkpoints.push_back(jckpt(
+        std::vector<int32_t>(ids.begin(), ids.begin() + std::ptrdiff_t(tokens / 2)), uint8_t(seed + 50)));
+    const int64_t cells = jcells(tokens);
+    for (int layer = 0; layer < 3; ++layer) {
+        ConversationKv kv;
+        kv.format = 1; kv.cells = cells; kv.heads = JHeads; kv.head_dim = JHeadDim;
+        kv.page_size = JPage;
+        kv.pooled_rows = layer < 2 && tokens > 0 ? (int64_t) tokens / JIdxBlock + 1 : 0;
+        kv.idx_dim = JIdxDim;
+        kv.k = jfill(size_t(cells) * size_t(JHeads * JHeadDim * 2), uint8_t(layer * 10 + seed));
+        kv.v = jfill(size_t(cells) * size_t(JHeads * JHeadDim * 2), uint8_t(layer * 10 + seed + 1));
+        kv.k_scale = layer < 2 ? jfill(size_t(cells) * size_t(JHeads * 2), uint8_t(layer * 10 + seed + 2))
+                               : ConversationBuffer{};
+        kv.v_scale = layer < 2 ? jfill(size_t(cells) * size_t(JHeads * 2), uint8_t(layer * 10 + seed + 3))
+                               : ConversationBuffer{};
+        kv.pooled = layer < 2 && tokens > 0
+                        ? jfill(size_t(kv.pooled_rows) * size_t(JIdxDim * 4), uint8_t(layer * 10 + seed + 4))
+                        : ConversationBuffer{};
+        s.kv.push_back(std::move(kv));
+    }
+    return s;
+}
+
+SavedConversation conv_grow(const SavedConversation& base, size_t extra, uint8_t seed) {
+    SavedConversation s = base;
+    const size_t old_tokens = s.live.ids.size();
+    for (size_t i = 0; i < extra; ++i) s.live.ids.push_back(int32_t(3000 + old_tokens + i));
+    const std::vector<ConversationImageKey> base_imgs = s.live.imgs;
+    s.live = jckpt(s.live.ids, seed);
+    s.live.imgs = base_imgs;
+    s.checkpoints.clear();
+    s.checkpoints.push_back(jckpt(
+        std::vector<int32_t>(s.live.ids.begin(),
+                             s.live.ids.begin() + std::ptrdiff_t(s.live.ids.size() / 2)),
+        uint8_t(seed + 50)));
+    const int64_t whole = (int64_t) (old_tokens / JPage) * JPage;
+    const int64_t cells = jcells(s.live.ids.size());
+    const int64_t pooled_keep = (int64_t) old_tokens / JIdxBlock;
+    for (int layer = 0; layer < 3; ++layer) {
+        ConversationKv& kv = s.kv[layer];
+        kv.cells = cells;
+        kv.pooled_rows = layer < 2 ? (int64_t) s.live.ids.size() / JIdxBlock + 1 : 0;
+        auto extend = [&](ConversationBuffer& buf, size_t size, size_t at) {
+            buf.resize(size);
+            if (size > at)
+                buf.visit(at, size - at, [&](uint8_t* p, size_t c, size_t) {
+                    for (size_t i = 0; i < c; ++i) p[i] = uint8_t(i * 17u + seed + layer);
+                    return true;
+                });
+        };
+        extend(kv.k, size_t(cells) * size_t(JHeads * JHeadDim * 2), size_t(whole) * size_t(JHeads * JHeadDim * 2));
+        extend(kv.v, size_t(cells) * size_t(JHeads * JHeadDim * 2), size_t(whole) * size_t(JHeads * JHeadDim * 2));
+        if (layer < 2) {
+            extend(kv.k_scale, size_t(cells) * size_t(JHeads * 2), size_t(whole) * size_t(JHeads * 2));
+            extend(kv.v_scale, size_t(cells) * size_t(JHeads * 2), size_t(whole) * size_t(JHeads * 2));
+            extend(kv.pooled, size_t(kv.pooled_rows) * size_t(JIdxDim * 4), size_t(pooled_keep) * size_t(JIdxDim * 4));
+        }
+    }
+    return s;
 }
 
 } // namespace
@@ -183,7 +290,7 @@ int main() {
                                                      /*resume*/ 0, /*slot_tokens*/ 0, id);
         check(from_disk_b.has_value(), "disk fallback restored the conversation");
         check(from_disk_b->live.ids.size() == 800, "restored image has 800 tokens");
-        check(store->size() == 0, "disk entry removed after restore (take = remove)");
+        check(store->size() == 1, "disk entry KEPT after restore (take-keep: the delta base)");
     }
 
     // ── 3. restore_from_disk_or_ram: resume/slot_tokens floor honors the live session ────
@@ -398,6 +505,12 @@ int main() {
         const uint64_t s0_sz = fs::file_size(dir / "build10" / "conv-77.stage0.bin");
         const uint64_t s1_sz = fs::file_size(dir / "build10" / "conv-77.stage1.bin");
         check(store->bytes() == main_sz + s0_sz + s1_sz, "bytes() counts main + stage files");
+        // A second spill with stages, put BEFORE the take so its LRU stamp ends up the oldest
+        // (take bumps the taken entry's stamp): the eviction's victim must be 78, and its main,
+        // .idx AND stage files all go together.
+        SavedConversation s2 = sample(300);
+        s2.stage_images.push_back(sample(300));
+        check(store->put(std::move(s2), 78, id), "second spill with one stage");
         // take() restores the whole image: main + both stages, contents intact.
         ConversationCache::Match m;
         m.serial = 77; m.tokens = 400; m.live = true;
@@ -410,12 +523,7 @@ int main() {
         check(back->stage_images[0].layer_lo == 24 && back->stage_images[0].layer_hi == 48,
               "stage 0 carve survived");
         check(fs::exists(dir / "build10" / "conv-77.bin"), "files kept on disk after take (policy)");
-        // A second spill with stages, then evict_oldest: main, .idx AND stage files all go.
-        // (conv-77's files stay: take() keeps them on disk by policy.)
-        SavedConversation s2 = sample(300);
-        s2.stage_images.push_back(sample(300));
-        check(store->put(std::move(s2), 78, id), "second spill with one stage");
-        check(store->evict_oldest(), "evict_oldest dropped the oldest entry");
+        check(store->evict_oldest(), "evict_oldest dropped the least-recently-used entry");
         check(!fs::exists(dir / "build10" / "conv-78.bin"), "evict removed the evicted main .bin");
         check(!fs::exists(dir / "build10" / "conv-78.idx"), "evict removed the evicted .idx");
         check(!fs::exists(dir / "build10" / "conv-78.stage0.bin"), "evict removed the evicted stage file");
@@ -769,6 +877,35 @@ int main() {
             check(!fs::exists(rp / "pfx-9.stage0.bin"), "pfx-9.stage0.bin purged");
             check(fs::exists(rp / "keep.txt"), "keep.txt kept");
         }
+    }
+
+    // ── 16. Delta journal end-to-end: park, grow, append, and restore through the very
+    // restore_from_disk_or_ram path the engine uses — the folded image must equal the newest
+    // conversation, and the entry must stay for the next park's delta.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_e2e";
+        SpillConfig cfg;
+        cfg.path = rdir.string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        check(store != nullptr && store->enabled(), "16: store enabled");
+        SavedConversation a0 = conv_image(1000, 1);
+        const std::vector<ConversationImageKey> imgs = a0.live.imgs;
+        check(store->put(std::move(a0), 2000, id), "16: the first park");
+        SavedConversation a1 = conv_grow(conv_image(1000, 1), 24, 2);
+        check(store->put_async(std::move(a1), 2001, id), "16: the delta park");
+        store->flush_pending();
+        check(fs::exists(rdir / "conv-2000.dlt"), "16: the journal exists");
+        std::vector<int32_t> prompt = conv_grow(conv_image(1000, 1), 24, 2).live.ids;
+        prompt.push_back(9999);
+        const ConversationCache::Match no_park{};
+        auto restored = restore_from_disk_or_ram(no_park, store.get(), prompt, imgs, false,
+                                                 /*resume*/ 0, /*slot*/ 0, id);
+        check(restored.has_value(), "16: the folded conversation restored");
+        check(restored->live.ids.size() == 1024, "16: the restored image is the NEWEST state");
+        check(store->size() == 1, "16: the entry stayed in the manifest (the next delta's base)");
+        junsetenv("STRATA_SPILL_JOURNAL");
     }
 
     fs::remove_all(dir);

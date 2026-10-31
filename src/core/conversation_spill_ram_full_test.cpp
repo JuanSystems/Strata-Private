@@ -150,7 +150,7 @@ int main() {
                                                   /*resume*/ 0, /*slot_tokens*/ 0, id);
         check(restored.has_value(), "the spilled conversation was restored from disk");
         check(restored->live.ids == captured_ids, "restored ids match the original");
-        check(store->size() == 0, "disk store empty after restore (take = remove)");
+        check(store->size() == 1, "disk entry KEPT after restore (take-keep: the delta base)");
     }
 
     // ── 2. Spill disabled (budget_gib = 0): the path is a no-op, conversation lost ──────
@@ -223,7 +223,7 @@ int main() {
         check(restored.has_value(), "restored conversation #3 from disk");
         check(restored->live.ids.size() == 100, "restored 100 tokens");
         check(restored->live.ids[0] == 5000, "restored prefix starts at 5000 (conversation #3)");
-        check(store->size() == 4, "disk store has 4 left after take");
+        check(store->size() == 5, "disk store keeps all 5 after take (take-keep: the delta base)");
     }
 
     fs::remove_all(dir);

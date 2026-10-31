@@ -112,41 +112,47 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   # conversation_disk_store.cpp) when a spill store is attached; every test that exercises the
   # cache (directly or indirectly) must link conversation_disk_store.cpp so the symbol resolves.
   add_executable(conversation_cache_test
-    src/core/conversation_cache_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp)
+    src/core/conversation_cache_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp src/core/conversation_delta.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
   add_executable(conversation_split_failure_test
-    src/core/conversation_split_failure_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp)
+    src/core/conversation_split_failure_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp src/core/conversation_delta.cpp)
   target_include_directories(conversation_split_failure_test PRIVATE include)
   add_test(NAME conversation_split_failure_test COMMAND conversation_split_failure_test)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
   add_executable(conversation_file_test
-    src/core/conversation_file_test.cpp src/core/conversation_file.cpp src/core/conversation_disk_store.cpp)
+    src/core/conversation_file_test.cpp src/core/conversation_file.cpp src/core/conversation_disk_store.cpp src/core/conversation_delta.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
   add_executable(session_save_reclaim_test
-    src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp src/core/conversation_disk_store.cpp)
+    src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp src/core/conversation_disk_store.cpp src/core/conversation_delta.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
   # Disk-tier spill store: same CPU-only style as the file-test; links conversation_file.cpp
   # (the spill uses session_file_write/read as its on-disk format) and conversation_disk_store.cpp.
   add_executable(conversation_disk_store_test
-    src/core/conversation_disk_store_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp)
+    src/core/conversation_disk_store_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp src/core/conversation_delta.cpp)
   target_include_directories(conversation_disk_store_test PRIVATE include)
   add_test(NAME conversation_disk_store_test COMMAND conversation_disk_store_test)
+  # Delta journal codec: the record format, the chain rule, the torn-tail truncation and the
+  # compaction-crash idempotency, all without touching the store itself.
+  add_executable(conversation_delta_test
+    src/core/conversation_delta_test.cpp src/core/conversation_delta.cpp)
+  target_include_directories(conversation_delta_test PRIVATE include)
+  add_test(NAME conversation_delta_test COMMAND conversation_delta_test)
   # Integration test: exercises the free-function wrappers (attach_spill, restore_from_disk_or_ram,
   # spill_drop_superseded, spill_clear, spill_purge_on_startup, make_disk_store) that generate.cpp
   # calls - validates the engine wiring points without needing a GPU or model.
   add_executable(conversation_spill_integration_test
-    src/core/conversation_spill_integration_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp)
+    src/core/conversation_spill_integration_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp src/core/conversation_delta.cpp)
   target_include_directories(conversation_spill_integration_test PRIVATE include)
   add_test(NAME conversation_spill_integration_test COMMAND conversation_spill_integration_test)
   # RAM-full spill test: validates that when conversation_memory_admit refuses (RAM floor would be
   # violated), the captured image is spilled directly to disk instead of being dropped.
   add_executable(conversation_spill_ram_full_test
-    src/core/conversation_spill_ram_full_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp)
+    src/core/conversation_spill_ram_full_test.cpp src/core/conversation_disk_store.cpp src/core/conversation_file.cpp src/core/conversation_delta.cpp)
   target_include_directories(conversation_spill_ram_full_test PRIVATE include)
   add_test(NAME conversation_spill_ram_full_test COMMAND conversation_spill_ram_full_test)
 endif()
@@ -514,7 +520,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
-    src/core/conversation_disk_store.cpp)
+    src/core/conversation_disk_store.cpp src/core/conversation_delta.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)

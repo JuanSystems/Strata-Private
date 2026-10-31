@@ -7,9 +7,16 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <system_error>
 #include <utility>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace strata::core {
 namespace fs = std::filesystem;
@@ -154,11 +161,24 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
         if (!inline_write) pending_.push_back(std::move(p));
     }
     if (inline_write) {
-        // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded runs
-        // before put). AFTER the write the new entry's ids equal the cleanup's `ids` and the
-        // exact-match branch would delete the file we just wrote.
-        const size_t superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
-        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
+        // ── Delta path first, exactly as the writer thread does it (the append before the
+        // protected cleanup); the thread-start failure that landed here must not change the
+        // on-disk shape between the two modes.
+        bool ok = false;
+        const size_t superseded = [&] {
+            if (journal_ && !p.prefix && p.image.stage_images.empty())
+                if (auto base = find_delta_base(p.image)) {
+                    const uint64_t base_serial = entries_[base->index].serial;
+                    if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
+                        ok = true;
+                        { SavedConversation discard = std::move(p.image); (void) discard; }
+                        return drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec, base_serial);
+                    }
+                }
+            const size_t n = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
+            ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
+            return n;
+        }();
         if (ok && superseded > 0)
             std::fprintf(stderr, "strata serve: conversation spill: write landed (serial %llu) "
                                  "and dropped %zu superseded spill file%s\n",
@@ -181,22 +201,60 @@ void ConversationDiskStore::writer_loop() {
         pending_.pop_front();
         writer_busy_ = true;
         lk.unlock();
-        // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded runs
-        // before put). AFTER the write the new entry's ids equal the cleanup's `ids` and the
-        // exact-match branch would delete the file we just wrote (the async test caught this).
-        const size_t superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
-        const bool ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
+        // ── Delta path first (STRATA_SPILL_JOURNAL=1): a park whose conversation is already
+        // on disk as (base + journal) appends ONE record instead of rewriting the .bin. The
+        // append runs BEFORE the superseded cleanup — the base entry holds a strict PREFIX of
+        // this image's ids, so the cleanup's prefix branch would delete it (Trampa 1); and
+        // AFTER the append the entry's ids EQUAL the cleanup's ids, so the exact-match branch
+        // would delete it too (Trampa 2) — hence the protect_serial the cleanup gets then.
+        // Any anomaly falls through to today's full write, whose cleanup replaces the entry.
+        bool ok = false;
+        size_t superseded = 0;
+        if (journal_ && !p.prefix && p.image.stage_images.empty()) {
+            if (auto base = find_delta_base(p.image)) {
+                const uint64_t base_serial = entries_[base->index].serial;   // copied: the cleanup may erase
+                if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
+                    ok = true;
+                    superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec, base_serial);
+                    { SavedConversation discard = std::move(p.image); (void) discard; }
+                }
+            }
+        }
+        if (!ok) {
+            // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded
+            // runs before put). AFTER the write the new entry's ids equal the cleanup's `ids`
+            // and the exact-match branch would delete the file we just wrote.
+            superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
+            ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
+        }
+        // ── Compaction: only with the queue idle (never on a request's way) and only one
+        // candidate per pass — the fold is a full read+rewrite of one conversation. The
+        // writer stays busy through it, so a take() that arrives meanwhile waits inside
+        // flush_pending() instead of reading a half-compacted entry.
+        bool compact = false;
         lk.lock();
-        writer_busy_ = false;
-        if (!ok)
-            std::fprintf(stderr, "strata serve: conversation spill: background write FAILED "
-                                 "(serial %llu); the conversation stays in RAM only\n",
-                         (unsigned long long) p.serial);
-        else if (superseded > 0)
-            std::fprintf(stderr, "strata serve: conversation spill: background write landed "
-                                 "(serial %llu) and dropped %zu superseded spill file%s\n",
-                         (unsigned long long) p.serial, superseded, superseded == 1 ? "" : "s");
-        writer_cv_.notify_all();   // a flusher may be waiting for this write to land
+        compact = journal_ && pending_.empty() && !writer_stop_;
+        if (!compact) {
+            writer_busy_ = false;
+            if (!ok)
+                std::fprintf(stderr, "strata serve: conversation spill: background write FAILED "
+                                     "(serial %llu); the conversation stays in RAM only\n",
+                             (unsigned long long) p.serial);
+            else if (superseded > 0)
+                std::fprintf(stderr, "strata serve: conversation spill: background write landed "
+                                     "(serial %llu) and dropped %zu superseded spill file%s\n",
+                             (unsigned long long) p.serial, superseded, superseded == 1 ? "" : "s");
+            writer_cv_.notify_all();   // a flusher may be waiting for this write to land
+        }
+        lk.unlock();
+        if (compact) {
+            (void) compact_idle(p.id);
+            lk.lock();
+            writer_busy_ = false;
+            writer_cv_.notify_all();
+            lk.unlock();
+        }
+        lk.lock();
     }
 }
 
@@ -204,6 +262,10 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
                                              const SessionFileIdentity* identity)
     : dir_(std::move(dir)), budget_(budget_bytes) {
     if (identity) { identity_ = *identity; identity_bound_ = true; }
+    // The delta journal's flag, read once (A/B safe): 1 = a park that finds a delta base
+    // appends a conv-<serial>.dlt record instead of rewriting the whole .bin; anything else
+    // (unset, 0) = the exact behaviour of the build before the journal existed.
+    if (const char* env = std::getenv("STRATA_SPILL_JOURNAL")) journal_ = std::strcmp(env, "1") == 0;
     if (budget_ == 0 || dir_.empty()) { budget_ = 0; return; }
     // Create the spill dir (idempotent). 0700: only the engine user can read parked
     // conversations (they may carry prompt contents).
@@ -216,6 +278,12 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
         return;
     }
     fs::permissions(dir_, fs::perms::owner_all, ec);   // best-effort; ignore if unsupported
+    if (journal_)
+        std::fprintf(stderr, "strata serve: conversation spill: delta journal ON "
+                             "(STRATA_SPILL_JOURNAL=1): a continued turn appends conv-<serial>.dlt "
+                             "instead of rewriting the .bin (compaction at %llu MiB / %u records)\n",
+                     (unsigned long long) (kJournalCompactBytes / (1024ull * 1024)),
+                     (unsigned) kJournalCompactRecords);
 }
 
 // The dtor DRAINS: the engine's shutdown auto-spill is queued microseconds before main()
@@ -235,12 +303,32 @@ ConversationDiskStore::~ConversationDiskStore() {
     while (!pending_.empty()) {
         PendingWrite p = std::move(pending_.front());
         pending_.pop_front();
-        // same order as the writer: the superseded cleanup runs BEFORE the write
-        (void) drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
-        if (!put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix))
-            std::fprintf(stderr, "strata serve: conversation spill: shutdown drain write FAILED "
-                                 "(serial %llu)\n", (unsigned long long) p.serial);
+        // the writer thread's order (delta first, then the protected cleanup; the fallback
+        // full write with today's cleanup) — same code, run on the draining thread
+        bool ok = false;
+        if (journal_ && !p.prefix && p.image.stage_images.empty())
+            if (auto base = find_delta_base(p.image)) {
+                const uint64_t base_serial = entries_[base->index].serial;
+                if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
+                    ok = true;
+                    (void) drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec, base_serial);
+                    { SavedConversation discard = std::move(p.image); (void) discard; }
+                }
+            }
+        if (!ok) {
+            // same order as the writer: the superseded cleanup runs BEFORE the write
+            (void) drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
+            if (!put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix))
+                std::fprintf(stderr, "strata serve: conversation spill: shutdown drain write FAILED "
+                                     "(serial %llu)\n", (unsigned long long) p.serial);
+        }
     }
+    // Shutdown compaction (the plan's third trigger): fold every journal past its bounds back
+    // into its .bin, so the next run restores from one file per conversation. Fail-soft — a
+    // journal left over compacts on the next run's idle pass instead. Needs the identity this
+    // run's writes carried (the engine passes it per call; remembered in put_impl/append_delta
+    // and at reload) — without one there is nothing this run owns on disk to fold.
+    if (journal_ && write_id_set_) compact_all();
 }
 
 // Not movable since Phase 2 (the writer thread + mutex + cv); no call site ever moved the
@@ -248,6 +336,10 @@ ConversationDiskStore::~ConversationDiskStore() {
 
 std::string ConversationDiskStore::path_for(uint64_t serial, bool prefix) const {
     return dir_ + "/" + kind_name(prefix) + std::to_string(serial) + ".bin";
+}
+
+std::string ConversationDiskStore::path_for_dlt(uint64_t serial, bool prefix) const {
+    return dir_ + "/" + kind_name(prefix) + std::to_string(serial) + ".dlt";
 }
 
 // ── Stage files (a layer split's spill) ─────────────────────────────────────────────────────
@@ -284,7 +376,7 @@ namespace {
 
 // Magic + version. Bumping the version invalidates every old .idx (the slow path rewrites them).
 constexpr char kIdxMagic[4] = {'S', 'I', 'D', 'X'};
-constexpr uint32_t kIdxVersion = 2;   // v2: adds ckpt_ids + ckpt_imgs after live imgs
+constexpr uint32_t kIdxVersion = 3;   // v3: adds the journal's size/mtime/records (freshness)
 
 // Layout (little-endian, no struct memcpy — explicit byte writes):
 //   4   magic "SIDX"
@@ -295,9 +387,12 @@ constexpr uint32_t kIdxVersion = 2;   // v2: adds ckpt_ids + ckpt_imgs after liv
 //   8   int64  layer_lo
 //   8   int64  layer_hi
 //   1   uint8  cvec
-//   8   uint64 file_bytes    (size of the .bin on disk when the .idx was written)
+//   8   uint64 file_bytes    (the entry's disk footprint: .bin + stages + journal)
 //   8   uint64 bin_size      (fs::file_size of the .bin at write time — freshness check)
 //   8   int64  bin_mtime_ns  (fs::last_write_time as nanoseconds since epoch — freshness check)
+//   8   uint64 journal_size    (the .dlt's size at write time; 0: none — freshness check)
+//   8   int64  journal_mtime_ns (the .dlt's mtime; 0 when there is none)
+//   4   uint32 journal_records (the compaction trigger's unit)
 //   4   uint32 n_ids
 //   n_ids × 4   int32 ids[]
 //   4   uint32 n_imgs
@@ -344,7 +439,8 @@ bool read_le_u8(const std::vector<uint8_t>& buf, size_t& pos, uint8_t& out) {
 
 // Build the .idx payload (everything except the trailing checksum) into a byte buffer.
 std::vector<uint8_t> build_idx_payload(const DiskEntry& e, const SessionFileIdentity& id,
-                                       uint64_t bin_size, int64_t bin_mtime_ns) {
+                                       uint64_t bin_size, int64_t bin_mtime_ns,
+                                       uint64_t journal_size, int64_t journal_mtime_ns) {
     std::vector<uint8_t> buf;
     buf.reserve(256 + e.ids.size() * 4 + e.imgs.size() * 16 + e.ckpt_ids.size() * 4 + e.ckpt_imgs.size() * 16);
     for (int i = 0; i < 4; ++i) buf.push_back(uint8_t(kIdxMagic[i]));
@@ -358,6 +454,11 @@ std::vector<uint8_t> build_idx_payload(const DiskEntry& e, const SessionFileIden
     write_le_u64(buf, e.file_bytes);
     write_le_u64(buf, bin_size);
     write_le_i64(buf, bin_mtime_ns);
+    // the journal's freshness hint: what the .dlt was when this .idx was written. A later
+    // append changes the .dlt (and then rewrites this .idx); a mismatch means stale.
+    write_le_u64(buf, journal_size);
+    write_le_i64(buf, journal_mtime_ns);
+    write_le_u32(buf, e.journal_records);
     // live ids + imgs
     write_le_u32(buf, uint32_t(e.ids.size()));
     for (int32_t v : e.ids) write_le_u32(buf, uint32_t(v));
@@ -412,8 +513,31 @@ bool ConversationDiskStore::write_idx(const DiskEntry& e, const std::string& bin
             bin_mtime_ns = sys.time_since_epoch().count();
         }
     }
+    // The journal's freshness hint, the same way: the .dlt must still be exactly what it was
+    // when this .idx is written (an append lands BEFORE the .idx refresh, so the pair is
+    // always in this order on disk).
+    uint64_t journal_size = 0;
+    int64_t journal_mtime_ns = 0;
+    {
+        std::string dlt_path = bin_path;
+        if (dlt_path.size() > 4 && dlt_path.compare(dlt_path.size() - 4, 4, ".bin") == 0)
+            dlt_path.replace(dlt_path.size() - 4, 4, ".dlt");
+        else dlt_path = path_for_dlt(e.serial, e.prefix);
+        std::error_code ec2;
+        if (fs::exists(dlt_path, ec2) && !ec2) {
+            journal_size = (uint64_t) fs::file_size(dlt_path, ec2);
+            if (ec2) journal_size = 0;
+            const fs::file_time_type ft = fs::last_write_time(dlt_path, ec2);
+            if (!ec2) {
+                const auto sys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                    ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+                journal_mtime_ns = sys.time_since_epoch().count();
+            }
+        }
+    }
     // Build the payload (everything except the checksum).
-    std::vector<uint8_t> payload = build_idx_payload(e, id, bin_size, bin_mtime_ns);
+    std::vector<uint8_t> payload = build_idx_payload(e, id, bin_size, bin_mtime_ns,
+                                                     journal_size, journal_mtime_ns);
     // Append the checksum.
     const uint64_t cs = idx_checksum(payload);
     write_le_u64(payload, cs);
@@ -494,6 +618,12 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
     uint64_t bin_size = 0;
     int64_t bin_mtime_ns = 0;
     if (!read_le_u64(buf, pos, bin_size) || !read_le_i64(buf, pos, bin_mtime_ns)) return false;
+    // v3: the journal's recorded freshness + record count.
+    uint64_t journal_size = 0;
+    int64_t journal_mtime_ns = 0;
+    if (!read_le_u64(buf, pos, journal_size) || !read_le_i64(buf, pos, journal_mtime_ns)) return false;
+    uint32_t journal_records = 0;
+    if (!read_le_u32(buf, pos, journal_records)) return false;
     // Parse ids.
     uint32_t n_ids = 0;
     if (!read_le_u32(buf, pos, n_ids) || n_ids > (1u << 28)) return false;   // sanity bound
@@ -567,6 +697,28 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
         actual_ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
     const int64_t actual_mtime_ns = actual_sys.time_since_epoch().count();
     if (actual_mtime_ns != bin_mtime_ns) return false;   // mtime mismatch → fallback
+    // The journal must match too: the manifest data in this .idx describes base+journal, so a
+    // .dlt that changed since (an append whose .idx refresh never landed) makes it stale. An
+    // absent .dlt reads as (0, 0) — a recorded journal_size > 0 with no file is a mismatch.
+    {
+        const std::string dlt_path = bin_path.substr(0, bin_path.size() - 4) + ".dlt";   // .bin → .dlt
+        uint64_t actual_journal_size = 0;
+        int64_t actual_journal_mtime_ns = 0;
+        if (fs::exists(dlt_path, ec) && !ec) {
+            actual_journal_size = (uint64_t) fs::file_size(dlt_path, ec);
+            if (ec) actual_journal_size = 0;
+            const fs::file_time_type jft = fs::last_write_time(dlt_path, ec);
+            if (!ec) {
+                const auto jsys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
+                    jft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+                actual_journal_mtime_ns = jsys.time_since_epoch().count();
+            }
+        }
+        if (actual_journal_size != journal_size || actual_journal_mtime_ns != journal_mtime_ns)
+            return false;   // the .dlt changed (or went missing) since this .idx → fallback
+    }
+    e.journal_bytes = journal_size;
+    e.journal_records = journal_records;
     out = std::move(e);
     out.path = bin_path;
     return true;
@@ -639,6 +791,8 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
                                 const SessionFileIdentity& id, const SessionWriteOptions& options,
                                 bool prefix) {
     if (!enabled()) return false;
+    write_id_ = id;   // the shutdown compaction re-reads what this run wrote
+    write_id_set_ = true;
     // A prefix write whose exact prefix is already held is a SUCCESSFUL no-op: the engine spills
     // a pin once per run, but after a restart it does not know a previous run already wrote the
     // same file, and two identical pfx-<serial>.bin files (one per run) would waste the budget
@@ -656,24 +810,57 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
         }
     }
     // If this serial is already spilled (re-park of a conversation that came back from disk
-    // and got evicted again), replace it: delete the old files (.bin + .idx) and re-add the entry.
+    // and got evicted again), replace it: delete the old files (.bin + .idx + .dlt) and re-add
+    // the entry — but ONLY when the holder is this same conversation (a branch of the incoming
+    // image). A DIFFERENT conversation under a colliding serial (the RAM cache's park counter
+    // restarts at 1 every engine start, while reloaded spills keep their old serials) must keep
+    // its files: the new image is written under a fresh serial instead, lifted above every
+    // serial the manifest has ever seen. Without the guard, the first park after a restart
+    // destroyed a reloaded conversation's spill — and with journals, its delta base.
+    uint64_t use_serial = serial;
     if (DiskEntry* existing = find_by_serial(serial)) {
-        std::error_code ec;
-        const std::string old_bin = existing->path;
-        const uint64_t old_bytes = existing->file_bytes;
-        const size_t idx = static_cast<size_t>(existing - &entries_.front());
-        erase(idx);   // invalidates `existing`
-        bytes_ -= old_bytes;
-        remove_spill_files(old_bin);
+        auto ids_prefix = [](const std::vector<int32_t>& cid, const std::vector<int32_t>& full) {
+            return !cid.empty() && cid.size() <= full.size() &&
+                   std::equal(cid.begin(), cid.end(), full.begin());
+        };
+        auto imgs_contained = [](const std::vector<ConversationImageKey>& from,
+                                 const std::vector<ConversationImageKey>& into) {
+            if (from.size() > into.size()) return false;
+            size_t k = 0;
+            for (size_t a = 0; a < into.size() && k < from.size(); ++a)
+                if (into[a] == from[k]) ++k;
+            return k == from.size();
+        };
+        const bool branch =
+            (ids_prefix(existing->ids, image.live.ids) && imgs_contained(existing->imgs, image.live.imgs)) ||
+            (!existing->ckpt_ids.empty() && ids_prefix(existing->ckpt_ids, image.live.ids) &&
+             imgs_contained(existing->ckpt_imgs, image.live.imgs));
+        if (!branch) {
+            use_serial = next_fresh_serial_++;
+            while (find_by_serial(use_serial) != nullptr) use_serial = next_fresh_serial_++;
+            std::fprintf(stderr, "strata serve: conversation spill: serial %llu is held by another "
+                                 "conversation; writing under the fresh serial %llu instead\n",
+                         (unsigned long long) serial, (unsigned long long) use_serial);
+            existing = nullptr;
+        } else {
+            std::error_code ec;
+            const std::string old_bin = existing->path;
+            const uint64_t old_bytes = existing->file_bytes;
+            const size_t idx = static_cast<size_t>(existing - &entries_.front());
+            erase(idx);   // invalidates `existing`
+            bytes_ -= old_bytes;
+            remove_spill_files(old_bin);
+        }
     }
+    if (use_serial >= next_fresh_serial_) next_fresh_serial_ = use_serial + 1;
     // Capture the cheap manifest data before we move the image out (kv + checkpoints live on).
     // We mirror what ConversationCache's best() matches against: the live state and the deepest
     // checkpoint. session_checkpoints_to_save keeps the deepest one when writing, so the file's
     // image.checkpoints will hold it (and best() below consults both).
     DiskEntry e;
-    e.serial = serial;
+    e.serial = use_serial;
     e.prefix = prefix;
-    e.path = path_for(serial, prefix);
+    e.path = path_for(use_serial, prefix);
     e.ids = image.live.ids;                  // copy: the manifest keeps these in RAM
     e.imgs = image.live.imgs;
     // Capture the deepest checkpoint's ids/imgs too — this is the turn boundary that the next
@@ -849,38 +1036,99 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
         }
         back.stage_images.push_back(std::move(stage_img));
     }
-    // Success: the conversation is back in RAM. Remove from the manifest but DON'T delete the
-    // file — the user wants conversations preserved on disk. The file will be replaced only
-    // when a newer spill of the same conversation is written (drop_superseded), or evicted by
-    // the LRU when the disk budget is exceeded.
-    // A shared-prefix entry is NOT consumed: many conversations branch from it (the first
-    // request of every new chat restores it), so it stays in the manifest AND on disk — the
-    // next sibling conversation finds it there instead of recomputing the system prompt.
-    if (!is_prefix_entry(*e)) {
-        for (size_t i = 0; i < serials_.size(); ++i) {
-            if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
+    // ── Delta journal: apply the records on top of the base .bin (single pass, hash-checked,
+    // chain-checked). A torn or unchainable tail truncates the file at the last good record;
+    // a journal whose FIRST record does not chain onto this base is junk for it (a compaction
+    // that crashed after publishing the new .bin, or a .bin replaced under a reused serial) —
+    // dropped whole.
+    DeltaFold fold;   // had_journal=false without a .dlt: the correction below is then a no-op
+    if (!entry_pfx) {
+        const std::string dlt = path_for_dlt(m.serial, false);
+        std::error_code ec;
+        if (fs::exists(dlt, ec) && !ec) {
+            fold = conversation_delta_apply(dlt, back);
+            if (fold.failed) {
+                // a mid-apply I/O error: the image is suspect, exactly a corrupt .bin read.
+                // The entry leaves the manifest (not usable right now); every file stays.
+                std::fprintf(stderr, "[strata diag] spill take: journal conv-%llu.dlt apply failed "
+                                     "(I/O); entry dropped from the manifest, files KEPT\n",
+                             (unsigned long long) m.serial);
+                for (size_t i = 0; i < serials_.size(); ++i) {
+                    if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
+                }
+                return std::nullopt;
+            }
+            if (fold.dropped) {
+                fs::remove(dlt, ec);
+                std::fprintf(stderr, "strata serve: conversation spill: journal conv-%llu.dlt does not "
+                                     "chain onto its base — dropped (the base restores alone)\n",
+                             (unsigned long long) m.serial);
+            } else if (fold.torn) {
+                fs::resize_file(dlt, fold.valid_end, ec);
+                std::fprintf(stderr, "strata serve: conversation spill: journal conv-%llu.dlt truncated at "
+                                     "%llu B (torn or unchainable tail; %zu record%s applied)\n",
+                             (unsigned long long) m.serial, (unsigned long long) fold.valid_end,
+                             fold.applied, fold.applied == 1 ? "" : "s");
+            }
         }
     }
-    // NO borrar el archivo. La conversación está en RAM pero el archivo se queda en disco
-    // como copia de seguridad. Si el engine se reinicia, el archivo sigue ahí.
+    // Correct the manifest entry to the state the disk actually restores now, and bump its LRU
+    // stamp: the entry STAYS in the manifest (the (base + journal) pair is what the next park
+    // of this conversation appends its delta to, and what holds() sees to skip re-capturing an
+    // unchanged one — the retry case). Without a journal the correction is a no-op except the
+    // stamp. The RAM cache's own copy shadows it for matching while it is parked; the disk LRU
+    // still governs it under the budget, and drop_superseded still replaces it when a newer
+    // spill of the same conversation lands. A shared-prefix entry was never consumed either
+    // (many conversations branch from it).
+    for (size_t i = 0; i < serials_.size(); ++i) {
+        if (serials_[i] != m.serial) continue;
+        DiskEntry& en = entries_[i];
+        const uint64_t old_bytes = en.file_bytes;
+        en.ids = back.live.ids;
+        en.imgs = back.live.imgs;
+        if (!back.checkpoints.empty()) {
+            const auto& deepest = back.checkpoints.back();
+            en.ckpt_ids = deepest.ids;
+            en.ckpt_imgs = deepest.imgs;
+        } else {
+            en.ckpt_ids.clear();
+            en.ckpt_imgs.clear();
+        }
+        en.journal_bytes = fold.dropped ? 0 : fold.journal_bytes;
+        en.journal_records = fold.dropped ? 0 : fold.records;
+        en.file_bytes = (uint64_t) read + stage_files_bytes(m.serial, entry_pfx) + en.journal_bytes;
+        bytes_ += en.file_bytes - old_bytes;
+        en.used = next_used_++;
+        break;
+    }
     ++restores_;
     return back;
 }
 
-bool ConversationDiskStore::evict_oldest() {
+bool ConversationDiskStore::evict_oldest(uint64_t protect_serial) {
     if (entries_.empty()) return false;
-    // entries_ is oldest-first (LRU). The front is the one to drop — unless it is a pinned
-    // shared prefix: those are the smallest and most-reused entries (every new conversation's
-    // first request restores one), so a budget squeeze takes an ordinary conversation first.
-    // With only prefixes left, the oldest still goes: a full disk must not wedge parking.
-    size_t victim = 0;
-    while (victim < entries_.size() && is_prefix_entry(entries_[victim])) ++victim;
-    if (victim >= entries_.size()) victim = 0;
+    // The least-recently-used entry goes, by the `used` stamp (bumped by put, take and every
+    // delta append): with take() now KEEPING the entry in the manifest, the just-restored
+    // conversation must not be the victim while older untouched entries exist. Pinned shared
+    // prefixes are still spared while an ordinary conversation is available (they are the
+    // smallest and most-reused assets — every new conversation's first request restores one).
+    // With only prefixes left, the least recently used still goes (a full disk must not wedge
+    // parking) — unless the only thing left is a protected append's own base: its record may
+    // then run over the budget rather than destroy the base it extends.
+    size_t victim = SIZE_MAX;
+    for (size_t i = 0; i < entries_.size(); ++i) {
+        if (is_prefix_entry(entries_[i]) || entries_[i].serial == protect_serial) continue;
+        if (victim == SIZE_MAX || entries_[i].used < entries_[victim].used) victim = i;
+    }
+    if (victim == SIZE_MAX) {
+        if (protect_serial != UINT64_MAX) return false;
+        victim = 0;
+    }
     const DiskEntry e = std::move(entries_[victim]);
     bytes_ -= e.file_bytes;
     entries_.erase(entries_.begin() + (std::ptrdiff_t) victim);
     serials_.erase(serials_.begin() + (std::ptrdiff_t) victim);
-    remove_spill_files(e.path);   // .bin + .idx + .idx.tmp — best-effort, all three
+    remove_spill_files(e.path);   // .bin + .idx + .idx.tmp + stages (+ .dlt via the serial sweep)
     ++drops_;
     return true;
 }
@@ -914,8 +1162,10 @@ void ConversationDiskStore::purge_on_startup() {
                             name.compare(name.size() - 4, 4, ".bin") == 0;
         const bool is_idx = (named_conv || named_pfx) && name.size() > 4 &&
                             name.compare(name.size() - 4, 4, ".idx") == 0;
+        const bool is_dlt = (named_conv || named_pfx) && name.size() > 4 &&
+                            name.compare(name.size() - 4, 4, ".dlt") == 0;
         const bool is_tmp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
-        if (is_bin || is_idx || is_tmp) {
+        if (is_bin || is_idx || is_dlt || is_tmp) {
             fs::remove(entry.path(), ec);
         }
     }
@@ -963,6 +1213,15 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     // to keep them from being mistaken for mains — "conv-808.stage0.bin" ends in .bin and its
     // digits parse to 808, which would load serial 808 twice. Both kinds can carry stages.
     std::vector<SpillFile> stage_files;
+    // Delta journals (conv-<serial>.dlt): collected to clean orphans — a journal whose main
+    // .bin is gone can never apply to anything. The journals of surviving mains are read
+    // through path_for_dlt after the entry loads (the .idx fast path already carries their
+    // effect in the manifest data; the slow path folds them into the parsed image).
+    std::vector<SpillFile> dlt_files;
+    // The highest serial any file names — the fresh-serial floor for the put() collision guard
+    // (the park counter restarts at 1 every run; a reloaded serial must never be reused).
+    uint64_t max_serial_seen = 0;
+    bool any_serial_seen = false;
     for (const auto& entry : fs::directory_iterator(dir_, ec)) {
         if (ec) break;
         const std::string name = entry.path().filename().string();
@@ -994,11 +1253,14 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             remove_spill_files(entry.path().string());   // invalid serial: drop .bin + .idx (+ stages)
             continue;
         }
+        if (!any_serial_seen || serial > max_serial_seen) { max_serial_seen = serial; any_serial_seen = true; }
         const std::string tail = name.substr(p + 1);
         if (tail == "bin") {
             files.push_back({entry.path(), serial, is_pfx});
         } else if (tail.rfind("stage", 0) == 0) {
             stage_files.push_back({entry.path(), serial, is_pfx});
+        } else if (tail == "dlt") {
+            dlt_files.push_back({entry.path(), serial, is_pfx});
         }
         // ".idx" (and anything else) is read through path_for_idx, not scanned here
     }
@@ -1011,7 +1273,18 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             const std::string main_path = path_for(sf.serial, sf.prefix);
             if (!fs::exists(main_path, ec2) || ec2) fs::remove(sf.path, ec2);
         }
+        // Orphan journals: a .dlt whose main .bin is gone (the main was evicted or replaced and
+        // a build that did not know about journals left the .dlt behind — remove_spill_files'
+        // serial-prefix sweep takes it too, but a direct removal here also covers a manual
+        // delete of the .bin).
+        for (const auto& sf : dlt_files) {
+            const std::string main_path = path_for(sf.serial, sf.prefix);
+            if (!fs::exists(main_path, ec2) || ec2) fs::remove(sf.path, ec2);
+        }
     }
+    if (any_serial_seen && max_serial_seen + 1 > next_fresh_serial_) next_fresh_serial_ = max_serial_seen + 1;
+    write_id_ = identity;   // the shutdown compaction re-reads what this run can see
+    write_id_set_ = true;
     if (files.empty()) return 0;
     // Sort ASCENDING by serial so entries_ ends up oldest-first (LRU front = oldest), matching
     // put()'s order. evict_oldest() pops the front, so under budget pressure the OLDEST spill
@@ -1071,6 +1344,37 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
                              bin_path.c_str(), error.c_str(), (int) status.error);
                 continue;
             }
+            // ── Delta journal: fold the records onto the parsed image BEFORE the manifest data
+            // is captured, so the entry describes the state the disk restores (base + journal).
+            // The .idx fast path already carries that (the .idx is rewritten after every
+            // append); this is the stale-.idx recovery. A journal that does not chain onto
+            // this base is junk for it — dropped whole; a torn tail is truncated.
+            uint64_t e_journal_bytes = 0;
+            uint32_t e_journal_records = 0;
+            if (!is_pfx) {
+                const std::string dlt = path_for_dlt(serial, false);
+                std::error_code ec2;
+                if (fs::exists(dlt, ec2) && !ec2) {
+                    const DeltaFold fold = conversation_delta_apply(dlt, image);
+                    if (fold.dropped) {
+                        fs::remove(dlt, ec2);
+                        std::fprintf(stderr, "strata serve: conversation spill: reload: journal "
+                                             "conv-%llu.dlt does not chain onto its base — dropped\n",
+                                     (unsigned long long) serial);
+                    } else if (fold.torn) {
+                        fs::resize_file(dlt, fold.valid_end, ec2);
+                        std::fprintf(stderr, "strata serve: conversation spill: reload: journal "
+                                             "conv-%llu.dlt truncated at %llu B (%zu record%s applied)\n",
+                                     (unsigned long long) serial, (unsigned long long) fold.valid_end,
+                                     fold.applied, fold.applied == 1 ? "" : "s");
+                    }
+                    if (!fold.dropped && fold.applied > 0) {
+                        // journal bytes join the entry's disk footprint (put's accounting)
+                        e_journal_bytes = fold.journal_bytes;
+                        e_journal_records = fold.records;
+                    }
+                }
+            }
             // Capture the manifest data; the heavy K/V is dropped right after.
             DiskEntry e;
             e.serial = serial;
@@ -1093,6 +1397,9 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             // path carries that total — the slow path must arrive at the same number). Both
             // kinds can carry stages (a conversation and a shared-prefix snapshot alike).
             e.file_bytes = bytes_read + stage_files_bytes(serial, is_pfx);
+            e.journal_bytes = e_journal_bytes;
+            e.journal_records = e_journal_records;
+            e.file_bytes += e_journal_bytes;
             e.used = next_used_++;
             { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
             // LRU evict if over budget: drop the oldest entries (the front of entries_, which
@@ -1139,6 +1446,218 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
                      dup, dup == 1 ? "" : "s", entries_.size(), (double) bytes_ / (1024.0 * 1024.0));
     }
     return loaded;
+}
+
+// ── Delta journal: the writer-side selection, append and compaction ────────────────────────
+
+std::optional<ConversationDiskStore::DeltaBase> ConversationDiskStore::find_delta_base(
+    const SavedConversation& image) const {
+    auto ids_prefix = [](const std::vector<int32_t>& cid, const std::vector<int32_t>& full) {
+        return !cid.empty() && cid.size() <= full.size() &&
+               std::equal(cid.begin(), cid.end(), full.begin());
+    };
+    auto imgs_contained = [](const std::vector<ConversationImageKey>& from,
+                             const std::vector<ConversationImageKey>& into) {
+        if (from.size() > into.size()) return false;
+        size_t k = 0;
+        for (size_t a = 0; a < into.size() && k < from.size(); ++a)
+            if (into[a] == from[k]) ++k;
+        return k == from.size();
+    };
+    std::optional<DeltaBase> best;
+    for (size_t i = entries_.size(); i-- > 0;) {   // newest first: the tie prefers the most recent
+        const DiskEntry& e = entries_[i];
+        if (is_prefix_entry(e) || e.cvec != image.cvec || e.geometry != image.geometry ||
+            e.layer_lo != image.layer_lo || e.layer_hi != image.layer_hi)
+            continue;
+        if (stage_files_bytes(e.serial) > 0) continue;   // a layer split's spill: written whole
+        uint64_t keep = 0;
+        if (ids_prefix(e.ids, image.live.ids) && imgs_contained(e.imgs, image.live.imgs)) {
+            keep = (uint64_t) e.ids.size();   // the conversation grew on top of this spill
+        } else if (ids_prefix(e.ckpt_ids, image.live.ids) &&
+                   imgs_contained(e.ckpt_imgs, image.live.imgs)) {
+            keep = (uint64_t) e.ckpt_ids.size();   // the client re-rendered the history: the turn
+                                                   // boundary this entry's deepest checkpoint
+                                                   // holds is what the new render still contains
+        }
+        if (keep == 0) continue;
+        // The base must carry at least half the new image (the codec's own rule): otherwise the
+        // record would not save a rewrite and a full write is strictly better.
+        if (keep * 2 < (uint64_t) image.live.ids.size()) continue;
+        if (!best || keep > best->keep_tokens) best = DeltaBase{i, keep};
+    }
+    return best;
+}
+
+bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens,
+                                         const SavedConversation& image, const SessionFileIdentity& id) {
+    if (base_index >= entries_.size()) return false;
+    // Copies up front: the make-room loop below may evict OTHER entries, and erasing from the
+    // middle of a deque invalidates every reference into it.
+    const uint64_t base_serial = entries_[base_index].serial;
+    const std::string bin_path = entries_[base_index].path;
+    const uint64_t base_len = (uint64_t) entries_[base_index].ids.size();
+    const uint64_t base_journal = entries_[base_index].journal_bytes;
+    // The journal file must be exactly what the entry's accounting says: a size mismatch means
+    // a previous append landed but its manifest update did not (a crash window), or the file
+    // was touched from outside — either way the safe move is the full write (whose superseded
+    // cleanup then replaces this entry, .bin and .dlt included).
+    const std::string dlt = path_for_dlt(base_serial, false);
+    std::error_code ec;
+    const bool existed = fs::exists(dlt, ec) && !ec;
+    if (existed) {
+        const uint64_t size = fs::file_size(dlt, ec);
+        if (ec || size != base_journal) return false;
+    } else if (base_journal != 0) {
+        return false;   // the entry remembers a journal that is not there: full write
+    }
+    DeltaPlan plan;
+    if (!conversation_delta_plan(plan, image, base_len, keep_tokens)) return false;
+    // Make room for the record in the disk budget (put_impl's pattern): the base is marked
+    // in use first, so the LRU victim is never it while anything else can go.
+    entries_[base_index].used = next_used_++;
+    while (bytes_ + plan.record_bytes > budget_ && !entries_.empty()) {
+        if (!evict_oldest(base_serial)) break;   // nothing else to give: over budget, best effort
+    }
+    DiskEntry* base = find_by_serial(base_serial);
+    if (base == nullptr) return false;   // impossible (it was protected), belt and braces
+    uint64_t rec = 0;
+    if (!conversation_delta_append(dlt, image, plan, rec)) return false;
+    if (!existed) {
+        // The journal's NAME must survive a crash right after its creation: flush the folder,
+        // the same discipline the .bin's publish applies to its rename (Windows has no folder
+        // flush — the same exception session_file_write documents).
+#if !defined(_WIN32)
+        const int dfd = ::open(dir_.c_str(), O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) {
+            ::fsync(dfd);
+            ::close(dfd);
+        }
+#endif
+    }
+    // The entry becomes the post-apply state; the .idx is refreshed so the next start's fast
+    // path carries it (the .dlt's freshness pair rides along).
+    base->ids = image.live.ids;
+    base->imgs = image.live.imgs;
+    if (!image.checkpoints.empty()) {
+        const auto& deepest = image.checkpoints.back();
+        base->ckpt_ids = deepest.ids;
+        base->ckpt_imgs = deepest.imgs;
+    } else {
+        base->ckpt_ids.clear();
+        base->ckpt_imgs.clear();
+    }
+    base->journal_bytes += rec;
+    ++base->journal_records;
+    base->file_bytes += rec;
+    bytes_ += rec;
+    if (!write_idx(*base, bin_path, id))
+        std::fprintf(stderr, "strata serve: conversation spill: warning: could not refresh "
+                             "%s.idx after a delta append (the .dlt is fine; the next start "
+                             "parses the .bin and folds the journal)\n", bin_path.c_str());
+    std::fprintf(stderr, "strata serve: conversation spill [delta]: +%zu tokens (%.1f MiB) "
+                         "appended to conv-%llu.dlt (base %zu tokens; journal %.1f MiB, %u record%s)\n",
+                 image.live.ids.size() - size_t(plan.keep_tokens), rec / (1024.0 * 1024.0),
+                 (unsigned long long) base_serial, size_t(plan.keep_tokens),
+                 base->journal_bytes / (1024.0 * 1024.0), base->journal_records,
+                 base->journal_records == 1 ? "" : "s");
+    return true;
+}
+
+void ConversationDiskStore::compact_journal(DiskEntry& e, const SessionFileIdentity& id) {
+    // Read the base .bin, apply the journal, rewrite the .bin with the folded state, drop the
+    // .dlt. Every step is fail-soft: an error leaves the entry exactly as it was (the journal
+    // stays valid — the rewrite is an atomic temp+rename over the SAME name, and a crash
+    // between the rename and the .dlt removal is the idempotency case the reader's chain rule
+    // already handles: the stale journal does not chain onto the new base and is dropped).
+    try {
+        SavedConversation image;
+        size_t read = 0;
+        std::string error;
+        SessionStatus status;
+        if (!session_file_read(e.path, id, image, read, error, {}, &status)) {
+            std::fprintf(stderr, "strata serve: conversation spill: compaction could not re-read "
+                                 "%s (%s); the journal stays as it is\n", e.path.c_str(), error.c_str());
+            return;
+        }
+        if (image.stage_images.empty() == false) return;   // a layer split's spill: not journaled
+        const std::string dlt = path_for_dlt(e.serial, false);
+        std::error_code ec;
+        if (!fs::exists(dlt, ec) || ec) return;   // nothing to fold
+        const DeltaFold fold = conversation_delta_apply(dlt, image);
+        if (fold.applied == 0) {
+            // The journal does not chain onto this base (already folded, or foreign): drop it.
+            fs::remove(dlt, ec);
+            return;
+        }
+        if (fold.torn) fs::resize_file(dlt, fold.valid_end, ec);   // heal, then fold what healed
+        size_t written = 0;
+        SessionWriteOptions opts;   // durable, default free-space preflight
+        opts.min_free_bytes = 256ull * 1024 * 1024;
+        SessionStatus wstatus;
+        if (!session_file_write(e.path, image, id, written, error, opts, &wstatus)) {
+            std::fprintf(stderr, "strata serve: conversation spill: compaction could not rewrite "
+                                 "%s (%s); the journal stays as it is\n", e.path.c_str(), error.c_str());
+            return;
+        }
+        fs::remove(dlt, ec);
+        // Re-account: the .bin now carries the folded state, the journal is gone.
+        bytes_ -= e.file_bytes;
+        e.ids = image.live.ids;
+        e.imgs = image.live.imgs;
+        if (!image.checkpoints.empty()) {
+            const auto& deepest = image.checkpoints.back();
+            e.ckpt_ids = deepest.ids;
+            e.ckpt_imgs = deepest.imgs;
+        } else {
+            e.ckpt_ids.clear();
+            e.ckpt_imgs.clear();
+        }
+        e.journal_bytes = 0;
+        e.journal_records = 0;
+        e.file_bytes = (uint64_t) written + stage_files_bytes(e.serial, false);
+        bytes_ += e.file_bytes;
+        if (!write_idx(e, e.path, id))
+            std::fprintf(stderr, "strata serve: conversation spill: warning: could not refresh "
+                                 "%s.idx after compaction (the .bin is fine)\n", e.path.c_str());
+        std::fprintf(stderr, "strata serve: conversation spill [delta]: compacted conv-%llu.dlt "
+                             "(%zu record%s, %.1f MiB) into %s (%zu tokens, %.1f MiB)\n",
+                     (unsigned long long) e.serial, fold.applied, fold.applied == 1 ? "" : "s",
+                     fold.journal_bytes / (1024.0 * 1024.0), e.path.c_str(), image.live.ids.size(),
+                     (double) written / (1024.0 * 1024.0));
+    } catch (const std::bad_alloc&) {
+        std::fprintf(stderr, "strata serve: conversation spill: compaction ran out of RAM; the "
+                             "journal stays as it is (the next idle pass retries)\n");
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "strata serve: conversation spill: compaction failed (%s); the "
+                             "journal stays as it is\n", ex.what());
+    }
+}
+
+bool ConversationDiskStore::compact_idle(const SessionFileIdentity& id) {
+    for (size_t i = entries_.size(); i-- > 0;) {
+        DiskEntry& e = entries_[i];
+        if (is_prefix_entry(e) || e.journal_records == 0) continue;
+        const uint64_t bin_bytes = e.file_bytes > e.journal_bytes ? e.file_bytes - e.journal_bytes : 0;
+        if (e.journal_bytes > kJournalCompactBytes || e.journal_records > kJournalCompactRecords ||
+            e.journal_bytes * 5 > bin_bytes) {
+            compact_journal(e, id);
+            return true;   // at most one per idle pass
+        }
+    }
+    return false;
+}
+
+void ConversationDiskStore::compact_all() {
+    if (!write_id_set_) return;
+    for (size_t i = entries_.size(); i-- > 0;) {
+        DiskEntry& e = entries_[i];
+        if (is_prefix_entry(e) || e.journal_records == 0) continue;
+        const uint64_t bin_bytes = e.file_bytes > e.journal_bytes ? e.file_bytes - e.journal_bytes : 0;
+        if (e.journal_bytes > kJournalCompactBytes || e.journal_records > kJournalCompactRecords ||
+            e.journal_bytes * 5 > bin_bytes)
+            compact_journal(e, write_id_);
+    }
 }
 
 // Older reload duplicates: entry i is superseded when a NEWER entry (higher index = higher
@@ -1201,7 +1720,7 @@ size_t ConversationDiskStore::drop_superseded(const std::vector<int32_t>& ids,
 size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& ids,
                                               const std::vector<ConversationImageKey>& images,
                                               const std::vector<ConversationCheckpoint>& checkpoints,
-                                              bool cvec) {
+                                              bool cvec, uint64_t protect_serial) {
     auto held = [&](const std::vector<int32_t>& cid, const std::vector<ConversationImageKey>& cimgs) {
         if (cid == ids && cimgs == images) return true;
         for (const auto& k : checkpoints)
@@ -1238,6 +1757,12 @@ size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& i
         const auto& e = entries_[i];
         if (e.cvec != cvec) { ++i; continue; }
         if (is_prefix_entry(e)) { ++i; continue; }   // a pinned shared prefix: not this conversation's branch
+        // The delta base the writer just appended to: after the append this entry IS the newest
+        // state of this conversation, so every branch below (exact, prefix, re-render) would
+        // describe it as "superseded by the park it just absorbed" and delete it — .bin, .dlt
+        // and .idx — one step after the append. Protected here; every OTHER serial of the same
+        // branch (an older base, a pre-journal spill) still goes.
+        if (e.serial == protect_serial) { ++i; continue; }
         // The deepest checkpoint the spill file carries is the one ConversationCache handed to
         // session_checkpoints_to_save. The manifest only stores the live prefix; if the live
         // prefix itself is what the new conversation supersedes, drop. (Phase 2: store the

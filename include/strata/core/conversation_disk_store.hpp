@@ -10,6 +10,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/conversation_delta.hpp"
 #include "strata/core/conversation_file.hpp"
 
 #include <algorithm>
@@ -57,6 +58,13 @@ struct DiskEntry {
     // still recognizes prefix-shaped files written by older builds under the conv- name, so
     // every protection keeps BOTH signals: e.prefix || prefix_snapshot(e).
     bool prefix = false;
+    // ── Delta journal (STRATA_SPILL_JOURNAL=1) ── the .dlt appended beside the .bin: its
+    // bytes (counted in file_bytes too) and its record count (the compaction trigger). A
+    // conversation on disk is then the pair (base .bin + journal .dlt): take() applies the
+    // journal to the base, and a park that finds this entry as its delta base appends one
+    // record instead of rewriting the whole .bin.
+    uint64_t journal_bytes = 0;
+    uint32_t journal_records = 0;
 };
 
 /// Disk-tier spill store. RAM manifest + payload-on-disk. Take = remove: when a conversation
@@ -152,12 +160,19 @@ public:
     ConversationCache::Match best(const std::vector<Token>& prompt,
                                    const std::vector<ConversationImageKey>& images, bool cvec) const;
 
-    // Reads, validates (session_file_read's full check: header, identity, bounded parse, hash),
-    // and REMOVES the entry from the manifest and its file from disk. nullopt: I/O error,
-    // corrupt file, identity mismatch, or RAM preflight refusal (the file is kept on a RAM
-    // refusal so a later turn with more free RAM can retry). Phase 2: if the entry is still
-    // being written by the background thread, take() waits (condvar) for the write to finish
-    // before reading.
+    // Reads, validates (session_file_read's full check: header, identity, bounded parse, hash)
+    // the entry's base .bin — and applies its delta journal on top (each record hash-checked
+    // as its bytes stream in; a torn or unchainable tail truncates the journal at the last
+    // good record, and a journal whose first record does not chain is dropped whole). The
+    // entry STAYS in the manifest (its file too): that is what lets the next park of the same
+    // conversation APPEND a delta to this base instead of rewriting the .bin, and what makes
+    // holds() skip the re-capture of an unchanged conversation (the retry case). A
+    // shared-prefix entry is not consumed either (many conversations branch from it).
+    // nullopt: I/O error, corrupt file, identity mismatch, or RAM preflight refusal (the file
+    // is kept on a RAM refusal so a later turn with more free RAM can retry — the entry is
+    // then dropped from the manifest as before, since nothing about it is usable right now).
+    // Phase 2: if the entry is still being written by the background thread, take() waits
+    // (condvar) for the write to finish before reading.
     std::optional<SavedConversation> take(const ConversationCache::Match& m, const SessionFileIdentity& id,
                                           const SessionReadLimits& limits = {});
 
@@ -176,11 +191,13 @@ public:
     size_t drops() const { return drops_; }    // LRU evictions from the disk tier itself
     size_t lost() const { return lost_; }       // RAM-and-disk-both-refused count (logged)
 
-    // LRU eviction of the disk tier itself: when put() would exceed budget_, the oldest entry
-    // is deleted. Returns false only when the manifest is empty (or all entries are pinned,
-    // which Phase 1 does not have). Called by put() internally — NO flush here (put() and the
-    // writer already hold the single-thread invariant; flushing would deadlock the writer).
-    bool evict_oldest();
+    // LRU eviction of the disk tier itself: when put() would exceed budget_, the least
+    // recently used entry is deleted. Returns false only when the manifest is empty (or every
+    // candidate is pinned or protected). Called by put() internally — NO flush here (put() and
+    // the writer already hold the single-thread invariant; flushing would deadlock the writer).
+    // protect_serial: an append's own base never pays for its own record (its `used` stamp is
+    // the newest anyway; the guard covers the only-entry case). UINT64_MAX: today's behaviour.
+    bool evict_oldest(uint64_t protect_serial = UINT64_MAX);
 
     // #879 (non-finite logits poison): purge every spill file and clear the manifest.
     // Mirrors ConversationCache::clear() — the disk tier must not keep a poisoned conversation.
@@ -267,6 +284,26 @@ private:
     bool writer_busy_ = false;                    // writer moved an image out and is writing it
     std::deque<PendingWrite> pending_;
     size_t async_dropped_ = 0;                    // queue-overflowed images (logged)
+    // ── Delta journal (read once in the constructor): 1 = a park that finds a delta base
+    // appends a conv-<serial>.dlt record instead of rewriting the .bin; anything else = the
+    // exact behaviour of the build before the journal existed (A/B safe).
+    bool journal_ = false;
+    // Fresh-serial source for the put() collision guard: reloaded spills keep the serials of
+    // the runs that wrote them, while the RAM cache's park counter restarts at 1 every engine
+    // start — a colliding park must not replace a DIFFERENT conversation's files. Lifted above
+    // every serial seen at reload, and above every serial written since.
+    uint64_t next_fresh_serial_ = 1;
+    // The identity this run's writes (put/append) and reload carried — the shutdown compaction
+    // needs one to re-read the .bin files, and the engine hands it per call instead of holding
+    // it here. Set on the first write or reload; unset means nothing on disk is ours to fold.
+    SessionFileIdentity write_id_{};
+    bool write_id_set_ = false;
+
+    // ── Delta journal: compaction triggers, evaluated on the writer thread when the queue is
+    // idle. A journal past either bound is folded back into its .bin (one full rewrite, off
+    // every request's path) and the .dlt starts over.
+    static constexpr uint64_t kJournalCompactBytes = 64ull * 1024 * 1024;   // or 20% of the .bin
+    static constexpr uint32_t kJournalCompactRecords = 16;
 
     void writer_loop();
     // The sync put()'s body, shared by put() and the writer thread. NO locking inside.
@@ -276,9 +313,15 @@ private:
     bool put_impl(SavedConversation&& image, uint64_t serial, const SessionFileIdentity& id,
                   const SessionWriteOptions& options, bool prefix);
     // drop_superseded()'s body, shared by the public wrapper and the writer thread.
+    // protect_serial: the delta base the writer just appended to — the exact-match, prefix and
+    // re-render branches all describe "this conversation's older spill", and after an append
+    // the base entry IS the newest state of that conversation, so without the guard the very
+    // cleanup that follows every write would delete it (with .bin and .dlt) one step after the
+    // append. UINT64_MAX (the default) protects nothing: today's behaviour.
     size_t drop_superseded_impl(const std::vector<int32_t>& ids,
                                 const std::vector<ConversationImageKey>& images,
-                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec);
+                                const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                                uint64_t protect_serial = UINT64_MAX);
     // Post-reload cleanup: same-conversation duplicates left by earlier runs (one serial per
     // park, none of them superseded because the client re-renders the assistant thinking).
     // The newest serial of each conversation wins; the older files are deleted. Called at
@@ -286,15 +329,46 @@ private:
     // accumulated duplicates (measured: 18 files for 1 conversation) back to one set.
     size_t dedupe_loaded();
     // Post-write cleanup the writer runs: same-branch older spills go (prefix of the new live).
+    // protect_serial forwards to drop_superseded_impl (the delta base survives its own append).
     size_t drop_superseded_light(const std::vector<int32_t>& ids,
-                                 const std::vector<ConversationImageKey>& images, bool cvec) {
-        return drop_superseded_impl(ids, images, {}, cvec);
+                                 const std::vector<ConversationImageKey>& images, bool cvec,
+                                 uint64_t protect_serial = UINT64_MAX) {
+        return drop_superseded_impl(ids, images, {}, cvec, protect_serial);
     }
+    // ── Delta journal: the writer-side selection and append ──
+    // The manifest entry a new image can extend by a delta: same cvec, geometry and layer
+    // carve, not a shared prefix, no stage files (a layer split's spill is written whole),
+    // and holding a prefix of the image's live ids — either its own ids (the conversation
+    // grew) or its deepest checkpoint's (the client re-rendered the history). The candidate
+    // keeping the most tokens wins; the base must carry at least half the new image (the
+    // codec's own rule) or the record would not save a rewrite.
+    struct DeltaBase {
+        size_t index = 0;
+        uint64_t keep_tokens = 0;
+    };
+    std::optional<DeltaBase> find_delta_base(const SavedConversation& image) const;
+    // Append one record for `image` to base's journal, update the entry (ids, imgs, ckpt,
+    // file_bytes, journal accounting) and refresh the .idx. Any anomaly (the file's size does
+    // not match the entry's journal_bytes, a plan the codec refuses, an I/O failure) returns
+    // false with nothing landed in the manifest — the caller falls back to the full write,
+    // whose superseded cleanup then replaces this entry wholesale.
+    bool append_delta(size_t base_index, uint64_t keep_tokens, const SavedConversation& image,
+                      const SessionFileIdentity& id);
+    // Fold one entry's journal back into its .bin (read + apply + rewrite + drop the .dlt).
+    // Fail-soft: on any failure the entry is left exactly as it was. Runs on the writer thread
+    // only. compact_idle() picks at most one candidate per idle pass; compact_all() is the
+    // shutdown drain's sweep (it uses the identity remembered from this run's writes/reload —
+    // the engine passes the identity per put_async call, it does not live in the store).
+    void compact_journal(DiskEntry& e, const SessionFileIdentity& id);
+    bool compact_idle(const SessionFileIdentity& id);
+    void compact_all();
 
     // <dir>/conv-<serial>.bin — a whole conversation. `prefix`: <dir>/pfx-<serial>.bin — a
     // shared-prefix snapshot (the pinned system prompt's K/V). One serial space (the cache's
     // low half, the direct spills' high half): the name prefix tells the kinds apart.
     std::string path_for(uint64_t serial, bool prefix = false) const;
+    // <dir>/conv-<serial>.dlt — a conversation's delta journal (never a prefix snapshot's).
+    std::string path_for_dlt(uint64_t serial, bool prefix = false) const;
     // A layer split's spill: one extra self-contained session file per later stage
     // (conv-<serial>.stage<k>.bin; a shared-prefix snapshot's is pfx-<serial>.stage<k>.bin),
     // written by put() BEFORE the main .bin (the main is the commit point of the put) and
