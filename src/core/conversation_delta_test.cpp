@@ -573,6 +573,63 @@ int main() {
         check(same_image(back, next), "12: truncated base + record == the re-rendered image");
     }
 
+    // ── 13. A capture with a long checkpoint chain: the record carries ONLY the checkpoint a
+    // full write would store (the chain's deepest; with a pinned shared prefix in the chain,
+    // the deepest PINNED one) — serializing the whole chain re-sent every checkpoint's full
+    // running state on every turn's append, and the .dlt outgrew the .bin it extends. The
+    // fold must land exactly that one checkpoint (the apply replaces the chain).
+    {
+        fs::remove(journal);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation next = grow(base, 300, 2);   // one checkpoint at 650 (the deepest)
+        check(next.checkpoints.size() == 1 && next.checkpoints[0].ids.size() == 650,
+              "13: the grown capture starts with its one checkpoint");
+        // the real park shape: the pinned shared prefix + a periodic checkpoint deeper than it
+        ConversationCheckpoint shallow = ckpt_of(
+            std::vector<int32_t>(next.live.ids.begin(), next.live.ids.begin() + 200), 61);
+        shallow.pinned = true;
+        ConversationCheckpoint deep = ckpt_of(
+            std::vector<int32_t>(next.live.ids.begin(), next.live.ids.begin() + 900), 62);
+        next.checkpoints.push_back(shallow);
+        next.checkpoints.push_back(deep);
+        // with a pin present, the full-write selection is the deepest PINNED one (at 200)
+        SavedConversation trimmed_pin = next;
+        trimmed_pin.checkpoints.assign(1, shallow);
+        DeltaPlan plan, plan_trimmed;
+        check(conversation_delta_plan(plan, next, 1000, 1000), "13: plan for the chained capture");
+        check(conversation_delta_plan(plan_trimmed, trimmed_pin, 1000, 1000),
+              "13: plan for the trimmed capture");
+        check(plan.record_bytes == plan_trimmed.record_bytes,
+              "13: the record carries ONE checkpoint, not the chain");
+        uint64_t rec = 0;
+        check(conversation_delta_append(journal, next, plan, rec), "13: append lands");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back);
+        check(fold.applied == 1 && !fold.torn, "13: one record applied");
+        check(back.checkpoints.size() == 1 && back.checkpoints[0].ids == shallow.ids,
+              "13: the folded chain is the record's one checkpoint");
+        check(same_image(back, trimmed_pin), "13: fold == a full write of the park");
+        // no pin in the chain: the selection is the chain's deepest (at 900)
+        fs::remove(journal);
+        SavedConversation nopin = next;
+        nopin.checkpoints[1].pinned = false;
+        SavedConversation trimmed_deep = nopin;
+        trimmed_deep.checkpoints.assign(1, deep);
+        DeltaPlan plan2, plan2_trimmed;
+        check(conversation_delta_plan(plan2, nopin, 1000, 1000) &&
+              conversation_delta_plan(plan2_trimmed, trimmed_deep, 1000, 1000), "13: no-pin plans");
+        check(plan2.record_bytes == plan2_trimmed.record_bytes,
+              "13: without a pin the record carries the deepest checkpoint alone");
+        uint64_t rec2 = 0;
+        check(conversation_delta_append(journal, nopin, plan2, rec2), "13: no-pin append lands");
+        SavedConversation back2 = base;
+        const DeltaFold fold2 = conversation_delta_apply(journal, back2);
+        check(fold2.applied == 1 && !fold2.torn, "13: no-pin fold");
+        check(back2.checkpoints.size() == 1 && back2.checkpoints[0].ids == deep.ids,
+              "13: the folded chain is the deepest checkpoint");
+        check(same_image(back2, trimmed_deep), "13: no-pin fold == a full write of the park");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_delta_test: %d checks passed\n", checks);
     return 0;

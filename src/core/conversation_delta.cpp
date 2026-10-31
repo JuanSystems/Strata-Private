@@ -111,6 +111,25 @@ std::vector<uint8_t>* state_of(ConversationCheckpoint& c, size_t i) {
     }
 }
 
+// The checkpoint a record carries: the same ONE the v1 session file stores
+// (session_checkpoints_to_save → session_deepest_checkpoint, conversation_file.cpp) — the
+// chain's deepest, or with a pinned shared prefix in the chain the deepest PINNED one.
+// Serializing the whole capture chain here made every turn's append re-send up to
+// --prompt-cache checkpoints (each with its full running state, once per image section), so
+// the .dlt outgrew the .bin it extends — the opposite of the journal's purpose. One
+// checkpoint per record keeps the invariant exact and cheap: fold(base + records) == a full
+// write of the newest park, and the apply's replace semantics (img.checkpoints =
+// sec.checkpoints) lands the folded image on exactly that chain.
+const ConversationCheckpoint* record_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
+    const ConversationCheckpoint* deepest = nullptr;
+    bool any_pinned = false;
+    for (const auto& c : chain) any_pinned = any_pinned || c.pinned;
+    for (const auto& c : chain)
+        if ((!any_pinned || c.pinned) && (!deepest || c.ids.size() > deepest->ids.size()))
+            deepest = &c;
+    return deepest;
+}
+
 // The image list a record covers: the main first, then its stage images in order.
 std::vector<const SavedConversation*> images_of(const SavedConversation& image) {
     std::vector<const SavedConversation*> out;
@@ -163,14 +182,15 @@ void put_checkpoint(std::vector<uint8_t>& b, const ConversationCheckpoint& c) {
     put_u64(b, c.used);
 }
 
-// One section's front matter (everything but its K/V payload): state + checkpoints + table.
+// One section's front matter (everything but its K/V payload): state + the record's ONE
+// checkpoint + table.
 uint64_t section_front_bytes(const SavedConversation& img) {
     uint64_t n = kSectionFixedBytes;
     for (size_t i = 0; i < 5; ++i) n += state_of(img.live, i)->size();
     n += 4;
-    for (const auto& c : img.checkpoints) {
-        n += 8 + c.ids.size() * sizeof(int32_t) + 8 + c.imgs.size() * 16 + 40;
-        for (size_t i = 0; i < 5; ++i) n += state_of(c, i)->size();
+    if (const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints)) {
+        n += 8 + sel->ids.size() * sizeof(int32_t) + 8 + sel->imgs.size() * 16 + 40;
+        for (size_t i = 0; i < 5; ++i) n += state_of(*sel, i)->size();
         n += 8;
     }
     n += img.kv.size() * (kLayerHeaderBytes + kPartTableBytesPerLayer);
@@ -179,16 +199,17 @@ uint64_t section_front_bytes(const SavedConversation& img) {
 
 void put_section_front(std::vector<uint8_t>& b, const SavedConversation& img, uint64_t geometry_hash,
                        const DeltaImagePlan& plan) {
+    const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints);
     put_u32(b, uint32_t(img.kv.size()));
     put_u64(b, geometry_hash);
-    put_u64(b, img.checkpoints.empty() ? 0 : (uint64_t) img.checkpoints.back().ids.size());
+    put_u64(b, sel ? (uint64_t) sel->ids.size() : 0);
     for (size_t i = 0; i < 5; ++i) put_u64(b, state_of(img.live, i)->size());
     for (size_t i = 0; i < 5; ++i) {
         const auto& s = *state_of(img.live, i);
         b.insert(b.end(), s.begin(), s.end());
     }
-    put_u32(b, uint32_t(img.checkpoints.size()));
-    for (const auto& c : img.checkpoints) put_checkpoint(b, c);
+    put_u32(b, sel ? 1u : 0u);   // the record's ONE checkpoint: the full-write selection
+    if (sel) put_checkpoint(b, *sel);
     for (const auto& kv : img.kv) {
         put_i64(b, kv.format); put_i64(b, kv.cells); put_i64(b, kv.heads);
         put_i64(b, kv.head_dim); put_i64(b, kv.page_size);
@@ -477,7 +498,8 @@ bool conversation_delta_append(const std::string& path, const SavedConversation&
         put_u32(front, uint32_t(plan.images.size()));
         put_u32(front, uint32_t(plan.images[0].n_layers));
         put_u64(front, image.live.imgs.size());
-        put_u64(front, image.checkpoints.empty() ? 0 : (uint64_t) image.checkpoints.back().ids.size());
+        const ConversationCheckpoint* main_ckpt = record_checkpoint(image.checkpoints);
+        put_u64(front, main_ckpt ? (uint64_t) main_ckpt->ids.size() : 0);
         for (size_t i = 0; i < 5; ++i) put_u64(front, state_of(image.live, i)->size());
         put_u64(front, sections);
         put_shared_region(front, image, plan.keep_tokens);

@@ -43,7 +43,10 @@
 //   u64 ckpt_tokens_i                          this image's deepest checkpoint after applying
 //   u64 state_bytes_i[5]                       this image's live running state sizes
 //   u8[state_bytes_i[0..4]]                    this image's live running state, complete
-//   u32 n_checkpoints_i + per checkpoint: u64 n_ids; i32 x n_ids; u64 n_cimgs; (i64,u64) x
+//   u32 n_checkpoints_i (0 or 1: the ONE checkpoint a full write of the same park would
+//       store — the chain's deepest, or with a pinned shared prefix the deepest pinned one;
+//       readers accept any count, records written by older builds may carry more) + per
+//       checkpoint: u64 n_ids; i32 x n_ids; u64 n_cimgs; (i64,u64) x
 //       n_cimgs; u64 sz[5]; u8 x sz[0..4]; u64 used
 //   K/V table (so a scanner can size the record without reading the payload):
 //   per layer: 7 x i64  format, cells, heads, head_dim, page_size, pooled_rows, idx_dim
