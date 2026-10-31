@@ -1268,8 +1268,8 @@ int main() {
         store.flush_pending();
         check(store.size() == 1 && fs::exists(rdir / "conv-701.bin"),
               "26: the re-render-branch cleanup kept the base as well");
-        // (the journal itself may already be past its 20% bound and compacted into the .bin —
-        // the take below proves whichever shape the pair is in restores correctly)
+        // (nothing ever folds the journal — the take below proves the three-record chain
+        // restores correctly, record by record)
         // the whole chain restores
         ConversationCache::Match m;
         m.serial = 701; m.tokens = 1000; m.live = true;
@@ -1375,31 +1375,39 @@ int main() {
         check(!fs::exists(rdir / "conv-12.dlt"), "30: the reload swept the orphan .dlt");
     }
 
-    // ── 31. Compaction: once the journal crosses 20% of its .bin, the writer folds it back
-    // (the .dlt disappears, the .bin carries the newest state, take() restores it whole).
+    // ── 31. Append-only FOREVER: turns past every old compaction bound (16 records / 64 MiB /
+    // 20% of the .bin) keep APPENDING — the .dlt survives with every record, the parent .bin
+    // is never rewritten (its size never moves), and take() folds the whole chain back to the
+    // newest state. This is the parent/children contract: one .bin written once + one record
+    // per continued turn, for the conversation's whole life.
     {
         jsetenv("STRATA_SPILL_JOURNAL", "1");
-        const auto rdir = dir / "journal_compact";
+        const auto rdir = dir / "journal_append_only";
         ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
         SavedConversation cur = conv_image(1000, 1);
         check(store.put(std::move(cur), 1000, id), "31: the base");
         cur = conv_image(1000, 1);
-        // grow a page at a time: each record re-sends one partial page (~17 KiB), so the 20%
-        // bound crosses after a handful of records
-        for (int turn = 1; turn <= 8; ++turn) {
+        const uint64_t bin_size = fs::file_size(rdir / "conv-1000.bin");
+        // grow a page at a time: each record re-sends one partial page (~17 KiB); 24 turns is
+        // past every old bound — the record count (16) for sure, and the byte/ratio bounds too
+        for (int turn = 1; turn <= 24; ++turn) {
             SavedConversation next = conv_grow(cur, 30, uint8_t(turn));
             SavedConversation queued = next;   // the queue takes a copy; the chain keeps the original
             cur = std::move(next);
             check(store.put_async(std::move(queued), uint64_t(1000 + turn), id), "31: a delta turn");
             store.flush_pending();
-            if (!fs::exists(rdir / "conv-1000.dlt")) break;   // compacted
+            check(fs::file_size(rdir / "conv-1000.bin") == bin_size,
+                  "31: the parent .bin never moved (byte-for-byte the first park)");
         }
-        check(!fs::exists(rdir / "conv-1000.dlt"), "31: the journal was compacted away");
-        check(store.size() == 1, "31: one entry after the compaction");
+        check(fs::exists(rdir / "conv-1000.dlt"), "31: the journal survived — nothing folds it");
+        check(store.size() == 1, "31: one entry (the parent + its children)");
         ConversationCache::Match m;
         m.serial = 1000; m.tokens = (int64_t) cur.live.ids.size(); m.live = true;
         auto back = store.take(m, id);
-        check(back.has_value() && same_conv(*back, cur), "31: the compacted .bin restores the newest state");
+        check(back.has_value() && same_conv(*back, cur),
+              "31: the parent + every record restores the newest state");
+        check(fs::file_size(rdir / "conv-1000.bin") == bin_size,
+              "31: the .bin is still the first park's bytes after the take");
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
@@ -1414,7 +1422,8 @@ int main() {
             probe.put(conv_image(1000, 1), 1, id);
             return fs::file_size(rdir.string() + "-probe/conv-1.bin");
         }();
-        // room for two .bin files plus a small journal, but not for two .bin files plus 20%
+        // room for two .bin files plus a small journal, but not for two .bin files plus a
+        // growing one
         ConversationDiskStore store(rdir.string(), 2 * bin_sz + bin_sz / 8, &id);
         // an OLDER, different conversation: the eviction's intended victim
         SavedConversation other = conv_image(1000, 1);
@@ -1522,33 +1531,37 @@ int main() {
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
-    // ── 35. Compaction with stages: the 20% bound folds the journal back into the .bin AND
-    // the .stage0.bin (both rewrites, main last), and the folded pair restores whole.
+    // ── 35. Append-only with stages: turns past every old bound keep appending ONE record
+    // that covers the main AND the stage — neither parent file is ever rewritten, and take()
+    // folds the whole chain over both images.
     {
         jsetenv("STRATA_SPILL_JOURNAL", "1");
-        const auto rdir = dir / "journal_stages_compact";
+        const auto rdir = dir / "journal_stages_append_only";
         ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
         SavedConversation cur = conv_stage_of(1000, 1);
         check(store.put(std::move(cur), 1500, id), "35: the 2-GPU base");
         cur = conv_stage_of(1000, 1);
-        for (int turn = 1; turn <= 8; ++turn) {
+        const uint64_t bin_size = fs::file_size(rdir / "conv-1500.bin");
+        const uint64_t stage_size = fs::file_size(rdir / "conv-1500.stage0.bin");
+        for (int turn = 1; turn <= 24; ++turn) {
             SavedConversation next = conv_stage_grow(cur, 30, uint8_t(turn));
             SavedConversation queued = next;   // the queue takes a copy; the chain keeps the original
             cur = std::move(next);
             check(store.put_async(std::move(queued), uint64_t(1500 + turn), id), "35: a delta turn");
             store.flush_pending();
-            if (!fs::exists(rdir / "conv-1500.dlt")) break;   // compacted
         }
-        check(!fs::exists(rdir / "conv-1500.dlt"), "35: the journal was compacted away");
-        check(store.size() == 1, "35: one entry after the compaction");
-        check(fs::exists(rdir / "conv-1500.bin") && fs::exists(rdir / "conv-1500.stage0.bin"),
-              "35: the pair is still on disk");
+        check(fs::exists(rdir / "conv-1500.dlt"), "35: the journal survived — nothing folds it");
+        check(fs::file_size(rdir / "conv-1500.bin") == bin_size &&
+              fs::file_size(rdir / "conv-1500.stage0.bin") == stage_size,
+              "35: neither the parent .bin nor the stage file was ever rewritten");
+        check(store.size() == 1, "35: one entry after every turn");
         ConversationCache::Match m;
         m.serial = 1500; m.tokens = (int64_t) cur.live.ids.size(); m.live = true;
         auto back = store.take(m, id);
-        check(back.has_value() && same_conv(*back, cur), "35: the compacted .bin restores the newest state");
+        check(back.has_value() && same_conv(*back, cur),
+              "35: the parent + every record restores the newest state");
         check(back->stage_images.size() == 1 && same_conv(back->stage_images[0], cur.stage_images[0]),
-              "35: the compacted stage file restores the newest state too");
+              "35: the stage folds to the newest state too");
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
@@ -1695,14 +1708,14 @@ int main() {
         check(!fs::exists(rdir / "conv-700.dlt") && !fs::exists(rdir / "conv-701.dlt"),
               "40: no journal from a partial prefix without a pin");
         check(store.size() == 2, "40: both spills on disk (today's shape)");
-        // today's rule still works: a re-render anchored exactly at the checkpoint appends. The
-        // record may already be past its 20% bound and compacted into the .bin (as test 26
-        // documents), so the proof is the restored state and the absent new .bin, not the .dlt
+        // today's rule still works: a re-render anchored exactly at the checkpoint appends —
+        // and nothing ever folds the record away, so the .dlt itself is the proof
         SavedConversation c = conv_rerender(conv_at(1000, 500, 1), 300, 3);
         check(store.put_async(std::move(c), 702, id), "40: the checkpoint-anchored park is queued");
         store.flush_pending();
         check(!fs::exists(rdir / "conv-702.bin"),
               "40: no new .bin — the park appended to the base entry");
+        check(fs::exists(rdir / "conv-700.dlt"), "40: the record landed in the journal");
         ConversationCache::Match m;
         m.serial = 700; m.tokens = 800; m.live = true;
         auto back = store.take(m, id);
@@ -1714,8 +1727,7 @@ int main() {
     // ── 41. The chain: park after park after park, each re-rendered, each diverging below the
     // previous checkpoint — every one of them appends to the SAME entry (the reporting run's
     // churn: 4 parks, 0 journals, 4.9 GiB; with the fix: 4 parks, 3 records, one .bin). The
-    // records are kept small against the .bin so no compaction folds them mid-chain: what the
-    // take() below proves is the two-record FOLD, base → record 1 → record 2.
+    // take() below proves the two-record FOLD, base → record 1 → record 2.
     {
         jsetenv("STRATA_SPILL_JOURNAL", "1");
         const auto rdir = dir / "journal_lcp_chain";

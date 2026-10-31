@@ -293,34 +293,24 @@ void ConversationDiskStore::writer_loop() {
             superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
             ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
         }
-        // ── Compaction: only with the queue idle (never on a request's way) and only one
-        // candidate per pass — the fold is a full read+rewrite of one conversation. The
-        // writer stays busy through it, so a take() that arrives meanwhile waits inside
-        // flush_pending() instead of reading a half-compacted entry.
-        bool compact = false;
+        // ── No compaction pass — by design. The .bin is the immutable PARENT of a
+        // conversation (written once, at its first park) and the .dlt's records are its
+        // append-only CHILDREN: folding the journal back into the .bin would rewrite the
+        // whole history, exactly the write amplification this store exists to eliminate.
+        // The journal simply grows for the conversation's whole life; the disk budget's
+        // LRU (evict_oldest, whole entries only) bounds the total footprint instead.
         lk.lock();
-        compact = journal_ && pending_.empty() && !writer_stop_;
-        if (!compact) {
-            writer_busy_ = false;
-            if (!ok)
-                std::fprintf(stderr, "strata serve: conversation spill: background write FAILED "
-                                     "(serial %llu); the conversation stays in RAM only\n",
-                             (unsigned long long) p.serial);
-            else if (superseded > 0)
-                std::fprintf(stderr, "strata serve: conversation spill: background write landed "
-                                     "(serial %llu) and dropped %zu superseded spill file%s\n",
-                             (unsigned long long) p.serial, superseded, superseded == 1 ? "" : "s");
-            writer_cv_.notify_all();   // a flusher may be waiting for this write to land
-        }
-        lk.unlock();
-        if (compact) {
-            (void) compact_idle(p.id);
-            lk.lock();
-            writer_busy_ = false;
-            writer_cv_.notify_all();
-            lk.unlock();
-        }
-        lk.lock();
+        writer_busy_ = false;
+        if (!ok)
+            std::fprintf(stderr, "strata serve: conversation spill: background write FAILED "
+                                 "(serial %llu); the conversation stays in RAM only\n",
+                         (unsigned long long) p.serial);
+        else if (superseded > 0)
+            std::fprintf(stderr, "strata serve: conversation spill: background write landed "
+                                 "(serial %llu) and dropped %zu superseded spill file%s\n",
+                         (unsigned long long) p.serial, superseded, superseded == 1 ? "" : "s");
+        writer_cv_.notify_all();   // a flusher may be waiting for this write to land
+        // the lock stays held; the wait() at the top of the loop releases it
     }
 }
 
@@ -349,11 +339,11 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
     fs::permissions(dir_, fs::perms::owner_all, ec);   // best-effort; ignore if unsupported
     if (journal_)
         std::fprintf(stderr, "strata serve: conversation spill: delta journal ON (default; "
-                             "STRATA_SPILL_JOURNAL=0 disables it): a continued turn appends "
-                             "conv-<serial>.dlt instead of rewriting the .bin and its stage files "
-                             "(compaction at %llu MiB / %u records)\n",
-                     (unsigned long long) (kJournalCompactBytes / (1024ull * 1024)),
-                     (unsigned) kJournalCompactRecords);
+                             "STRATA_SPILL_JOURNAL=0 disables it): the .bin is the immutable "
+                             "parent, written once at the conversation's first park; every "
+                             "continued turn appends one conv-<serial>.dlt record (its "
+                             "children) carrying only the newest tokens; take() reads the .bin "
+                             "+ every record — the history is never rewritten\n");
 }
 
 // The dtor DRAINS: the engine's shutdown auto-spill is queued microseconds before main()
@@ -393,12 +383,10 @@ ConversationDiskStore::~ConversationDiskStore() {
                                      "(serial %llu)\n", (unsigned long long) p.serial);
         }
     }
-    // Shutdown compaction (the plan's third trigger): fold every journal past its bounds back
-    // into its .bin, so the next run restores from one file per conversation. Fail-soft — a
-    // journal left over compacts on the next run's idle pass instead. Needs the identity this
-    // run's writes carried (the engine passes it per call; remembered in put_impl/append_delta
-    // and at reload) — without one there is nothing this run owns on disk to fold.
-    if (journal_ && write_id_set_) compact_all();
+    // No shutdown fold: the .bin stays the immutable parent across runs and the .dlt keeps
+    // every record — reload_from_disk() restores the pair (the base with all records
+    // applied), so the next run APPENDS to the same journal instead of rewriting the
+    // history. The disk budget's LRU, not a rewrite, bounds the footprint.
 }
 
 // Not movable since Phase 2 (the writer thread + mutex + cv); no call site ever moved the
@@ -462,7 +450,7 @@ constexpr uint32_t kIdxVersion = 4;   // v4: adds the stage count + each stage f
 //   8   int64  bin_mtime_ns  (fs::last_write_time as nanoseconds since epoch — freshness check)
 //   8   uint64 journal_size    (the .dlt's size at write time; 0: none — freshness check)
 //   8   int64  journal_mtime_ns (the .dlt's mtime; 0 when there is none)
-//   4   uint32 journal_records (the compaction trigger's unit)
+//   4   uint32 journal_records (how many child records the .dlt holds)
 //   4   uint32 n_stages       (the layer split's stage files this entry owns)
 //   8 × n_stages int64 stage_layer_lo[]  (each stage file's carve — delta-base matching)
 //   8 × n_stages int64 stage_layer_hi[]
@@ -885,8 +873,6 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
                                 const SessionFileIdentity& id, const SessionWriteOptions& options,
                                 bool prefix) {
     if (!enabled()) return false;
-    write_id_ = id;   // the shutdown compaction re-reads what this run wrote
-    write_id_set_ = true;
     // A prefix write whose exact prefix is already held is a SUCCESSFUL no-op: the engine spills
     // a pin once per run, but after a restart it does not know a previous run already wrote the
     // same file, and two identical pfx-<serial>.bin files (one per run) would waste the budget
@@ -1141,9 +1127,9 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
     }
     // ── Delta journal: apply the records on top of the base .bin (single pass, hash-checked,
     // chain-checked). A torn or unchainable tail truncates the file at the last good record;
-    // a journal whose FIRST record does not chain onto this base is junk for it (a compaction
-    // that crashed after publishing the new .bin, or a .bin replaced under a reused serial) —
-    // dropped whole.
+    // a journal whose FIRST record does not chain onto this base is junk for it (a .dlt left
+    // by a pre-append-only build's fold that crashed after publishing the new .bin, or a .bin
+    // replaced under a reused serial) — dropped whole.
     DeltaFold fold;   // had_journal=false without a .dlt: the correction below is then a no-op
     if (!entry_pfx) {
         const std::string dlt = path_for_dlt(m.serial, false);
@@ -1386,8 +1372,6 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
         }
     }
     if (any_serial_seen && max_serial_seen + 1 > next_fresh_serial_) next_fresh_serial_ = max_serial_seen + 1;
-    write_id_ = identity;   // the shutdown compaction re-reads what this run can see
-    write_id_set_ = true;
     if (files.empty()) return 0;
     // Sort ASCENDING by serial so entries_ ends up oldest-first (LRU front = oldest), matching
     // put()'s order. evict_oldest() pops the front, so under budget pressure the OLDEST spill
@@ -1580,7 +1564,7 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     return loaded;
 }
 
-// ── Delta journal: the writer-side selection, append and compaction ────────────────────────
+// ── Delta journal: the writer-side selection and append ───────────────────────────────────
 
 std::optional<ConversationDiskStore::DeltaBase> ConversationDiskStore::find_delta_base(
     const SavedConversation& image) const {
@@ -1753,146 +1737,20 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
     return true;
 }
 
-void ConversationDiskStore::compact_journal(DiskEntry& e, const SessionFileIdentity& id) {
-    // Read the base .bin AND every stage file, apply the journal to all of them, rewrite each
-    // file with the folded state, drop the .dlt. Every step is fail-soft: an error leaves the
-    // entry exactly as it was (the journal stays valid — the rewrites are atomic temp+rename
-    // over the SAME names, and a crash between a stage's rename and the main's leaves the
-    // journal applying cleanly onto whatever mix is on disk: the records' spans [at, at+n) are
-    // identical below the boundary either way, so the fold converges; a crash AFTER the main's
-    // rename is the idempotency case the reader's chain rule already handles — the stale
-    // journal does not chain onto the new base and is dropped).
-    try {
-        SavedConversation image;
-        size_t read = 0;
-        std::string error;
-        SessionStatus status;
-        if (!session_file_read(e.path, id, image, read, error, {}, &status)) {
-            std::fprintf(stderr, "strata serve: conversation spill: compaction could not re-read "
-                                 "%s (%s); the journal stays as it is\n", e.path.c_str(), error.c_str());
-            return;
-        }
-        // The stage files, exactly like take() reads them: stop at the first missing k. A
-        // partial set cannot fold (the record's image count would not match) and the fold
-        // below reports it as a torn tail — the entry keeps its files and the next idle pass
-        // retries once the .bin is whole again.
-        for (size_t k = 0; ; ++k) {
-            std::error_code sec;
-            const std::string spath = path_for_stage(e.serial, k, false);
-            if (!fs::exists(spath, sec) || sec) break;
-            SavedConversation stage_img;
-            size_t s_read = 0;
-            std::string s_error;
-            SessionStatus s_status;
-            if (!session_file_read(spath, id, stage_img, s_read, s_error, {}, &s_status)) {
-                std::fprintf(stderr, "strata serve: conversation spill: compaction could not re-read "
-                                     "%s (%s); the journal stays as it is\n", spath.c_str(), s_error.c_str());
-                return;
-            }
-            image.stage_images.push_back(std::move(stage_img));
-        }
-        const std::string dlt = path_for_dlt(e.serial, false);
-        std::error_code ec;
-        if (!fs::exists(dlt, ec) || ec) return;   // nothing to fold
-        const DeltaFold fold = conversation_delta_apply(dlt, image);
-        if (fold.applied == 0) {
-            // The journal does not chain onto this base (already folded, or foreign): drop it.
-            fs::remove(dlt, ec);
-            return;
-        }
-        if (fold.torn) fs::resize_file(dlt, fold.valid_end, ec);   // heal, then fold what healed
-        SessionWriteOptions opts;   // durable, default free-space preflight
-        opts.min_free_bytes = 256ull * 1024 * 1024;
-        // Rewrite the STAGES first and the main LAST — put_impl's commit order: a crash
-        // mid-rewrite leaves orphan/duplicate state the journal's chain rule sorts out, never
-        // a published main whose stages are missing.
-        uint64_t stages_written = 0;
-        for (size_t k = 0; k < image.stage_images.size(); ++k) {
-            size_t s_written = 0;
-            std::string s_error;
-            SessionStatus s_status;
-            const std::string spath = path_for_stage(e.serial, k, false);
-            if (!session_file_write(spath, image.stage_images[k], id, s_written, s_error, opts, &s_status)) {
-                std::fprintf(stderr, "strata serve: conversation spill: compaction could not rewrite "
-                                     "%s (%s); the journal stays as it is\n", spath.c_str(), s_error.c_str());
-                return;
-            }
-            stages_written += s_written;
-        }
-        size_t written = 0;
-        SessionStatus wstatus;
-        if (!session_file_write(e.path, image, id, written, error, opts, &wstatus)) {
-            std::fprintf(stderr, "strata serve: conversation spill: compaction could not rewrite "
-                                 "%s (%s); the journal stays as it is\n", e.path.c_str(), error.c_str());
-            return;
-        }
-        fs::remove(dlt, ec);
-        // Re-account: the .bin (and its stages) now carry the folded state, the journal is gone.
-        bytes_ -= e.file_bytes;
-        e.ids = image.live.ids;
-        e.imgs = image.live.imgs;
-        if (!image.checkpoints.empty()) {
-            const auto& deepest = image.checkpoints.back();
-            e.ckpt_ids = deepest.ids;
-            e.ckpt_imgs = deepest.imgs;
-        } else {
-            e.ckpt_ids.clear();
-            e.ckpt_imgs.clear();
-        }
-        e.n_stages = uint32_t(image.stage_images.size());
-        e.stage_layer_lo.clear();
-        e.stage_layer_hi.clear();
-        for (const auto& st : image.stage_images) {
-            e.stage_layer_lo.push_back(st.layer_lo);
-            e.stage_layer_hi.push_back(st.layer_hi);
-        }
-        e.journal_bytes = 0;
-        e.journal_records = 0;
-        e.file_bytes = (uint64_t) written + stages_written;
-        bytes_ += e.file_bytes;
-        if (!write_idx(e, e.path, id))
-            std::fprintf(stderr, "strata serve: conversation spill: warning: could not refresh "
-                                 "%s.idx after compaction (the .bin is fine)\n", e.path.c_str());
-        std::fprintf(stderr, "strata serve: conversation spill [delta]: compacted conv-%llu.dlt "
-                             "(%zu record%s, %.1f MiB) into %s (%zu tokens, %.1f MiB%s)\n",
-                     (unsigned long long) e.serial, fold.applied, fold.applied == 1 ? "" : "s",
-                     fold.journal_bytes / (1024.0 * 1024.0), e.path.c_str(), image.live.ids.size(),
-                     (double) (written + stages_written) / (1024.0 * 1024.0),
-                     image.stage_images.empty() ? "" : " + stages");
-    } catch (const std::bad_alloc&) {
-        std::fprintf(stderr, "strata serve: conversation spill: compaction ran out of RAM; the "
-                             "journal stays as it is (the next idle pass retries)\n");
-    } catch (const std::exception& ex) {
-        std::fprintf(stderr, "strata serve: conversation spill: compaction failed (%s); the "
-                             "journal stays as it is\n", ex.what());
-    }
-}
-
-bool ConversationDiskStore::compact_idle(const SessionFileIdentity& id) {
-    for (size_t i = entries_.size(); i-- > 0;) {
-        DiskEntry& e = entries_[i];
-        if (is_prefix_entry(e) || e.journal_records == 0) continue;
-        const uint64_t bin_bytes = e.file_bytes > e.journal_bytes ? e.file_bytes - e.journal_bytes : 0;
-        if (e.journal_bytes > kJournalCompactBytes || e.journal_records > kJournalCompactRecords ||
-            e.journal_bytes * 5 > bin_bytes) {
-            compact_journal(e, id);
-            return true;   // at most one per idle pass
-        }
-    }
-    return false;
-}
-
-void ConversationDiskStore::compact_all() {
-    if (!write_id_set_) return;
-    for (size_t i = entries_.size(); i-- > 0;) {
-        DiskEntry& e = entries_[i];
-        if (is_prefix_entry(e) || e.journal_records == 0) continue;
-        const uint64_t bin_bytes = e.file_bytes > e.journal_bytes ? e.file_bytes - e.journal_bytes : 0;
-        if (e.journal_bytes > kJournalCompactBytes || e.journal_records > kJournalCompactRecords ||
-            e.journal_bytes * 5 > bin_bytes)
-            compact_journal(e, write_id_);
-    }
-}
+// ── Append-only by design ──────────────────────────────────────────────────────────────────
+// The compact_journal/compact_idle/compact_all trio this section used to hold is GONE on
+// purpose: folding a journal back into its .bin re-reads and REWRITES the whole history
+// (the .bin + every stage file), which is exactly the disk churn the parent/children design
+// exists to eliminate. A conversation on disk is now, for its entire life:
+//   conv-<serial>.bin   the PARENT — written once, at the conversation's first park, and
+//                       never touched again (size and mtime never move);
+//   conv-<serial>.dlt   the CHILDREN — one append-only record per later park, each carrying
+//                       only the newest part of the conversation;
+//   take()/reload read  the parent + every child record applied in order.
+// The journal therefore grows without bound; the disk budget's LRU (evict_oldest — whole
+// entries only, never a rewrite) is what keeps the footprint inside budget_. A .dlt left
+// over by a pre-append-only build that does not chain onto its base is still dropped whole
+// by the reader (the chain rule), so upgrade paths stay safe.
 
 // Older reload duplicates: entry i is superseded when a NEWER entry (higher index = higher
 // serial, reload pushed ascending) is the same conversation — the strict-prefix rule, or the

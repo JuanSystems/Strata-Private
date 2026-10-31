@@ -59,10 +59,14 @@ struct DiskEntry {
     // every protection keeps BOTH signals: e.prefix || prefix_snapshot(e).
     bool prefix = false;
     // ── Delta journal (STRATA_SPILL_JOURNAL=1) ── the .dlt appended beside the .bin: its
-    // bytes (counted in file_bytes too) and its record count (the compaction trigger). A
-    // conversation on disk is then the pair (base .bin + journal .dlt): take() applies the
-    // journal to the base, and a park that finds this entry as its delta base appends one
-    // record instead of rewriting the whole .bin.
+    // bytes (counted in file_bytes too) and its record count. A conversation on disk is the
+    // PARENT .bin (written once, at the conversation's first park, never touched again) plus
+    // its CHILDREN — the .dlt's append-only records, one per later park, each carrying only
+    // the newest part of the conversation. take() reads the parent and applies every child
+    // record in order; a park that finds this entry as its delta base appends one record
+    // instead of rewriting the .bin. Nothing ever folds the records back into the parent:
+    // the pair grows append-only for the conversation's whole life, and the disk budget's
+    // LRU (not a rewrite) bounds the footprint.
     uint64_t journal_bytes = 0;
     uint32_t journal_records = 0;
     // ── Layer-split stages (conv-<serial>.stage<k>.bin) ── the count and each stage file's
@@ -304,17 +308,14 @@ private:
     // start — a colliding park must not replace a DIFFERENT conversation's files. Lifted above
     // every serial seen at reload, and above every serial written since.
     uint64_t next_fresh_serial_ = 1;
-    // The identity this run's writes (put/append) and reload carried — the shutdown compaction
-    // needs one to re-read the .bin files, and the engine hands it per call instead of holding
-    // it here. Set on the first write or reload; unset means nothing on disk is ours to fold.
-    SessionFileIdentity write_id_{};
-    bool write_id_set_ = false;
 
-    // ── Delta journal: compaction triggers, evaluated on the writer thread when the queue is
-    // idle. A journal past either bound is folded back into its .bin (one full rewrite, off
-    // every request's path) and the .dlt starts over.
-    static constexpr uint64_t kJournalCompactBytes = 64ull * 1024 * 1024;   // or 20% of the .bin
-    static constexpr uint32_t kJournalCompactRecords = 16;
+    // ── Append-only by design: there is NO compaction. The old triggers (64 MiB / 20% of the
+    // .bin / 16 records) and the compact_journal/compact_idle/compact_all trio that folded a
+    // journal back into its .bin are removed on purpose — a fold re-reads and REWRITES the
+    // whole history (.bin + stage files), which is exactly the write amplification the
+    // parent/children design exists to eliminate. The journal grows for the conversation's
+    // whole life; the disk budget's LRU (evict_oldest — whole entries only, never a rewrite)
+    // keeps the footprint inside budget_.
 
     void writer_loop();
     // The sync put()'s body, shared by put() and the writer thread. NO locking inside.
@@ -375,14 +376,6 @@ private:
     // whose superseded cleanup then replaces this entry wholesale.
     bool append_delta(size_t base_index, uint64_t keep_tokens, const SavedConversation& image,
                       const SessionFileIdentity& id);
-    // Fold one entry's journal back into its .bin (read + apply + rewrite + drop the .dlt).
-    // Fail-soft: on any failure the entry is left exactly as it was. Runs on the writer thread
-    // only. compact_idle() picks at most one candidate per idle pass; compact_all() is the
-    // shutdown drain's sweep (it uses the identity remembered from this run's writes/reload —
-    // the engine passes the identity per put_async call, it does not live in the store).
-    void compact_journal(DiskEntry& e, const SessionFileIdentity& id);
-    bool compact_idle(const SessionFileIdentity& id);
-    void compact_all();
 
     // <dir>/conv-<serial>.bin — a whole conversation. `prefix`: <dir>/pfx-<serial>.bin — a
     // shared-prefix snapshot (the pinned system prompt's K/V). One serial space (the cache's
