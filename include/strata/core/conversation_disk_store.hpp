@@ -65,6 +65,15 @@ struct DiskEntry {
     // record instead of rewriting the whole .bin.
     uint64_t journal_bytes = 0;
     uint32_t journal_records = 0;
+    // ── Layer-split stages (conv-<serial>.stage<k>.bin) ── the count and each stage file's
+    // layer carve, so find_delta_base can match a new capture's stage images against this
+    // entry's: a record carries one section per image, and a stage count or carve mismatch
+    // cannot chain. An entry whose stage files exist but whose carve lists are empty (a
+    // pre-v4 .idx that has not been regenerated yet) is never used as a delta base — the
+    // full write replaces it once and fills them in.
+    uint32_t n_stages = 0;
+    std::vector<int64_t> stage_layer_lo;
+    std::vector<int64_t> stage_layer_hi;
 };
 
 /// Disk-tier spill store. RAM manifest + payload-on-disk. Take = remove: when a conversation

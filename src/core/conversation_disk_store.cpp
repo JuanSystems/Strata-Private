@@ -166,7 +166,7 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
         // on-disk shape between the two modes.
         bool ok = false;
         const size_t superseded = [&] {
-            if (journal_ && !p.prefix && p.image.stage_images.empty())
+            if (journal_ && !p.prefix)
                 if (auto base = find_delta_base(p.image)) {
                     const uint64_t base_serial = entries_[base->index].serial;
                     if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
@@ -210,7 +210,7 @@ void ConversationDiskStore::writer_loop() {
         // Any anomaly falls through to today's full write, whose cleanup replaces the entry.
         bool ok = false;
         size_t superseded = 0;
-        if (journal_ && !p.prefix && p.image.stage_images.empty()) {
+        if (journal_ && !p.prefix) {
             if (auto base = find_delta_base(p.image)) {
                 const uint64_t base_serial = entries_[base->index].serial;   // copied: the cleanup may erase
                 if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
@@ -281,7 +281,8 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
     if (journal_)
         std::fprintf(stderr, "strata serve: conversation spill: delta journal ON "
                              "(STRATA_SPILL_JOURNAL=1): a continued turn appends conv-<serial>.dlt "
-                             "instead of rewriting the .bin (compaction at %llu MiB / %u records)\n",
+                             "instead of rewriting the .bin and its stage files (compaction at %llu "
+                             "MiB / %u records)\n",
                      (unsigned long long) (kJournalCompactBytes / (1024ull * 1024)),
                      (unsigned) kJournalCompactRecords);
 }
@@ -306,7 +307,7 @@ ConversationDiskStore::~ConversationDiskStore() {
         // the writer thread's order (delta first, then the protected cleanup; the fallback
         // full write with today's cleanup) — same code, run on the draining thread
         bool ok = false;
-        if (journal_ && !p.prefix && p.image.stage_images.empty())
+        if (journal_ && !p.prefix)
             if (auto base = find_delta_base(p.image)) {
                 const uint64_t base_serial = entries_[base->index].serial;
                 if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
@@ -376,7 +377,7 @@ namespace {
 
 // Magic + version. Bumping the version invalidates every old .idx (the slow path rewrites them).
 constexpr char kIdxMagic[4] = {'S', 'I', 'D', 'X'};
-constexpr uint32_t kIdxVersion = 3;   // v3: adds the journal's size/mtime/records (freshness)
+constexpr uint32_t kIdxVersion = 4;   // v4: adds the stage count + each stage file's carve
 
 // Layout (little-endian, no struct memcpy — explicit byte writes):
 //   4   magic "SIDX"
@@ -393,6 +394,9 @@ constexpr uint32_t kIdxVersion = 3;   // v3: adds the journal's size/mtime/recor
 //   8   uint64 journal_size    (the .dlt's size at write time; 0: none — freshness check)
 //   8   int64  journal_mtime_ns (the .dlt's mtime; 0 when there is none)
 //   4   uint32 journal_records (the compaction trigger's unit)
+//   4   uint32 n_stages       (the layer split's stage files this entry owns)
+//   8 × n_stages int64 stage_layer_lo[]  (each stage file's carve — delta-base matching)
+//   8 × n_stages int64 stage_layer_hi[]
 //   4   uint32 n_ids
 //   n_ids × 4   int32 ids[]
 //   4   uint32 n_imgs
@@ -459,6 +463,11 @@ std::vector<uint8_t> build_idx_payload(const DiskEntry& e, const SessionFileIden
     write_le_u64(buf, journal_size);
     write_le_i64(buf, journal_mtime_ns);
     write_le_u32(buf, e.journal_records);
+    // the layer split's stage files (v4): their count and carves, so find_delta_base can match
+    // a new capture's stage images without parsing the stage .bins
+    write_le_u32(buf, e.n_stages);
+    for (int64_t v : e.stage_layer_lo) write_le_i64(buf, v);
+    for (int64_t v : e.stage_layer_hi) write_le_i64(buf, v);
     // live ids + imgs
     write_le_u32(buf, uint32_t(e.ids.size()));
     for (int32_t v : e.ids) write_le_u32(buf, uint32_t(v));
@@ -624,6 +633,22 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
     if (!read_le_u64(buf, pos, journal_size) || !read_le_i64(buf, pos, journal_mtime_ns)) return false;
     uint32_t journal_records = 0;
     if (!read_le_u32(buf, pos, journal_records)) return false;
+    // v4: the stage files' count and carves.
+    uint32_t n_stages = 0;
+    if (!read_le_u32(buf, pos, n_stages) || n_stages > 64) return false;
+    try {
+        e.stage_layer_lo.reserve(n_stages);
+        e.stage_layer_hi.reserve(n_stages);
+    } catch (const std::exception&) {
+        return false;
+    }
+    for (uint32_t i = 0; i < n_stages; ++i) {
+        int64_t lo = 0, hi = 0;
+        if (!read_le_i64(buf, pos, lo) || !read_le_i64(buf, pos, hi)) return false;
+        e.stage_layer_lo.push_back(lo);
+        e.stage_layer_hi.push_back(hi);
+    }
+    e.n_stages = n_stages;
     // Parse ids.
     uint32_t n_ids = 0;
     if (!read_le_u32(buf, pos, n_ids) || n_ids > (1u << 28)) return false;   // sanity bound
@@ -876,6 +901,15 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
     e.layer_lo = image.layer_lo;
     e.layer_hi = image.layer_hi;
     e.cvec = image.cvec;
+    // The stage files this put is about to write (conv-<serial>.stage<k>.bin) and their layer
+    // carves — what find_delta_base matches a later capture's stage images against.
+    e.n_stages = uint32_t(image.stage_images.size());
+    e.stage_layer_lo.clear();
+    e.stage_layer_hi.clear();
+    for (const auto& st : image.stage_images) {
+        e.stage_layer_lo.push_back(st.layer_lo);
+        e.stage_layer_hi.push_back(st.layer_hi);
+    }
 
     // Make room in the disk budget before we write. Same pattern as ConversationCache::make_room.
     // We don't know the on-disk bytes yet, so estimate from the in-memory image: SavedConversation::bytes()
@@ -1344,11 +1378,33 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
                              bin_path.c_str(), error.c_str(), (int) status.error);
                 continue;
             }
-            // ── Delta journal: fold the records onto the parsed image BEFORE the manifest data
-            // is captured, so the entry describes the state the disk restores (base + journal).
-            // The .idx fast path already carries that (the .idx is rewritten after every
-            // append); this is the stale-.idx recovery. A journal that does not chain onto
-            // this base is junk for it — dropped whole; a torn tail is truncated.
+            // ── Stage files: read them BEFORE the journal fold — a v2 record carries one
+            // section per image (main + stages), so the fold needs every image the entry
+            // owns in memory. Stop at the first MISSING k (take()'s rule); a set shorter
+            // than the journal's image count folds as a torn tail and the base restores
+            // alone (the slow path rewrites the .idx from whatever it loaded).
+            for (size_t k = 0; ; ++k) {
+                std::error_code sec;
+                const std::string spath = path_for_stage(serial, k, is_pfx);
+                if (!fs::exists(spath, sec) || sec) break;
+                SavedConversation stage_img;
+                size_t s_read = 0;
+                std::string s_error;
+                SessionStatus s_status;
+                if (!session_file_read(spath, identity, stage_img, s_read, s_error, {}, &s_status)) {
+                    std::fprintf(stderr, "[strata diag] spill reload: SKIP %s (stage %zu read failed, "
+                                         "KEPT on disk): error=%s, status=%d\n",
+                                 spath.c_str(), k, s_error.c_str(), (int) s_status.error);
+                    break;
+                }
+                image.stage_images.push_back(std::move(stage_img));
+            }
+            // ── Delta journal: fold the records onto the parsed images (main + stages, the
+            // whole pair) BEFORE the manifest data is captured, so the entry describes the
+            // state the disk restores (base + journal). The .idx fast path already carries
+            // that (the .idx is rewritten after every append); this is the stale-.idx
+            // recovery. A journal that does not chain onto this base is junk for it —
+            // dropped whole; a torn tail is truncated.
             uint64_t e_journal_bytes = 0;
             uint32_t e_journal_records = 0;
             if (!is_pfx) {
@@ -1392,6 +1448,13 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             e.layer_lo = image.layer_lo;
             e.layer_hi = image.layer_hi;
             e.cvec = image.cvec;
+            // The stage files this entry owns and their carves (what find_delta_base matches
+            // against) — the parsed set, which is exactly the files on disk.
+            e.n_stages = uint32_t(image.stage_images.size());
+            for (const auto& st : image.stage_images) {
+                e.stage_layer_lo.push_back(st.layer_lo);
+                e.stage_layer_hi.push_back(st.layer_hi);
+            }
             // The .bin parse covers the main image only; a layer split's stage files belong to
             // this entry too (put() counted them into its file_bytes, and the fresh .idx fast
             // path carries that total — the slow path must arrive at the same number). Both
@@ -1470,7 +1533,18 @@ std::optional<ConversationDiskStore::DeltaBase> ConversationDiskStore::find_delt
         if (is_prefix_entry(e) || e.cvec != image.cvec || e.geometry != image.geometry ||
             e.layer_lo != image.layer_lo || e.layer_hi != image.layer_hi)
             continue;
-        if (stage_files_bytes(e.serial) > 0) continue;   // a layer split's spill: written whole
+        // A layer split's spill is a delta base only for the SAME split: the record carries one
+        // section per image, so the stage count and every stage file's carve must line up with
+        // the new capture's stage images (the codec's per-section geometry echo re-checks it at
+        // apply time). An entry without carve lists (a pre-v4 .idx) is skipped until a full
+        // write replaces it with one that has them.
+        if (e.n_stages != image.stage_images.size()) continue;
+        if (e.stage_layer_lo.size() != e.n_stages || e.stage_layer_hi.size() != e.n_stages) continue;
+        bool carves_ok = true;
+        for (size_t k = 0; k < e.n_stages; ++k)
+            if (e.stage_layer_lo[k] != image.stage_images[k].layer_lo ||
+                e.stage_layer_hi[k] != image.stage_images[k].layer_hi) { carves_ok = false; break; }
+        if (!carves_ok) continue;
         uint64_t keep = 0;
         if (ids_prefix(e.ids, image.live.ids) && imgs_contained(e.imgs, image.live.imgs)) {
             keep = (uint64_t) e.ids.size();   // the conversation grew on top of this spill
@@ -1510,6 +1584,14 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
         if (ec || size != base_journal) return false;
     } else if (base_journal != 0) {
         return false;   // the entry remembers a journal that is not there: full write
+    }
+    // Every stage file the record's sections extend must be there: a missing conv-<serial>.
+    // stage<k>.bin (an external deletion) would leave the record's section applying onto
+    // nothing — the full write's superseded cleanup replaces the whole entry instead.
+    for (size_t k = 0; k < entries_[base_index].n_stages; ++k) {
+        std::error_code ec2;
+        const std::string spath = path_for_stage(base_serial, k, false);
+        if (!fs::exists(spath, ec2) || ec2) return false;
     }
     DeltaPlan plan;
     if (!conversation_delta_plan(plan, image, base_len, keep_tokens)) return false;
@@ -1565,11 +1647,14 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
 }
 
 void ConversationDiskStore::compact_journal(DiskEntry& e, const SessionFileIdentity& id) {
-    // Read the base .bin, apply the journal, rewrite the .bin with the folded state, drop the
-    // .dlt. Every step is fail-soft: an error leaves the entry exactly as it was (the journal
-    // stays valid — the rewrite is an atomic temp+rename over the SAME name, and a crash
-    // between the rename and the .dlt removal is the idempotency case the reader's chain rule
-    // already handles: the stale journal does not chain onto the new base and is dropped).
+    // Read the base .bin AND every stage file, apply the journal to all of them, rewrite each
+    // file with the folded state, drop the .dlt. Every step is fail-soft: an error leaves the
+    // entry exactly as it was (the journal stays valid — the rewrites are atomic temp+rename
+    // over the SAME names, and a crash between a stage's rename and the main's leaves the
+    // journal applying cleanly onto whatever mix is on disk: the records' spans [at, at+n) are
+    // identical below the boundary either way, so the fold converges; a crash AFTER the main's
+    // rename is the idempotency case the reader's chain rule already handles — the stale
+    // journal does not chain onto the new base and is dropped).
     try {
         SavedConversation image;
         size_t read = 0;
@@ -1580,7 +1665,25 @@ void ConversationDiskStore::compact_journal(DiskEntry& e, const SessionFileIdent
                                  "%s (%s); the journal stays as it is\n", e.path.c_str(), error.c_str());
             return;
         }
-        if (image.stage_images.empty() == false) return;   // a layer split's spill: not journaled
+        // The stage files, exactly like take() reads them: stop at the first missing k. A
+        // partial set cannot fold (the record's image count would not match) and the fold
+        // below reports it as a torn tail — the entry keeps its files and the next idle pass
+        // retries once the .bin is whole again.
+        for (size_t k = 0; ; ++k) {
+            std::error_code sec;
+            const std::string spath = path_for_stage(e.serial, k, false);
+            if (!fs::exists(spath, sec) || sec) break;
+            SavedConversation stage_img;
+            size_t s_read = 0;
+            std::string s_error;
+            SessionStatus s_status;
+            if (!session_file_read(spath, id, stage_img, s_read, s_error, {}, &s_status)) {
+                std::fprintf(stderr, "strata serve: conversation spill: compaction could not re-read "
+                                     "%s (%s); the journal stays as it is\n", spath.c_str(), s_error.c_str());
+                return;
+            }
+            image.stage_images.push_back(std::move(stage_img));
+        }
         const std::string dlt = path_for_dlt(e.serial, false);
         std::error_code ec;
         if (!fs::exists(dlt, ec) || ec) return;   // nothing to fold
@@ -1591,9 +1694,25 @@ void ConversationDiskStore::compact_journal(DiskEntry& e, const SessionFileIdent
             return;
         }
         if (fold.torn) fs::resize_file(dlt, fold.valid_end, ec);   // heal, then fold what healed
-        size_t written = 0;
         SessionWriteOptions opts;   // durable, default free-space preflight
         opts.min_free_bytes = 256ull * 1024 * 1024;
+        // Rewrite the STAGES first and the main LAST — put_impl's commit order: a crash
+        // mid-rewrite leaves orphan/duplicate state the journal's chain rule sorts out, never
+        // a published main whose stages are missing.
+        uint64_t stages_written = 0;
+        for (size_t k = 0; k < image.stage_images.size(); ++k) {
+            size_t s_written = 0;
+            std::string s_error;
+            SessionStatus s_status;
+            const std::string spath = path_for_stage(e.serial, k, false);
+            if (!session_file_write(spath, image.stage_images[k], id, s_written, s_error, opts, &s_status)) {
+                std::fprintf(stderr, "strata serve: conversation spill: compaction could not rewrite "
+                                     "%s (%s); the journal stays as it is\n", spath.c_str(), s_error.c_str());
+                return;
+            }
+            stages_written += s_written;
+        }
+        size_t written = 0;
         SessionStatus wstatus;
         if (!session_file_write(e.path, image, id, written, error, opts, &wstatus)) {
             std::fprintf(stderr, "strata serve: conversation spill: compaction could not rewrite "
@@ -1601,7 +1720,7 @@ void ConversationDiskStore::compact_journal(DiskEntry& e, const SessionFileIdent
             return;
         }
         fs::remove(dlt, ec);
-        // Re-account: the .bin now carries the folded state, the journal is gone.
+        // Re-account: the .bin (and its stages) now carry the folded state, the journal is gone.
         bytes_ -= e.file_bytes;
         e.ids = image.live.ids;
         e.imgs = image.live.imgs;
@@ -1613,18 +1732,26 @@ void ConversationDiskStore::compact_journal(DiskEntry& e, const SessionFileIdent
             e.ckpt_ids.clear();
             e.ckpt_imgs.clear();
         }
+        e.n_stages = uint32_t(image.stage_images.size());
+        e.stage_layer_lo.clear();
+        e.stage_layer_hi.clear();
+        for (const auto& st : image.stage_images) {
+            e.stage_layer_lo.push_back(st.layer_lo);
+            e.stage_layer_hi.push_back(st.layer_hi);
+        }
         e.journal_bytes = 0;
         e.journal_records = 0;
-        e.file_bytes = (uint64_t) written + stage_files_bytes(e.serial, false);
+        e.file_bytes = (uint64_t) written + stages_written;
         bytes_ += e.file_bytes;
         if (!write_idx(e, e.path, id))
             std::fprintf(stderr, "strata serve: conversation spill: warning: could not refresh "
                                  "%s.idx after compaction (the .bin is fine)\n", e.path.c_str());
         std::fprintf(stderr, "strata serve: conversation spill [delta]: compacted conv-%llu.dlt "
-                             "(%zu record%s, %.1f MiB) into %s (%zu tokens, %.1f MiB)\n",
+                             "(%zu record%s, %.1f MiB) into %s (%zu tokens, %.1f MiB%s)\n",
                      (unsigned long long) e.serial, fold.applied, fold.applied == 1 ? "" : "s",
                      fold.journal_bytes / (1024.0 * 1024.0), e.path.c_str(), image.live.ids.size(),
-                     (double) written / (1024.0 * 1024.0));
+                     (double) (written + stages_written) / (1024.0 * 1024.0),
+                     image.stage_images.empty() ? "" : " + stages");
     } catch (const std::bad_alloc&) {
         std::fprintf(stderr, "strata serve: conversation spill: compaction ran out of RAM; the "
                              "journal stays as it is (the next idle pass retries)\n");

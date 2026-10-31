@@ -212,12 +212,12 @@ int main() {
               "1: plan's chain fields");
         // the boundary rule: at = per-cell bytes × the completed pages of the kept prefix
         const size_t per_k = size_t(kHeads * kHeadDim * 2);
-        check(plan.parts[0][0].at == 960 * per_k, "1: k's at is the completed-page boundary");
-        check(plan.parts[0][1].at == 960 * per_k, "1: v's at is the completed-page boundary");
+        check(plan.images[0].parts[0][0].at == 960 * per_k, "1: k's at is the completed-page boundary");
+        check(plan.images[0].parts[0][1].at == 960 * per_k, "1: v's at is the completed-page boundary");
         // pooled: idx_block derived as an upper bound from the new image (1300/(326-1)=4)
-        check(plan.parts[0][4].at == (1000 / 4) * size_t(kIdxDim * 4), "1: pooled's at is completed rows");
+        check(plan.images[0].parts[0][4].at == (1000 / 4) * size_t(kIdxDim * 4), "1: pooled's at is completed rows");
         // the draft layer has no pooled part at all
-        check(plan.parts[2][4].at == 0 && plan.parts[2][4].n == 0, "1: the draft has no pooled part");
+        check(plan.images[0].parts[2][4].at == 0 && plan.images[0].parts[2][4].n == 0, "1: the draft has no pooled part");
         uint64_t rec = 0;
         check(conversation_delta_append(journal, next, plan, rec), "1: append lands");
         check(rec == plan.record_bytes, "1: the record's size is the plan's");
@@ -379,6 +379,123 @@ int main() {
         const DeltaFold fold2 = conversation_delta_apply(empty, base);
         check(fold2.had_journal && fold2.applied == 0 && !fold2.torn && !fold2.dropped,
               "8: an empty journal folds to nothing");
+    }
+
+    // ── 9. Layer split (the 2-GPU shape): a record carries one section per image, and the
+    // fold reproduces the main AND the stage byte-exactly ────────────────────────────────
+    {
+        fs::remove(journal);
+        // a 2-image spill: the main holds layers [0, 40), the stage [40, 48) — different
+        // carve, different bytes, same live state (one capture, two devices)
+        SavedConversation base = image_of(1000, 1);
+        base.layer_lo = 0; base.layer_hi = 40;
+        {
+            SavedConversation stage = image_of(1000, 9);
+            stage.layer_lo = 40; stage.layer_hi = 48;   // the other card's carve
+            stage.live = base.live;                      // the capture's one live state
+            stage.checkpoints = base.checkpoints;
+            base.stage_images.push_back(std::move(stage));
+        }
+        SavedConversation next = grow(base, 300, 2);
+        next.stage_images.clear();
+        {
+            SavedConversation nstage = grow(base.stage_images[0], 300, 3);
+            nstage.layer_lo = 40; nstage.layer_hi = 48;
+            nstage.live = next.live;
+            nstage.checkpoints = next.checkpoints;
+            next.stage_images.push_back(std::move(nstage));
+        }
+        DeltaPlan plan;
+        check(conversation_delta_plan(plan, next, 1000, 1000), "9: plan for a 2-image turn");
+        check(plan.images.size() == 2, "9: the plan covers main + stage");
+        check(plan.images[1].geometry_hash != plan.images[0].geometry_hash,
+              "9: each section carries its own carve's echo");
+        uint64_t rec = 0;
+        check(conversation_delta_append(journal, next, plan, rec), "9: append lands");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back);
+        check(fold.applied == 1 && !fold.torn, "9: one record applied over both images");
+        check(same_image(back, next), "9: main + record == the grown main");
+        check(back.stage_images.size() == 1 && same_image(back.stage_images[0], next.stage_images[0]),
+              "9: stage + record == the grown stage");
+    }
+
+    // ── 10. Torn tail with stages: the fold stops at the last good record for BOTH images ──
+    {
+        fs::remove(journal);
+        SavedConversation base = image_of(1000, 1);
+        {
+            SavedConversation stage = image_of(1000, 9);
+            stage.layer_lo = 40; stage.layer_hi = 48;
+            stage.live = base.live; stage.checkpoints = base.checkpoints;
+            base.stage_images.push_back(std::move(stage));
+        }
+        SavedConversation t1 = grow(base, 40, 2);
+        t1.stage_images.clear();
+        {
+            SavedConversation nstage = grow(base.stage_images[0], 40, 3);
+            nstage.layer_lo = 40; nstage.layer_hi = 48;
+            nstage.live = t1.live; nstage.checkpoints = t1.checkpoints;
+            t1.stage_images.push_back(std::move(nstage));
+        }
+        uint64_t rec1 = 0;
+        DeltaPlan p1;
+        check(conversation_delta_plan(p1, t1, 1000, 1000) && conversation_delta_append(journal, t1, p1, rec1),
+              "10: record 1 lands over both images");
+        // garbage past it
+        {
+            std::FILE* f = std::fopen(journal.c_str(), "ab");
+            const char junk[64] = "SDLT";
+            std::fwrite(junk, 1, sizeof(junk), f);
+            std::fclose(f);
+        }
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back);
+        check(fold.applied == 1 && fold.torn && fold.valid_end == rec1,
+              "10: the fold stops at the last good record");
+        check(same_image(back, t1) && same_image(back.stage_images[0], t1.stage_images[0]),
+              "10: both images hold the first turn's state");
+    }
+
+    // ── 11. An image-count mismatch is a torn tail: a 2-image journal cannot apply onto the
+    // main alone (a stage file lost) — nothing moves, the base restores by itself ────────
+    {
+        fs::remove(journal);
+        SavedConversation base = image_of(1000, 1);
+        {
+            SavedConversation stage = image_of(1000, 9);
+            stage.layer_lo = 40; stage.layer_hi = 48;
+            stage.live = base.live; stage.checkpoints = base.checkpoints;
+            base.stage_images.push_back(std::move(stage));
+        }
+        SavedConversation next = grow(base, 40, 2);
+        next.stage_images.clear();
+        {
+            SavedConversation nstage = grow(base.stage_images[0], 40, 3);
+            nstage.layer_lo = 40; nstage.layer_hi = 48;
+            nstage.live = next.live; nstage.checkpoints = next.checkpoints;
+            next.stage_images.push_back(std::move(nstage));
+        }
+        uint64_t rec = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, next, 1000, 1000) && conversation_delta_append(journal, next, p, rec),
+              "11: a 2-image record lands");
+        // apply onto a copy WITHOUT the stage
+        SavedConversation main_only = base;
+        main_only.stage_images.clear();
+        const DeltaFold fold = conversation_delta_apply(journal, main_only);
+        check(fold.applied == 0 && fold.torn, "11: the image count does not match — nothing applies");
+        check(same_image(main_only, base), "11: the main is untouched");
+        // the plan also refuses images whose live states disagree (not one capture)
+        SavedConversation odd = image_of(1000, 1);
+        {
+            SavedConversation stage = image_of(999, 9);   // a different length: not a delta pair
+            stage.layer_lo = 40; stage.layer_hi = 48;
+            odd.stage_images.push_back(std::move(stage));
+        }
+        DeltaPlan refuse;
+        check(!conversation_delta_plan(refuse, odd, 1000, 1000),
+              "11: images that do not share one live state are refused");
     }
 
     fs::remove_all(dir);

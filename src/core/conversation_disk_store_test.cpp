@@ -215,6 +215,34 @@ SavedConversation conv_grow(const SavedConversation& base, size_t extra, uint8_t
     return s;
 }
 
+// A 2-GPU spill's shape: the main holds layers [0, 40), one stage holds [40, 48) — the same
+// live state (one capture, two devices), different K/V bytes per device. What
+// spill_live_to_disk builds for a layer split on two cards.
+SavedConversation conv_stage_of(size_t tokens, uint8_t seed) {
+    SavedConversation s = conv_image(tokens, seed);
+    s.layer_lo = 0; s.layer_hi = 40;
+    SavedConversation st = conv_image(tokens, uint8_t(seed + 9));
+    st.layer_lo = 40; st.layer_hi = 48;
+    st.live = s.live;                     // the capture's one live state
+    st.checkpoints = s.checkpoints;
+    s.stage_images.push_back(std::move(st));
+    return s;
+}
+
+// The next turn of a 2-GPU spill: the main and the stage each grow `extra` tokens from the
+// same completed-page boundary (each device's own buffers), sharing the new live state.
+SavedConversation conv_stage_grow(const SavedConversation& base, size_t extra, uint8_t seed) {
+    SavedConversation s = conv_grow(base, extra, seed);   // grows the main's ids and K/V
+    s.stage_images.clear();
+    SavedConversation st = conv_grow(base.stage_images[0], extra, uint8_t(seed + 1));
+    st.layer_lo = base.stage_images[0].layer_lo;
+    st.layer_hi = base.stage_images[0].layer_hi;
+    st.live = s.live;
+    st.checkpoints = s.checkpoints;
+    s.stage_images.push_back(std::move(st));
+    return s;
+}
+
 // The client's re-render: the new history keeps only the anchor checkpoint's prefix (the
 // base's live ids are NOT a prefix of the result) with a fresh shorter turn on top. The K/V
 // below the anchor's completed-page boundary is the base's own (the same conversation's
@@ -1311,6 +1339,117 @@ int main() {
         check(!fs::exists(rdir / "conv-1200.bin"), "32: the victim's .bin went");
         check(fs::exists(rdir / "conv-1100.bin") && fs::exists(rdir / "conv-1100.dlt"),
               "32: the base and its journal survived their own growth");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 33. The 2-GPU shape (a layer split): a continued turn appends ONE record that covers
+    // the main AND the stage — neither file is rewritten; take() folds both; the restart
+    // restores both (this is the Kaggle 2×T4 churn scenario the journal exists for).
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_stages";
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            SavedConversation a0 = conv_stage_of(1000, 1);
+            SavedConversation a1 = conv_stage_grow(a0, 24, 2);
+            SavedConversation a2 = conv_stage_grow(a1, 24, 3);
+            const uint64_t serial = 1300;
+            check(store.put(std::move(a0), serial, id), "33: the first park writes .bin + .stage0.bin");
+            check(fs::exists(rdir / "conv-1300.bin") && fs::exists(rdir / "conv-1300.stage0.bin"),
+                  "33: both files exist");
+            check(!fs::exists(rdir / "conv-1300.dlt"), "33: no journal yet");
+            const uint64_t bin_size = fs::file_size(rdir / "conv-1300.bin");
+            const uint64_t stage_size = fs::file_size(rdir / "conv-1300.stage0.bin");
+            check(store.put_async(std::move(a1), serial + 1, id), "33: the second park is queued");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-1300.dlt"), "33: the second park appended a journal record");
+            check(fs::file_size(rdir / "conv-1300.bin") == bin_size, "33: the main .bin was NOT rewritten");
+            check(fs::file_size(rdir / "conv-1300.stage0.bin") == stage_size,
+                  "33: the stage file was NOT rewritten either");
+            check(store.size() == 1, "33: one entry (the base, extended)");
+            check(store.put_async(std::move(a2), serial + 2, id), "33: the third park is queued");
+            store.flush_pending();
+            check(store.size() == 1, "33: still one entry");
+            const uint64_t journal_size = fs::file_size(rdir / "conv-1300.dlt");
+            check(journal_size > 0, "33: the journal holds two records");
+            check(journal_size < (bin_size + stage_size) / 2,
+                  "33: two records cost less than half a full 2-GPU spill");
+            // take() folds the journal over BOTH images
+            ConversationCache::Match m;
+            m.serial = 1300; m.tokens = 1048; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value(), "33: take returns the folded image");
+            SavedConversation want = conv_stage_grow(conv_stage_grow(conv_stage_of(1000, 1), 24, 2), 24, 3);
+            check(same_conv(*back, want), "33: the main folds to the third turn's state");
+            check(back->stage_images.size() == 1 && same_conv(back->stage_images[0], want.stage_images[0]) &&
+                  back->stage_images[0].layer_lo == 40 && back->stage_images[0].layer_hi == 48,
+                  "33: the stage folds to the third turn's state too");
+            check(store.size() == 1, "33: the entry stayed in the manifest after take");
+        }
+        // restart: the .idx fast path carries the pair; a fresh take restores both images
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 1, "33: reload loads the (base + journal) entry");
+            ConversationCache::Match m;
+            m.serial = 1300; m.tokens = 1048; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && back->live.ids.size() == 1048 && back->stage_images.size() == 1 &&
+                      back->stage_images[0].live.ids.size() == 1048,
+                  "33: after the restart, both images restore folded");
+        }
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 34. A different layer split never appends: same stage count but a different carve is
+    // not the same base — the full write replaces the entry (a journal built for one carve
+    // cannot chain onto another).
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_stages_mismatch";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        check(store.put(conv_stage_of(1000, 1), 1400, id), "34: the 2-GPU base");
+        // a capture from ANOTHER split: the stage's carve moved (44.. instead of 40..)
+        SavedConversation other = conv_stage_grow(conv_stage_of(1000, 1), 24, 2);
+        other.stage_images[0].layer_lo = 44;
+        check(store.put_async(std::move(other), 1401, id), "34: the other split's park is queued");
+        store.flush_pending();
+        check(store.size() == 1, "34: one entry — the other split's spill superseded the base");
+        check(!fs::exists(rdir / "conv-1400.bin") && !fs::exists(rdir / "conv-1400.stage0.bin"),
+              "34: the old split's spill went (full write + cleanup)");
+        check(fs::exists(rdir / "conv-1401.bin") && fs::exists(rdir / "conv-1401.stage0.bin"),
+              "34: the other split wrote its own spill");
+        check(!fs::exists(rdir / "conv-1400.dlt") && !fs::exists(rdir / "conv-1401.dlt"),
+              "34: no journal was ever created");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 35. Compaction with stages: the 20% bound folds the journal back into the .bin AND
+    // the .stage0.bin (both rewrites, main last), and the folded pair restores whole.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_stages_compact";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation cur = conv_stage_of(1000, 1);
+        check(store.put(std::move(cur), 1500, id), "35: the 2-GPU base");
+        cur = conv_stage_of(1000, 1);
+        for (int turn = 1; turn <= 8; ++turn) {
+            SavedConversation next = conv_stage_grow(cur, 30, uint8_t(turn));
+            SavedConversation queued = next;   // the queue takes a copy; the chain keeps the original
+            cur = std::move(next);
+            check(store.put_async(std::move(queued), uint64_t(1500 + turn), id), "35: a delta turn");
+            store.flush_pending();
+            if (!fs::exists(rdir / "conv-1500.dlt")) break;   // compacted
+        }
+        check(!fs::exists(rdir / "conv-1500.dlt"), "35: the journal was compacted away");
+        check(store.size() == 1, "35: one entry after the compaction");
+        check(fs::exists(rdir / "conv-1500.bin") && fs::exists(rdir / "conv-1500.stage0.bin"),
+              "35: the pair is still on disk");
+        ConversationCache::Match m;
+        m.serial = 1500; m.tokens = (int64_t) cur.live.ids.size(); m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value() && same_conv(*back, cur), "35: the compacted .bin restores the newest state");
+        check(back->stage_images.size() == 1 && same_conv(back->stage_images[0], cur.stage_images[0]),
+              "35: the compacted stage file restores the newest state too");
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
