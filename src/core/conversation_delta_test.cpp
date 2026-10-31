@@ -169,6 +169,49 @@ SavedConversation rerender(const SavedConversation& base, size_t new_tail, uint8
     return s;
 }
 
+// A re-render that diverges at an ARBITRARY cut — neither the base's end nor its checkpoint:
+// the selector's common-prefix case. Below the completed-page boundary of `cut` the base's own
+// bytes (the same conversation's cells); above it, a fresh tail.
+SavedConversation lcp_turn(const SavedConversation& base, size_t cut, size_t new_tail, uint8_t seed) {
+    SavedConversation s = base;
+    const int64_t whole = (int64_t) (cut / kPage) * kPage;
+    const int64_t pooled_keep = cut / kIdxBlock;
+    s.live.ids.assign(base.live.ids.begin(), base.live.ids.begin() + (std::ptrdiff_t) cut);
+    for (size_t i = 0; i < new_tail; ++i) s.live.ids.push_back(int32_t(9000 + i));
+    s.live = ckpt_of(s.live.ids, seed);
+    s.live.imgs = {{7, 0xabcd0000ull + seed}};
+    s.checkpoints.clear();
+    s.checkpoints.push_back(ckpt_of(
+        std::vector<int32_t>(s.live.ids.begin(), s.live.ids.begin() + (std::ptrdiff_t) (s.live.ids.size() / 2)),
+        uint8_t(seed + 50)));
+    const int64_t cells = cells_of(s.live.ids.size());
+    for (int layer = 0; layer < 3; ++layer) {
+        ConversationKv& kv = s.kv[layer];
+        kv.cells = cells;
+        kv.pooled_rows = layer < 2 ? (int64_t) s.live.ids.size() / kIdxBlock + 1 : 0;
+        auto cut_buf = [&](ConversationBuffer& buf, size_t size, size_t at) {
+            buf.resize(at);   // keep the base's completed pages of the kept prefix
+            buf.resize(size);
+            if (size > at)
+                buf.visit(at, size - at, [&](uint8_t* p, size_t c, size_t) {
+                    for (size_t i = 0; i < c; ++i) p[i] = uint8_t(i * 23u + seed + layer);
+                    return true;
+                });
+        };
+        cut_buf(kv.k, size_t(cells) * size_t(kHeads * kHeadDim * 2),
+                size_t(whole) * size_t(kHeads * kHeadDim * 2));
+        cut_buf(kv.v, size_t(cells) * size_t(kHeads * kHeadDim * 2),
+                size_t(whole) * size_t(kHeads * kHeadDim * 2));
+        if (layer < 2) {
+            cut_buf(kv.k_scale, size_t(cells) * size_t(kHeads * 2), size_t(whole) * size_t(kHeads * 2));
+            cut_buf(kv.v_scale, size_t(cells) * size_t(kHeads * 2), size_t(whole) * size_t(kHeads * 2));
+            cut_buf(kv.pooled, size_t(kv.pooled_rows) * size_t(kIdxDim * 4),
+                    size_t(pooled_keep) * size_t(kIdxDim * 4));
+        }
+    }
+    return s;
+}
+
 bool same_image(const SavedConversation& a, const SavedConversation& b) {
     if (a.geometry != b.geometry || a.layer_lo != b.layer_lo || a.layer_hi != b.layer_hi ||
         a.cvec != b.cvec || a.live.ids != b.live.ids || a.live.imgs != b.live.imgs ||
@@ -496,6 +539,38 @@ int main() {
         DeltaPlan refuse;
         check(!conversation_delta_plan(refuse, odd, 1000, 1000),
               "11: images that do not share one live state are refused");
+    }
+
+    // ── 12. The intermediate cut (the selector's new case): keep_tokens is NEITHER the base's
+    // end NOR a checkpoint — 700 of a 1000-id base whose deepest checkpoint sits at 500. The
+    // plan builds, the record appends, and apply reconstructs the image byte-exactly from the
+    // truncated base + the re-sent tail (the partial page at the cut is re-sent, not trusted).
+    {
+        fs::remove(journal);
+        SavedConversation base = image_of(1000, 1);
+        check(base.checkpoints.back().ids.size() == 500, "12: the base's checkpoint is at 500");
+        SavedConversation next = lcp_turn(base, 700, 300, 5);
+        check(next.live.ids.size() == 1000, "12: the re-rendered park is 1000 ids");
+        check(next.live.ids.size() != base.checkpoints.back().ids.size(),
+              "12: the cut is not the checkpoint");
+        DeltaPlan plan;
+        check(conversation_delta_plan(plan, next, 1000, 700), "12: plan for the intermediate cut");
+        check(plan.keep_tokens == 700 && plan.applies_to_len == 1000 && plan.new_tokens == 1000,
+              "12: the plan's chain fields");
+        // the payload starts at the completed pages of the CUT (640), not of the base (960):
+        // the 36 cells of the cut's partial page are re-sent, never trusted
+        const size_t per_k = size_t(kHeads * kHeadDim * 2);
+        check(plan.images[0].parts[0][0].at == 640 * per_k, "12: k's at is the CUT's page boundary");
+        check(plan.images[0].parts[0][1].at == 640 * per_k, "12: v's at is the CUT's page boundary");
+        check(plan.images[0].parts[0][4].at == (700 / kIdxBlock) * size_t(kIdxDim * 4),
+              "12: pooled's at is the cut's completed rows");
+        uint64_t rec = 0;
+        check(conversation_delta_append(journal, next, plan, rec), "12: append lands");
+        check(rec == plan.record_bytes, "12: the record's size is the plan's");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back);
+        check(fold.applied == 1 && !fold.torn && !fold.dropped, "12: one record applied, nothing torn");
+        check(same_image(back, next), "12: truncated base + record == the re-rendered image");
     }
 
     fs::remove_all(dir);

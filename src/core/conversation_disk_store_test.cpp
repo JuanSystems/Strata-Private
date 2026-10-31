@@ -288,6 +288,104 @@ SavedConversation conv_rerender(const SavedConversation& base, size_t new_tail, 
     return s;
 }
 
+// A capture whose deepest checkpoint sits at `ckpt_tokens` (the real park shape: the checkpoint
+// is the last turn boundary, a few hundred ids below the live end — the reporting run's park
+// 5814 held 22728 under 23143).
+SavedConversation conv_at(size_t tokens, size_t ckpt_tokens, uint8_t seed) {
+    SavedConversation s = conv_image(tokens, seed);
+    s.checkpoints.clear();
+    s.checkpoints.push_back(jckpt(
+        std::vector<int32_t>(s.live.ids.begin(), s.live.ids.begin() + std::ptrdiff_t(ckpt_tokens)),
+        uint8_t(seed + 50)));
+    return s;
+}
+
+// The reporting run's next park: the history keeps [0, cut) of the base and is re-rendered
+// above it (the client strips the assistant's thinking), so the base's ids are NOT a prefix of
+// the result and its checkpoint is NOT contained — only the common prefix survives, landing
+// BELOW the old checkpoint (measured: 29 ids below it, every consecutive pair of the run). The
+// K/V below the completed-page boundary of `cut` is the base's own cells (the same
+// conversation's bytes, what a capture re-sends); above it, fresh bytes. `ckpt_at` places the
+// new capture's deepest checkpoint (0: at half) — a real park's checkpoint is its last turn
+// boundary, near the end, which a chain's next park cuts just below.
+SavedConversation conv_lcp_turn(const SavedConversation& base, size_t cut, size_t new_tail,
+                                uint8_t seed, size_t ckpt_at = 0) {
+    const std::vector<ConversationImageKey> base_imgs = base.live.imgs;
+    SavedConversation s = base;
+    s.live.ids.assign(base.live.ids.begin(), base.live.ids.begin() + std::ptrdiff_t(cut));
+    for (size_t i = 0; i < new_tail; ++i) s.live.ids.push_back(int32_t(9000 + i));
+    s.live = jckpt(s.live.ids, seed);
+    s.live.imgs = base_imgs;
+    const size_t ckpt_pos = ckpt_at > 0 ? std::min(ckpt_at, s.live.ids.size()) : s.live.ids.size() / 2;
+    s.checkpoints.clear();
+    s.checkpoints.push_back(jckpt(
+        std::vector<int32_t>(s.live.ids.begin(), s.live.ids.begin() + std::ptrdiff_t(ckpt_pos)),
+        uint8_t(seed + 50)));
+    const int64_t whole = (int64_t) (cut / JPage) * JPage;
+    const int64_t cells = jcells(s.live.ids.size());
+    const int64_t pooled_keep = (int64_t) cut / JIdxBlock;
+    for (int layer = 0; layer < 3; ++layer) {
+        ConversationKv& kv = s.kv[layer];
+        kv.cells = cells;
+        kv.pooled_rows = layer < 2 ? (int64_t) s.live.ids.size() / JIdxBlock + 1 : 0;
+        auto cut_buf = [&](ConversationBuffer& buf, size_t size, size_t at) {
+            buf.resize(at);      // keep the base's completed pages of the kept prefix
+            buf.resize(size);    // grow to the new layout
+            if (size > at)
+                buf.visit(at, size - at, [&](uint8_t* p, size_t c, size_t) {
+                    for (size_t i = 0; i < c; ++i) p[i] = uint8_t(i * 23u + seed + layer);
+                    return true;
+                });
+        };
+        cut_buf(kv.k, size_t(cells) * size_t(JHeads * JHeadDim * 2),
+                size_t(whole) * size_t(JHeads * JHeadDim * 2));
+        cut_buf(kv.v, size_t(cells) * size_t(JHeads * JHeadDim * 2),
+                size_t(whole) * size_t(JHeads * JHeadDim * 2));
+        if (layer < 2) {
+            cut_buf(kv.k_scale, size_t(cells) * size_t(JHeads * 2), size_t(whole) * size_t(JHeads * 2));
+            cut_buf(kv.v_scale, size_t(cells) * size_t(JHeads * 2), size_t(whole) * size_t(JHeads * 2));
+            cut_buf(kv.pooled, size_t(kv.pooled_rows) * size_t(JIdxDim * 4),
+                    size_t(pooled_keep) * size_t(JIdxDim * 4));
+        }
+    }
+    return s;
+}
+
+// The 2-GPU next park with the same divergence: the main and the stage each keep the base's
+// completed pages below `cut`, sharing the re-rendered live state.
+SavedConversation conv_stage_lcp(const SavedConversation& base, size_t cut, size_t new_tail,
+                                 uint8_t seed) {
+    SavedConversation s = conv_lcp_turn(base, cut, new_tail, seed);
+    s.stage_images.clear();
+    SavedConversation st = conv_lcp_turn(base.stage_images[0], cut, new_tail, uint8_t(seed + 1));
+    st.layer_lo = base.stage_images[0].layer_lo;
+    st.layer_hi = base.stage_images[0].layer_hi;
+    st.live = s.live;
+    st.checkpoints = s.checkpoints;
+    s.stage_images.push_back(std::move(st));
+    return s;
+}
+
+// A pinned shared-prefix snapshot (pfx-<serial>.bin): only its ids — and their LENGTH, the
+// lineage guard's pin_len — matter to the store; a one-layer body keeps the file small. Its
+// live ids ARE its only checkpoint: the prefix shape is_prefix_entry() recognizes.
+SavedConversation pin_image(const std::vector<int32_t>& ids) {
+    SavedConversation s;
+    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(200 + i);
+    s.layer_lo = 0; s.layer_hi = 40;
+    s.cvec = false;
+    s.live = jckpt(ids, 21);
+    s.checkpoints.push_back(jckpt(ids, 21));
+    const int64_t cells = jcells(ids.size());
+    ConversationKv kv;
+    kv.format = 1; kv.cells = cells; kv.heads = JHeads; kv.head_dim = 8;
+    kv.page_size = JPage; kv.pooled_rows = 0; kv.idx_dim = JIdxDim;
+    kv.k = jfill(size_t(cells) * size_t(JHeads * 8 * 2), 31);
+    kv.v = jfill(size_t(cells) * size_t(JHeads * 8 * 2), 32);
+    s.kv.push_back(std::move(kv));
+    return s;
+}
+
 bool same_conv(const SavedConversation& a, const SavedConversation& b) {
     if (a.geometry != b.geometry || a.cvec != b.cvec || a.live.ids != b.live.ids ||
         a.live.imgs != b.live.imgs || a.live.gdn != b.live.gdn || a.live.ple != b.live.ple ||
@@ -1451,6 +1549,286 @@ int main() {
         check(back.has_value() && same_conv(*back, cur), "35: the compacted .bin restores the newest state");
         check(back->stage_images.size() == 1 && same_conv(back->stage_images[0], cur.stage_images[0]),
               "35: the compacted stage file restores the newest state too");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 36. The report's own shape (the case this whole block exists for): the client
+    // re-renders between parks and the divergence lands BELOW the old checkpoint (measured:
+    // 29 ids below it), so neither exact cut can see it and no .dlt is ever created — one full
+    // .bin per park. With a pinned shared root on disk (the run had pfx-*.bin at 22259), the
+    // common-prefix cut at the old render's frontier appends ONE record: no new .bin, and
+    // take() restores the re-rendered state byte-exactly.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_real";
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            // the run's park 5814: 23143 live ids, deepest checkpoint at 22728
+            SavedConversation a = conv_at(23143, 22728, 1);
+            // the pinned shared root: 22259 ids (pfx-*.bin, on disk since the run's first request)
+            const std::vector<int32_t> pin_ids(a.live.ids.begin(), a.live.ids.begin() + 22259);
+            check(store.put(pin_image(pin_ids), 300, id, {}, true), "36: the pinned root lands");
+            check(store.put(std::move(a), 5814, id), "36: park 5814 (the base)");
+            const uint64_t bin_size = fs::file_size(rdir / "conv-5814.bin");
+            // park 5815: the same conversation re-rendered — 22699 common ids (29 below the old
+            // checkpoint), then a fresh 999-id turn: 23698 ids
+            SavedConversation b = conv_lcp_turn(conv_at(23143, 22728, 1), 22699, 999, 2);
+            check(b.live.ids.size() == 23698, "36: the re-rendered park is 23698 ids");
+            check(store.put_async(std::move(b), 5815, id), "36: park 5815 is queued");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-5814.dlt"), "36: the .dlt EXISTS (the fix)");
+            check(!fs::exists(rdir / "conv-5815.bin"), "36: no new .bin for the re-rendered park");
+            check(fs::file_size(rdir / "conv-5814.bin") == bin_size,
+                  "36: the base .bin was NOT rewritten");
+            check(store.size() == 2, "36: two entries (the pin + the extended conversation)");
+            const uint64_t journal_size = fs::file_size(rdir / "conv-5814.dlt");
+            check(journal_size > 0 && journal_size < bin_size / 2,
+                  "36: one record costs far less than the .bin it saved");
+            // the folded state IS the re-rendered park, byte-exactly
+            ConversationCache::Match m;
+            m.serial = 5814; m.tokens = 23698; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value(), "36: take returns the folded image");
+            check(same_conv(*back, conv_lcp_turn(conv_at(23143, 22728, 1), 22699, 999, 2)),
+                  "36: base + record == the re-rendered park, byte-exactly");
+        }
+        // restart: the .idx fast path carries the post-apply ids; the folded state restores
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 2, "36: reload loads the pin and the entry");
+            ConversationCache::Match m;
+            m.serial = 5814; m.tokens = 23698; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && back->live.ids.size() == 23698,
+                  "36: after the restart, the folded state restores");
+        }
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 37. A divergence INSIDE the pinned root is not a conversation: the cut falls at or
+    // below pin_len — the region every conversation of this client shares — so no delta, a
+    // full write, and every entry coexists (the keep > pin_len guard).
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_in_pin";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation a = conv_at(1000, 850, 1);
+        const std::vector<int32_t> pin_ids(a.live.ids.begin(), a.live.ids.begin() + 600);
+        check(store.put(pin_image(pin_ids), 301, id, {}, true), "37: the pinned root (600 ids)");
+        check(store.put(std::move(a), 400, id), "37: the base");
+        // the next park diverges at 550, inside the pin (the half rule alone would take it:
+        // 550*2 >= 750) — the shared-root guard must refuse
+        SavedConversation b = conv_lcp_turn(conv_at(1000, 850, 1), 550, 200, 2);
+        check(store.put_async(std::move(b), 401, id), "37: the divergent park is queued");
+        store.flush_pending();
+        check(!fs::exists(rdir / "conv-400.dlt"), "37: no journal (the cut is inside the root)");
+        check(fs::exists(rdir / "conv-401.bin"), "37: the park full-wrote its own .bin");
+        check(store.size() == 3, "37: pin + base + the new park all coexist");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 38. The half rule on the common-prefix cut: a base carrying less than half the new
+    // image does not save the rewrite — the codec would refuse the plan, and the selector must
+    // not even offer it (1000 common ids under a 3000-id park).
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_half";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation a = conv_at(1200, 1050, 1);
+        const std::vector<int32_t> pin_ids(a.live.ids.begin(), a.live.ids.begin() + 400);
+        check(store.put(pin_image(pin_ids), 302, id, {}, true), "38: the pinned root (400 ids)");
+        check(store.put(std::move(a), 500, id), "38: the base");
+        // 1000 common ids — past the pin (400) and at the frontier (1050): both identity guards
+        // PASS; the half rule alone must refuse (1000*2 < 3000)
+        SavedConversation b = conv_lcp_turn(conv_at(1200, 1050, 1), 1000, 2000, 2);
+        check(b.live.ids.size() == 3000, "38: the new park is 3000 ids");
+        check(store.put_async(std::move(b), 501, id), "38: the park is queued");
+        store.flush_pending();
+        check(!fs::exists(rdir / "conv-500.dlt"), "38: no journal (the base is under half)");
+        check(fs::exists(rdir / "conv-501.bin"), "38: the park full-wrote");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 39. Another conversation of the same client: it shares the pinned root and even the
+    // first message past it, but its divergence sits FAR below the old render's frontier —
+    // not this conversation's re-render. No delta onto the old entry; the old conversation
+    // stays restorable by its own prefix (the lineage guard's whole purpose).
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_stranger";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation a = conv_at(1200, 1050, 1);
+        const std::vector<int32_t> pin_ids(a.live.ids.begin(), a.live.ids.begin() + 400);
+        check(store.put(pin_image(pin_ids), 303, id, {}, true), "39: the pinned root (400 ids)");
+        check(store.put(std::move(a), 600, id), "39: conversation X parks");
+        // conversation Y: shares root + 200 ids of the first message (the cut at 600 is past
+        // the pin and past the half rule: 600*2 >= 1150) but far below X's frontier (1050)
+        SavedConversation y = conv_lcp_turn(conv_at(1200, 1050, 1), 600, 550, 3);
+        check(y.live.ids.size() == 1150, "39: Y is 1150 ids");
+        check(store.put_async(std::move(y), 601, id), "39: conversation Y parks");
+        store.flush_pending();
+        check(!fs::exists(rdir / "conv-600.dlt"), "39: no journal onto X's entry");
+        check(fs::exists(rdir / "conv-601.bin"), "39: Y wrote its own spill");
+        check(store.size() == 3, "39: both conversations coexist");
+        // X is still restorable by its own prefix — Y's park did not consume it
+        ConversationCache::Match m;
+        m.serial = 600; m.tokens = 1200; m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value() && same_conv(*back, conv_at(1200, 1050, 1)),
+              "39: X restores whole after Y's park");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 40. Without a pinned root on disk (pin_len == 0) the common-prefix path stays OFF:
+    // only today's exact cuts. A partial-prefix re-render full-writes; the checkpoint-anchored
+    // re-render (today's rule) still appends.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_no_pin";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        check(store.put(conv_at(1000, 500, 1), 700, id), "40: the base (no pin on disk)");
+        // a re-render that diverges BELOW the checkpoint (at 400): a partial prefix no exact
+        // cut can see — with no pin to anchor identity, the conservative full write
+        SavedConversation b = conv_lcp_turn(conv_at(1000, 500, 1), 400, 600, 2);
+        check(store.put_async(std::move(b), 701, id), "40: the partial-prefix park is queued");
+        store.flush_pending();
+        check(!fs::exists(rdir / "conv-700.dlt") && !fs::exists(rdir / "conv-701.dlt"),
+              "40: no journal from a partial prefix without a pin");
+        check(store.size() == 2, "40: both spills on disk (today's shape)");
+        // today's rule still works: a re-render anchored exactly at the checkpoint appends. The
+        // record may already be past its 20% bound and compacted into the .bin (as test 26
+        // documents), so the proof is the restored state and the absent new .bin, not the .dlt
+        SavedConversation c = conv_rerender(conv_at(1000, 500, 1), 300, 3);
+        check(store.put_async(std::move(c), 702, id), "40: the checkpoint-anchored park is queued");
+        store.flush_pending();
+        check(!fs::exists(rdir / "conv-702.bin"),
+              "40: no new .bin — the park appended to the base entry");
+        ConversationCache::Match m;
+        m.serial = 700; m.tokens = 800; m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value() && same_conv(*back, conv_rerender(conv_at(1000, 500, 1), 300, 3)),
+              "40: the exact ckpt cut still chains (today's rule)");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 41. The chain: park after park after park, each re-rendered, each diverging below the
+    // previous checkpoint — every one of them appends to the SAME entry (the reporting run's
+    // churn: 4 parks, 0 journals, 4.9 GiB; with the fix: 4 parks, 3 records, one .bin). The
+    // records are kept small against the .bin so no compaction folds them mid-chain: what the
+    // take() below proves is the two-record FOLD, base → record 1 → record 2.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_chain";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation a0 = conv_at(4000, 3900, 1);
+        const std::vector<int32_t> pin_ids(a0.live.ids.begin(), a0.live.ids.begin() + 400);
+        check(store.put(pin_image(pin_ids), 304, id, {}, true), "41: the pinned root");
+        SavedConversation parked = a0;
+        check(store.put(std::move(parked), 800, id), "41: park 1 (the base)");
+        const uint64_t bin_size = fs::file_size(rdir / "conv-800.bin");
+        // park 2: diverges 29 ids below the old checkpoint (3871 under 3900); its own deepest
+        // checkpoint (the last turn boundary) at 3880
+        SavedConversation b = conv_lcp_turn(a0, 3871, 30, 2, 3880);
+        SavedConversation queued = b;
+        check(store.put_async(std::move(queued), 801, id), "41: park 2 queued");
+        store.flush_pending();
+        check(fs::exists(rdir / "conv-800.dlt"), "41: record 1 appended");
+        const uint64_t journal_1 = fs::file_size(rdir / "conv-800.dlt");
+        // park 3: re-rendered again — the entry now holds park 2's state, whose checkpoint
+        // sits at 3880; the new cut is ITS frontier minus 29 (3851)
+        SavedConversation c = conv_lcp_turn(b, 3851, 40, 3);
+        queued = c;
+        check(store.put_async(std::move(queued), 802, id), "41: park 3 queued");
+        store.flush_pending();
+        check(fs::file_size(rdir / "conv-800.dlt") > journal_1, "41: record 2 appended (the chain)");
+        check(fs::file_size(rdir / "conv-800.bin") == bin_size, "41: the .bin never moved");
+        check(store.size() == 2, "41: pin + ONE conversation entry after three parks");
+        check(!fs::exists(rdir / "conv-801.bin") && !fs::exists(rdir / "conv-802.bin"),
+              "41: no per-park .bin files");
+        // the whole chain folds back to park 3's state
+        ConversationCache::Match m;
+        m.serial = 800; m.tokens = 3891; m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value(), "41: take returns the folded image");
+        check(same_conv(*back, c), "41: base + 2 records == park 3, byte-exactly");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 42. The 2-GPU shape with an intermediate cut: the re-rendered park appends ONE record
+    // covering the main AND the stage (neither file rewritten); take() folds both.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_stages";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation a = conv_stage_of(4000, 1);
+        {   // move the checkpoint to a real park's shape: the last turn boundary (3900)
+            std::vector<int32_t> ck(a.live.ids.begin(), a.live.ids.begin() + 3900);
+            a.checkpoints = {jckpt(ck, 51)};
+            a.stage_images[0].checkpoints = a.checkpoints;
+        }
+        const std::vector<int32_t> pin_ids(a.live.ids.begin(), a.live.ids.begin() + 400);
+        check(store.put(pin_image(pin_ids), 305, id, {}, true), "42: the pinned root");
+        SavedConversation parked = a;
+        check(store.put(std::move(parked), 900, id), "42: the 2-GPU base");
+        const uint64_t bin_size = fs::file_size(rdir / "conv-900.bin");
+        const uint64_t stage_size = fs::file_size(rdir / "conv-900.stage0.bin");
+        // the re-rendered park: 3871 common ids (29 below the 3900 checkpoint), a fresh 30
+        SavedConversation b = conv_stage_lcp(a, 3871, 30, 2);
+        check(b.live.ids.size() == 3901, "42: the re-rendered park is 3901 ids");
+        SavedConversation queued = b;
+        check(store.put_async(std::move(queued), 901, id), "42: the re-rendered park is queued");
+        store.flush_pending();
+        check(fs::exists(rdir / "conv-900.dlt"), "42: the .dlt covers both images");
+        check(fs::file_size(rdir / "conv-900.bin") == bin_size &&
+              fs::file_size(rdir / "conv-900.stage0.bin") == stage_size,
+              "42: neither file was rewritten");
+        check(store.size() == 2, "42: pin + ONE entry");
+        ConversationCache::Match m;
+        m.serial = 900; m.tokens = 3901; m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value(), "42: take returns the folded image");
+        check(same_conv(*back, b), "42: the main folds to the re-rendered state");
+        check(back->stage_images.size() == 1 && same_conv(back->stage_images[0], b.stage_images[0]),
+              "42: the stage folds to the re-rendered state too");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 43. drop_superseded stays untouched: after a common-prefix delta no NEW .bin appears
+    // (the park created no entry), the delta base survives its own append's cleanup
+    // (protect_serial), and a DIFFERENT conversation's files are never collateral damage.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_lcp_cleanup";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation x = conv_at(4000, 3900, 1);
+        const std::vector<int32_t> pin_ids(x.live.ids.begin(), x.live.ids.begin() + 400);
+        check(store.put(pin_image(pin_ids), 306, id, {}, true), "43: the pinned root");
+        SavedConversation parked = x;
+        check(store.put(std::move(parked), 1000, id), "43: conversation X parks");
+        SavedConversation z = conv_image(800, 7);   // a different conversation of the client
+        for (auto& t : z.live.ids) t += 7777;
+        for (auto& c : z.checkpoints)
+            for (auto& t : c.ids) t += 7777;
+        check(store.put(std::move(z), 1001, id), "43: conversation Z parks");
+        auto count_bins = [&rdir] {
+            size_t n = 0;
+            for (const auto& f : fs::directory_iterator(rdir)) {
+                const std::string name = f.path().filename().string();
+                if (name.rfind("conv-", 0) == 0 && name.find(".stage") == std::string::npos &&
+                    name.size() > 4 && name.compare(name.size() - 4, 4, ".bin") == 0)
+                    ++n;
+            }
+            return n;
+        };
+        check(count_bins() == 2, "43: two .bin files before the re-rendered park");
+        // X re-rendered: 3871 common ids (29 below X's 3900 checkpoint), a fresh 40
+        SavedConversation x2 = conv_lcp_turn(x, 3871, 40, 2);
+        check(store.put_async(std::move(x2), 1002, id), "43: X's re-rendered park is queued");
+        store.flush_pending();
+        check(count_bins() == 2, "43: still two .bin files (the park created no entry)");
+        check(fs::exists(rdir / "conv-1000.dlt"), "43: X's park appended to X's entry");
+        check(fs::exists(rdir / "conv-1001.bin"), "43: Z's .bin survived X's park");
+        check(store.size() == 3, "43: pin + X (extended) + Z");
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 

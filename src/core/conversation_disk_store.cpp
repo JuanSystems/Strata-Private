@@ -58,6 +58,51 @@ static bool is_prefix_entry(const DiskEntry& e) {
     return e.prefix || prefix_snapshot(e);
 }
 
+// ── Delta-base lineage: the identity guard of the common-prefix cut ────────────────────────
+// The client's re-render between parks rewrites the region around the old capture's last turn
+// boundary, so the common prefix of two successive parks of ONE conversation ends just below
+// the old entry's deepest checkpoint (measured on the reporting run: 29 ids below it, every
+// consecutive pair — 22699/22728, 23244/23273, 25079/25108). A DIFFERENT conversation of the
+// same client diverges at the shared root instead — the pinned system prompt, thousands of ids
+// below that frontier. A cut is trusted as the same lineage only while it sits at the old
+// render's frontier; anything far below it is a compaction, a rewind or a stranger, and the
+// full write (today's behavior) is the safe answer.
+
+// The longest common prefix of two id sequences, in ids: how many leading ids are identical
+// (0 when the very first differs). A linear walk that stops at the first mismatch — never
+// std::equal over the whole short side (that is a prefix TEST, not a measurement).
+static size_t ids_common_prefix(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
+
+// How far below the old render's frontier a common-prefix cut may sit and still be the same
+// conversation's re-render. The measured offset is 29 ids; a turn rewritten whole (rather than
+// stripped) costs a few hundred, so 1024 covers it while staying an order of magnitude short
+// of a different conversation's divergence depth at the shared root.
+constexpr size_t kDeltaLineageSlack = 1024;
+
+// Does a common-prefix cut of `keep` ids against an entry (base_len ids live, its deepest
+// checkpoint at base_ckpt_len, 0 when it saved none) describe the SAME conversation
+// re-rendered, rather than another conversation of the client that happens to share the ids
+// below the cut? The K/V below the cut is valid for either by causality (position i depends
+// only on tokens <= i), so the restore is never wrong — what is at stake is the OLD entry: an
+// append re-describes it as the parking conversation, and a stranger must not consume it. The
+// guard: the cut must sit at the old render's frontier — the deepest checkpoint the old
+// capture saved, else its ids end — within a slack that never exceeds half the conversation's
+// own region past the shared root, so a short conversation gets a proportionally tight window
+// instead of a free 1024 ids. A cut PAST the frontier is the strongest identity there is: the
+// old checkpoint verbatim inside the new render is the same evidence drop_superseded's
+// re-render branch already trusts to delete files.
+static bool same_lineage(size_t keep, size_t base_len, size_t base_ckpt_len, size_t pin_len) {
+    const size_t frontier = base_ckpt_len > 0 ? base_ckpt_len : base_len;
+    const size_t region = frontier > pin_len ? frontier - pin_len : 0;
+    const size_t slack = std::min(kDeltaLineageSlack, region / 2);
+    return keep + slack >= frontier;
+}
+
 // The file-name prefix of a spill kind: conv- (a whole conversation) or pfx- (a shared
 // prefix). reload_from_disk parses the kind back out of the name; everything else flows from
 // DiskEntry::prefix.
@@ -166,7 +211,7 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
         // on-disk shape between the two modes.
         bool ok = false;
         const size_t superseded = [&] {
-            if (journal_ && !p.prefix)
+            if (!p.prefix && journal_) {
                 if (auto base = find_delta_base(p.image)) {
                     const uint64_t base_serial = entries_[base->index].serial;
                     if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
@@ -174,7 +219,15 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
                         { SavedConversation discard = std::move(p.image); (void) discard; }
                         return drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec, base_serial);
                     }
+                } else {
+                    std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (no base: tokens=%zu "
+                                         "ckpt=%zu)\n",
+                                 p.image.live.ids.size(),
+                                 p.image.checkpoints.empty() ? 0 : p.image.checkpoints.back().ids.size());
                 }
+            } else if (!p.prefix) {
+                std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (journal disabled)\n");
+            }
             const size_t n = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
             ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
             return n;
@@ -210,15 +263,28 @@ void ConversationDiskStore::writer_loop() {
         // Any anomaly falls through to today's full write, whose cleanup replaces the entry.
         bool ok = false;
         size_t superseded = 0;
-        if (journal_ && !p.prefix) {
-            if (auto base = find_delta_base(p.image)) {
-                const uint64_t base_serial = entries_[base->index].serial;   // copied: the cleanup may erase
-                if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
-                    ok = true;
-                    superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec, base_serial);
-                    { SavedConversation discard = std::move(p.image); (void) discard; }
-                }
+        if (p.prefix) {
+            // a prefix snapshot is a shared asset, never a delta candidate
+        } else if (!journal_) {
+            std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (journal disabled)\n");
+        } else if (auto base = find_delta_base(p.image)) {
+            const uint64_t base_serial = entries_[base->index].serial;   // copied: the cleanup may erase
+            if (append_delta(base->index, base->keep_tokens, p.image, p.id)) {
+                ok = true;
+                superseded = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec, base_serial);
+                { SavedConversation discard = std::move(p.image); (void) discard; }
             }
+            // an append anomaly (a journal-size mismatch, a missing stage, a codec refusal —
+            // each logs its own reason inside append_delta) lands here: the full write below
+        } else {
+            // WHY there was no delta — the instrument that separates "the selector found
+            // nothing" from "the codec refused what it found", without dumping .idx files:
+            // the capture's token count and its deepest checkpoint's, the pair the .idx dumps
+            // used to be needed for. One line per park that full-writes; stderr like the rest.
+            std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (no base: tokens=%zu "
+                                 "ckpt=%zu)\n",
+                         p.image.live.ids.size(),
+                         p.image.checkpoints.empty() ? 0 : p.image.checkpoints.back().ids.size());
         }
         if (!ok) {
             // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded
@@ -1518,6 +1584,16 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
 
 std::optional<ConversationDiskStore::DeltaBase> ConversationDiskStore::find_delta_base(
     const SavedConversation& image) const {
+    // The journal's single decision point: with it off nothing appends, here or in the writer
+    // (the writer used to carry this check; hoisting it leaves one place that answers).
+    if (!journal_) return std::nullopt;
+    // The longest pinned shared root on disk (prefix_pin_lengths() without its flush_pending()
+    // — the writer thread must not wait on itself). The region every conversation of this
+    // client shares: a cut at or inside it carries no identity of its own, and every
+    // conversation of the client would match every other through it.
+    size_t pin_len = 0;
+    for (const auto& e : entries_)
+        if (is_prefix_entry(e) && !e.ids.empty()) pin_len = std::max(pin_len, e.ids.size());
     auto ids_prefix = [](const std::vector<int32_t>& cid, const std::vector<int32_t>& full) {
         return !cid.empty() && cid.size() <= full.size() &&
                std::equal(cid.begin(), cid.end(), full.begin());
@@ -1556,6 +1632,25 @@ std::optional<ConversationDiskStore::DeltaBase> ConversationDiskStore::find_delt
             keep = (uint64_t) e.ckpt_ids.size();   // the client re-rendered the history: the turn
                                                    // boundary this entry's deepest checkpoint
                                                    // holds is what the new render still contains
+        } else if (pin_len > 0) {
+            // ── The common-prefix cut: the re-render that diverges BELOW both exact points ──
+            // (the reporting run's every consecutive pair: the cut sits 29 ids below the old
+            // checkpoint, so neither prefix test above can see it). The K/V below the cut is
+            // the base's own by causality, so the codec can chain from any cut — what the
+            // guards decide is identity, not validity. Without a pinned shared root on disk
+            // (pin_len == 0) there is no region every conversation of this client shares, so
+            // the conservative exact rules above stay the only path: today's behavior.
+            const size_t k_ids = ids_common_prefix(e.ids, image.live.ids);
+            const size_t k_ckpt = e.ckpt_ids.empty() ? 0 : ids_common_prefix(e.ckpt_ids, image.live.ids);
+            keep = (uint64_t) std::max(k_ids, k_ckpt);
+            if (keep <= pin_len)
+                keep = 0;   // the cut is inside the shared root: no identity of its own
+            else if (!same_lineage(size_t(keep), e.ids.size(), e.ckpt_ids.size(), pin_len))
+                keep = 0;   // the divergence sits far below the old render's frontier: a
+                            // compaction, a rewind or another conversation — not this one
+            else if (k_ids >= k_ckpt ? !imgs_contained(e.imgs, image.live.imgs)
+                                     : !imgs_contained(e.ckpt_imgs, image.live.imgs))
+                keep = 0;   // the winning cut's own image list must still be contained
         }
         if (keep == 0) continue;
         // The base must carry at least half the new image (the codec's own rule): otherwise the
@@ -1597,7 +1692,16 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
         if (!fs::exists(spath, ec2) || ec2) return false;
     }
     DeltaPlan plan;
-    if (!conversation_delta_plan(plan, image, base_len, keep_tokens)) return false;
+    if (!conversation_delta_plan(plan, image, base_len, keep_tokens)) {
+        // The selector already applies the codec's own guards (the half rule, keep <= base),
+        // so a refusal here means a shape mismatch the selector cannot see (per-layer layout,
+        // pooled bounds) — say which cut was refused, the writer's [delta] skip line pairs
+        // with it to tell "no base" from "base the codec would not take".
+        std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (codec refused; keep=%llu "
+                             "of %llu)\n",
+                     (unsigned long long) keep_tokens, (unsigned long long) base_len);
+        return false;
+    }
     // Make room for the record in the disk budget (put_impl's pattern): the base is marked
     // in use first, so the LRU victim is never it while anything else can go.
     entries_[base_index].used = next_used_++;

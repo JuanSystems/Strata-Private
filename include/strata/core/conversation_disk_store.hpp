@@ -348,11 +348,21 @@ private:
     }
     // ── Delta journal: the writer-side selection and append ──
     // The manifest entry a new image can extend by a delta: same cvec, geometry and layer
-    // carve, not a shared prefix, no stage files (a layer split's spill is written whole),
-    // and holding a prefix of the image's live ids — either its own ids (the conversation
-    // grew) or its deepest checkpoint's (the client re-rendered the history). The candidate
-    // keeping the most tokens wins; the base must carry at least half the new image (the
-    // codec's own rule) or the record would not save a rewrite.
+    // carve (a layer split's stage count and every stage's carve must line up with the
+    // capture's), not a shared prefix, and holding a prefix of the image's live ids. Three
+    // cuts count:
+    //   1. the entry's own ids — the conversation grew on top of the spill;
+    //   2. its deepest checkpoint's — the client re-rendered the history and that turn
+    //      boundary survives verbatim inside the new render;
+    //   3. the LONGEST COMMON PREFIX with either list, when a pinned shared root is on disk
+    //      (pin_len > 0), the cut falls strictly past that root, covers at least half the new
+    //      image, and sits at the old render's frontier (same_lineage: within a slack of the
+    //      old entry's deepest checkpoint, or its ids end when it saved no checkpoint) — the
+    //      measured shape of a same-conversation re-render, whose divergence lands BELOW the
+    //      old checkpoint where neither exact cut can see it. Without a pinned root on disk
+    //      the conservative exact cuts above are the only path.
+    // The candidate keeping the most tokens wins; the base must carry at least half the new
+    // image (the codec's own rule) or the record would not save a rewrite.
     struct DeltaBase {
         size_t index = 0;
         uint64_t keep_tokens = 0;
