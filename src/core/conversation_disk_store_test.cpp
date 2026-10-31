@@ -1233,10 +1233,11 @@ int main() {
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
-    // ── 29. Flag OFF: no journal is ever created; the old rewrite-in-place behaviour. (The
-    // whole suite above runs with the flag off; this asserts the file-level evidence.)
+    // ── 29. Opt-out (STRATA_SPILL_JOURNAL=0): no journal is ever created; the old
+    // rewrite-in-place behaviour. (The default is ON since v2 — the rest of the suite runs
+    // with it — so the escape must be the explicit zero, not the unset env.)
     {
-        junsetenv("STRATA_SPILL_JOURNAL");
+        jsetenv("STRATA_SPILL_JOURNAL", "0");
         const auto rdir = dir / "journal_off";
         ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
         SavedConversation a0 = conv_image(1000, 1);

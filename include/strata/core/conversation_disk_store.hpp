@@ -293,10 +293,12 @@ private:
     bool writer_busy_ = false;                    // writer moved an image out and is writing it
     std::deque<PendingWrite> pending_;
     size_t async_dropped_ = 0;                    // queue-overflowed images (logged)
-    // ── Delta journal (read once in the constructor): 1 = a park that finds a delta base
-    // appends a conv-<serial>.dlt record instead of rewriting the .bin; anything else = the
-    // exact behaviour of the build before the journal existed (A/B safe).
-    bool journal_ = false;
+    // ── Delta journal (read once in the constructor): DEFAULT ON since the v2 multi-image
+    // record — a park that finds a delta base appends a conv-<serial>.dlt record instead of
+    // rewriting the .bin and its stage files. STRATA_SPILL_JOURNAL=0 opts out (the A/B escape
+    // for the pre-journal on-disk shape); the constructor decides, this default only matters
+    // before it runs.
+    bool journal_ = true;
     // Fresh-serial source for the put() collision guard: reloaded spills keep the serials of
     // the runs that wrote them, while the RAM cache's park counter restarts at 1 every engine
     // start — a colliding park must not replace a DIFFERENT conversation's files. Lifted above

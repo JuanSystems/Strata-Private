@@ -262,10 +262,13 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
                                              const SessionFileIdentity* identity)
     : dir_(std::move(dir)), budget_(budget_bytes) {
     if (identity) { identity_ = *identity; identity_bound_ = true; }
-    // The delta journal's flag, read once (A/B safe): 1 = a park that finds a delta base
-    // appends a conv-<serial>.dlt record instead of rewriting the whole .bin; anything else
-    // (unset, 0) = the exact behaviour of the build before the journal existed.
-    if (const char* env = std::getenv("STRATA_SPILL_JOURNAL")) journal_ = std::strcmp(env, "1") == 0;
+    // The delta journal's flag, read once. DEFAULT ON since the v2 multi-image record: one
+    // append per continued turn instead of a full .bin + stage rewrite is strictly better, and
+    // the format is exercised by the whole suite. STRATA_SPILL_JOURNAL=0 is the opt-out (the
+    // A/B escape for a run that must reproduce the pre-journal on-disk shape exactly); any
+    // other value (unset, 1, garbage) leaves the default on.
+    journal_ = true;
+    if (const char* env = std::getenv("STRATA_SPILL_JOURNAL")) journal_ = std::strcmp(env, "0") != 0;
     if (budget_ == 0 || dir_.empty()) { budget_ = 0; return; }
     // Create the spill dir (idempotent). 0700: only the engine user can read parked
     // conversations (they may carry prompt contents).
@@ -279,10 +282,10 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
     }
     fs::permissions(dir_, fs::perms::owner_all, ec);   // best-effort; ignore if unsupported
     if (journal_)
-        std::fprintf(stderr, "strata serve: conversation spill: delta journal ON "
-                             "(STRATA_SPILL_JOURNAL=1): a continued turn appends conv-<serial>.dlt "
-                             "instead of rewriting the .bin and its stage files (compaction at %llu "
-                             "MiB / %u records)\n",
+        std::fprintf(stderr, "strata serve: conversation spill: delta journal ON (default; "
+                             "STRATA_SPILL_JOURNAL=0 disables it): a continued turn appends "
+                             "conv-<serial>.dlt instead of rewriting the .bin and its stage files "
+                             "(compaction at %llu MiB / %u records)\n",
                      (unsigned long long) (kJournalCompactBytes / (1024ull * 1024)),
                      (unsigned) kJournalCompactRecords);
 }
