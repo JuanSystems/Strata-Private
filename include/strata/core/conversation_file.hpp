@@ -185,6 +185,28 @@ std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vecto
 // The same choice without a copy (nullptr for an empty chain).
 const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<ConversationCheckpoint>& chain);
 
+// The checkpoint a SPILL restores as its resume point: the chain's DEEPEST, ignoring `pinned`.
+// The spill's full write stores the WHOLE capture chain (conversation_snapshot_save copies it,
+// session_file_write/put_payload serializes it), and the engine derives its resume after a disk
+// restore from the longest restored checkpoint that prefixes the next prompt (generate.cpp) — a
+// re-rendering client (zoocode/roocode strips the assistant's thinking tokens) needs the
+// turn-boundary checkpoint, which is never the pinned system prompt.  The pinned root is
+// persisted separately as a pfx-<serial>.bin shared-prefix snapshot, so preferring it here
+// (session_deepest_checkpoint's SAVE-command rule) only loses the turn boundary: a delta
+// record replaces the folded chain with the ONE checkpoint it carries, and the resume falls
+// back to the system prompt.  ONE rule shared by the delta codec (records + the .rst sidecar)
+// and the manifest (put/append_delta/take/reload), so best() promises exactly what take()
+// delivers and the superseded/dedupe cleanups keep seeing "the last turn boundary of the
+// client's own render" — an identity a different conversation of the same client never contains.
+// Inline: a pure selection over the chain, and the delta codec's test target links no
+// conversation_file.cpp — an out-of-line definition would break it.
+inline const ConversationCheckpoint* spill_resume_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
+    const ConversationCheckpoint* deepest = nullptr;
+    for (const auto& c : chain)
+        if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+    return deepest;
+}
+
 // What a SAVE copies into RAM besides what the engine already holds, for its RAM preflight.
 struct SessionSaveLive {
     uint64_t state_bytes = 0;   // the live running state (gdn + ple + every owned QSA layer's tail, dead, block_pos)

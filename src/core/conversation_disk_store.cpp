@@ -223,7 +223,8 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
                     std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (no base: tokens=%zu "
                                          "ckpt=%zu)\n",
                                  p.image.live.ids.size(),
-                                 p.image.checkpoints.empty() ? 0 : p.image.checkpoints.back().ids.size());
+                                 p.image.checkpoints.empty()
+                                     ? 0 : spill_resume_checkpoint(p.image.checkpoints)->ids.size());
                 }
             } else if (!p.prefix) {
                 std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (journal disabled)\n");
@@ -284,7 +285,8 @@ void ConversationDiskStore::writer_loop() {
             std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (no base: tokens=%zu "
                                  "ckpt=%zu)\n",
                          p.image.live.ids.size(),
-                         p.image.checkpoints.empty() ? 0 : p.image.checkpoints.back().ids.size());
+                         p.image.checkpoints.empty()
+                             ? 0 : spill_resume_checkpoint(p.image.checkpoints)->ids.size());
         }
         if (!ok) {
             // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded
@@ -460,7 +462,14 @@ namespace {
 
 // Magic + version. Bumping the version invalidates every old .idx (the slow path rewrites them).
 constexpr char kIdxMagic[4] = {'S', 'I', 'D', 'X'};
-constexpr uint32_t kIdxVersion = 4;   // v4: adds the stage count + each stage file's carve
+// v5: the checkpoint ids/imgs the manifest carries changed MEANING — spill_resume_checkpoint's
+// selection (the chain's deepest, the turn boundary) instead of the deepest PINNED one the
+// b4a5e5ef..b132fbcf builds stored. A v4 .idx written by those builds promises the pinned
+// system prompt as the entry's checkpoint; the fixed reader must not trust it (best() would
+// under-report, and the same-client cleanups would mistake the shared root for a turn
+// boundary), so every v4 .idx regenerates through the slow path (parse .bin + fold journal)
+// on the first reload after the upgrade. Self-healing: every put/append/take rewrites it.
+constexpr uint32_t kIdxVersion = 5;
 
 // The (constant) distance between the file clock's epoch and the system clock's, measured
 // ONCE. Deriving it per call sampled two different "now" instants, and the nanosecond
@@ -964,21 +973,24 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
     }
     if (use_serial >= next_fresh_serial_) next_fresh_serial_ = use_serial + 1;
     // Capture the cheap manifest data before we move the image out (kv + checkpoints live on).
-    // We mirror what ConversationCache's best() matches against: the live state and the deepest
-    // checkpoint. session_checkpoints_to_save keeps the deepest one when writing, so the file's
-    // image.checkpoints will hold it (and best() below consults both).
+    // We mirror what the FILE restores and ConversationCache's best() matches against: the live
+    // state and the deepest checkpoint (spill_resume_checkpoint — the turn boundary, the resume
+    // point the engine takes from the restored chain). A full write stores the WHOLE capture
+    // chain (put_payload), and the engine picks the longest restored checkpoint that prefixes
+    // the next prompt, so the deepest is exactly what take() can deliver.
     DiskEntry e;
     e.serial = use_serial;
     e.prefix = prefix;
     e.path = path_for(use_serial, prefix);
     e.ids = image.live.ids;                  // copy: the manifest keeps these in RAM
     e.imgs = image.live.imgs;
-    // Capture the checkpoint the FILE will restore too — session_deepest_checkpoint's selection
-    // (the chain's deepest, or with a pinned shared prefix the deepest PINNED one), the same
-    // rule session_file_write and the delta codec apply. The raw checkpoints.back() can be a
-    // deeper periodic checkpoint than the pinned selection the .bin stores, and the manifest
-    // would then promise best() a longer ckpt match than take() can deliver.
-    if (const ConversationCheckpoint* deepest = session_deepest_checkpoint(image.checkpoints)) {
+    // The checkpoint the FILE will restore as its resume point — spill_resume_checkpoint's
+    // selection (the chain's deepest, ignoring `pinned`), the same rule the delta codec's
+    // records, the .rst sidecar, take()'s manifest correction and the reload path apply. The
+    // pinned system prompt is persisted apart (pfx-*.bin) and must not be promised here:
+    // best() would under-report what the file restores, and the same-client cleanups would
+    // mistake the shared root for this conversation's turn boundary.
+    if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints)) {
         e.ckpt_ids = deepest->ids;
         e.ckpt_imgs = deepest->imgs;
     }
@@ -1225,10 +1237,14 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
         const uint64_t old_bytes = en.file_bytes;
         en.ids = back.live.ids;
         en.imgs = back.live.imgs;
-        if (!back.checkpoints.empty()) {
-            const auto& deepest = back.checkpoints.back();
-            en.ckpt_ids = deepest.ids;
-            en.ckpt_imgs = deepest.imgs;
+        // The manifest must promise what the files just delivered: spill_resume_checkpoint's
+        // selection over the RESTORED chain (a fold leaves the one checkpoint the last record
+        // carried; a bare .bin the whole written chain) — the deepest, the engine's resume
+        // point. checkpoints.back() could be a shallower newcomer while an older periodic
+        // checkpoint is deeper; the shared rule keeps best() and the fold honest the same way.
+        if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(back.checkpoints)) {
+            en.ckpt_ids = deepest->ids;
+            en.ckpt_imgs = deepest->imgs;
         } else {
             en.ckpt_ids.clear();
             en.ckpt_imgs.clear();
@@ -1578,11 +1594,11 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             e.path = bin_path;
             e.ids = image.live.ids;
             e.imgs = image.live.imgs;
-            // Capture the deepest checkpoint too (same as put()).
-            if (!image.checkpoints.empty()) {
-                const auto& deepest = image.checkpoints.back();
-                e.ckpt_ids = deepest.ids;
-                e.ckpt_imgs = deepest.imgs;
+            // Capture the manifest data; the heavy K/V is dropped right after. Same rule as
+            // put(): the spill-resume selection (the deepest checkpoint of the RESTORED chain).
+            if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints)) {
+                e.ckpt_ids = deepest->ids;
+                e.ckpt_imgs = deepest->imgs;
             }
             e.geometry = image.geometry;
             e.layer_lo = image.layer_lo;
@@ -1857,9 +1873,10 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
     // the .rst — the .idx needs no format change).
     base->ids = image.live.ids;
     base->imgs = image.live.imgs;
-    // The same full-write checkpoint selection the record/sidecar stores (see put_impl): the
-    // manifest must not promise a ckpt match the fold cannot deliver.
-    if (const ConversationCheckpoint* deepest = session_deepest_checkpoint(image.checkpoints)) {
+    // The same spill-resume selection the record/sidecar stores (see put_impl): the manifest
+    // must promise exactly the checkpoint the fold delivers — the chain's deepest, ignoring
+    // `pinned` (the turn boundary), never the pinned system prompt.
+    if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints)) {
         base->ckpt_ids = deepest->ids;
         base->ckpt_imgs = deepest->imgs;
     } else {
@@ -2010,10 +2027,10 @@ size_t ConversationDiskStore::drop_superseded_impl(const std::vector<int32_t>& i
         // and .idx — one step after the append. Protected here; every OTHER serial of the same
         // branch (an older base, a pre-journal spill) still goes.
         if (e.serial == protect_serial) { ++i; continue; }
-        // The deepest checkpoint the spill file carries is the one ConversationCache handed to
-        // session_checkpoints_to_save. The manifest only stores the live prefix; if the live
-        // prefix itself is what the new conversation supersedes, drop. (Phase 2: store the
-        // deepest checkpoint's ids/imgs in the manifest too for a more accurate match.)
+        // The deepest checkpoint the spill file carries is the turn boundary the client's own
+        // render left in the chain (spill_resume_checkpoint's selection — a full write stores
+        // the whole capture chain). The manifest stores the live prefix too; if the new
+        // conversation supersedes it, drop.
         if (!e.ids.empty() && held(e.ids, e.imgs)) {
             // Exact match: the new spill is the same conversation. Replace the old file.
             const std::string drop_path = e.path;

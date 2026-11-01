@@ -2112,9 +2112,10 @@ int main() {
               "50: the orphan sidecar and its temp were swept");
     }
 
-    // ── 51. The manifest's checkpoint mirrors the FILE's selection: with a pinned shared
-    // prefix in the chain, the .bin (and every record/sidecar) stores the deepest PINNED
-    // checkpoint — take() must return exactly that one, never the deeper periodic one ─────
+    // ── 51. The manifest's checkpoint mirrors the FILE's selection: spill_resume_checkpoint's
+    // — the chain's DEEPEST checkpoint, ignoring a pinned root (the pinned system prompt is
+    // persisted apart as pfx-*.bin; the turn boundary is the resume point a re-rendering client
+    // needs). take() must return exactly that one, and the manifest must promise the same ───
     {
         const auto rdir = dir / "ckpt_selection";
         jsetenv("STRATA_SPILL_JOURNAL", "1");
@@ -2128,25 +2129,32 @@ int main() {
         img.checkpoints.push_back(pinned);
         img.checkpoints.push_back(deep);
         check(store.put(std::move(img), 870, id), "51: the park lands");
-        // an append extends the journal; its record/sidecar carry the pinned selection too
+        // an append extends the journal; its record/sidecar carry the deepest selection too
         SavedConversation next = conv_grow(conv_image(1024, 1), 24, 2);
         ConversationCheckpoint np = jckpt(pinned_ids, 61);
         np.pinned = true;
         next.checkpoints.push_back(np);
         next.checkpoints.push_back(jckpt(
             std::vector<int32_t>(next.live.ids.begin(), next.live.ids.begin() + 900), 63));
+        // the probe prompt (901 tokens: the turn boundary 900 + one more, so the strict-prefix
+        // match accepts it) is captured BEFORE the put_async moves `next` away
+        const std::vector<int32_t> probe(next.live.ids.begin(), next.live.ids.begin() + 901);
         check(store.put_async(std::move(next), 871, id), "51: the append queues");
         store.flush_pending();
         ConversationCache::Match m;
         m.serial = 870; m.tokens = 1048; m.live = true;
+        // best() must promise the turn boundary (900), never the pinned root (200)
+        const auto match = store.best(probe, {}, false);
+        check(match.tokens == 900 && match.serial == 870,
+              "51: best() promises the deepest checkpoint (the turn boundary)");
         auto back = store.take(m, id);
         check(back.has_value(), "51: take returns the folded image");
-        check(back->checkpoints.size() == 1 && back->checkpoints[0].ids == pinned_ids,
-              "51: the folded chain is the PINNED checkpoint (the file's selection)");
+        check(back->checkpoints.size() == 1 && back->checkpoints[0].ids.size() == 900,
+              "51: the folded chain is the DEEPEST checkpoint (the file's selection)");
         // the manifest's correction kept the same selection (a second take agrees)
         auto back2 = store.take(m, id);
         check(back2.has_value() && back2->checkpoints.size() == 1 &&
-                  back2->checkpoints[0].ids == pinned_ids,
+                  back2->checkpoints[0].ids.size() == 900,
               "51: the manifest's ckpt and the file's agree across takes");
         junsetenv("STRATA_SPILL_JOURNAL");
     }
@@ -2168,6 +2176,197 @@ int main() {
         auto back = store.take(m, id);
         check(back.has_value() && back->live.ids.size() == 1024, "52: the fold still restores");
         junsetenv("STRATA_SPILL_DIAG");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 53. The zoocode/roocode resume regression: a pinned system prompt + turns re-rendered
+    // WITHOUT the assistant's thinking tokens + a restart. The delta record (and the .rst
+    // sidecar, and the manifest) must carry the chain's DEEPEST checkpoint — the turn boundary
+    // the next prompt still contains — or every delta-restored resume falls back to the pinned
+    // root and the engine recomputes the whole history past the system prompt. The engine's
+    // post-restore derivation is replicated here: the live if a strict prefix of the request's
+    // prompt, else the LONGEST restored checkpoint that is (generate.cpp does exactly this).
+    {
+        const auto rdir = dir / "resume_regression";
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        // capture-consistent images with EXPLICIT ids (the re-render model needs its own tokens)
+        auto ids_image = [&](const std::vector<int32_t>& ids, uint8_t seed) {
+            SavedConversation s;
+            for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(200 + i);
+            s.layer_lo = 0; s.layer_hi = 40;
+            s.cvec = false;
+            s.live = jckpt(ids, seed);
+            const size_t tokens = ids.size();
+            const int64_t cells = jcells(tokens);
+            for (int layer = 0; layer < 3; ++layer) {
+                ConversationKv kv;
+                kv.format = 1; kv.cells = cells; kv.heads = JHeads; kv.head_dim = JHeadDim;
+                kv.page_size = JPage;
+                kv.pooled_rows = layer < 2 && tokens > 0 ? (int64_t) tokens / JIdxBlock + 1 : 0;
+                kv.idx_dim = JIdxDim;
+                kv.k = jfill(size_t(cells) * size_t(JHeads * JHeadDim * 2), uint8_t(layer * 10 + seed));
+                kv.v = jfill(size_t(cells) * size_t(JHeads * JHeadDim * 2), uint8_t(layer * 10 + seed + 1));
+                kv.k_scale = layer < 2 ? jfill(size_t(cells) * size_t(JHeads * 2), uint8_t(layer * 10 + seed + 2))
+                                       : ConversationBuffer{};
+                kv.v_scale = layer < 2 ? jfill(size_t(cells) * size_t(JHeads * 2), uint8_t(layer * 10 + seed + 3))
+                                       : ConversationBuffer{};
+                kv.pooled = layer < 2 && tokens > 0
+                                ? jfill(size_t(kv.pooled_rows) * size_t(JIdxDim * 4), uint8_t(layer * 10 + seed + 4))
+                                : ConversationBuffer{};
+                s.kv.push_back(std::move(kv));
+            }
+            return s;
+        };
+        // the engine's resume derivation after a disk restore: the live if a strict prefix of
+        // the prompt, else the longest restored checkpoint that is (generate.cpp's rule — the
+        // turn boundary survives the client stripping the thinking tokens; the live does not)
+        auto engine_resume = [](const SavedConversation& img, const std::vector<int32_t>& prompt) {
+            int64_t resume = 0;
+            if (conversation_prefix(img.live, prompt, {}) > 0) resume = (int64_t) img.live.ids.size();
+            for (const auto& c : img.checkpoints)
+                resume = std::max(resume, conversation_prefix(c, prompt, {}));
+            return resume;
+        };
+        // the conversation: a 400-token pinned system prompt; turn k's prompt P_k, the
+        // assistant's private part a_k (thinking + answer — what the client strips), and
+        // P_{k+1} = P_k + the rendered answer + the next user turn
+        std::vector<int32_t> sys;
+        for (size_t i = 0; i < 400; ++i) sys.push_back(int32_t(3000 + i));
+        std::vector<int32_t> P1 = sys;
+        P1.push_back(3000 + 400); P1.push_back(3000 + 401);                       // +u1 → 402
+        std::vector<int32_t> a1;
+        for (size_t i = 0; i < 300; ++i) a1.push_back(int32_t(9000 + i));         // thinking + answer
+        std::vector<int32_t> P2 = P1;
+        for (size_t i = 0; i < 80; ++i) P2.push_back(int32_t(3100 + i));          // rendered answer
+        for (size_t i = 0; i < 60; ++i) P2.push_back(int32_t(3200 + i));          // +u2 → 542
+        std::vector<int32_t> a2;
+        for (size_t i = 0; i < 200; ++i) a2.push_back(int32_t(9100 + i));
+        std::vector<int32_t> P3 = P2;
+        for (size_t i = 0; i < 60; ++i) P3.push_back(int32_t(3300 + i));          // rendered answer
+        for (size_t i = 0; i < 70; ++i) P3.push_back(int32_t(3400 + i));          // +u3 → 672
+        check(P1.size() == 402 && P2.size() == 542 && P3.size() == 672, "53: the turn model's lengths");
+        auto with_private = [](const std::vector<int32_t>& p, const std::vector<int32_t>& a) {
+            std::vector<int32_t> live = p;
+            live.insert(live.end(), a.begin(), a.end());
+            return live;
+        };
+        // park k's capture: live = P_k + a_k, chain = [the pinned root, T_{k-1}?, T_k]
+        ConversationCheckpoint pin = jckpt(sys, 61);
+        pin.pinned = true;
+        const ConversationCheckpoint T1 = jckpt(P1, 62);
+        const ConversationCheckpoint T2 = jckpt(P2, 63);
+        SavedConversation park1 = ids_image(with_private(P1, a1), 1);
+        park1.checkpoints = {pin, T1};
+        SavedConversation park2 = ids_image(with_private(P2, a2), 2);
+        park2.checkpoints = {pin, T1, T2};   // T1 is still a prefix of the live: the chain keeps it
+
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            // the pinned shared root on disk (what find_delta_base's pin_len and the sibling
+            // matches see) — its live IS its only checkpoint (the prefix shape)
+            SavedConversation pfx = ids_image(sys, 9);
+            pfx.checkpoints = {pin};
+            check(store.put(std::move(pfx), 1, id, {}, true), "53: the pfx entry lands");
+            // park 1 → the base .bin (a FULL write: nothing to extend yet)
+            check(store.put(std::move(park1), 2, id), "53: park 1 lands (full write)");
+            // request 2 restores: the base write carries the whole chain, so the engine finds
+            // T1 — and with the fix best() PROMISES it too (the manifest's ckpt is the deepest)
+            {
+                const auto m = store.best(P2, {}, false);
+                check(m.tokens == 402 && m.serial == 2, "53: request 2: best() promises T1 (402)");
+                auto back = store.take(m, id);
+                check(back.has_value(), "53: request 2: take restores");
+                check(engine_resume(*back, P2) == 402,
+                      "53: request 2: the engine resumes at T1, not the pinned root");
+            }
+            // park 2 → ONE delta record appends onto park 1's base
+            check(store.put_async(std::move(park2), 3, id), "53: park 2 queues");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-2.dlt") && fs::file_size(rdir / "conv-2.dlt") > 0,
+                  "53: park 2 appended a journal record");
+            // request 3 restores through the fold: the record carried T2 (the deepest), so the
+            // resume lands on the previous turn boundary — NOT the 400-token pinned root
+            {
+                const auto m = store.best(P3, {}, false);
+                check(m.tokens == 542 && m.serial == 2, "53: request 3: best() promises T2 (542)");
+                auto back = store.take(m, id);
+                check(back.has_value(), "53: request 3: take restores");
+                check(back->checkpoints.size() == 1 && back->checkpoints[0].ids == T2.ids,
+                      "53: the folded chain carries T2 (the deepest, never the pinned root)");
+                check(engine_resume(*back, P3) == 542,
+                      "53: request 3: the engine resumes at T2, not the pinned root");
+            }
+            // rollback (the documented Option-A limit): a prompt that rewinds PAST the last
+            // turn boundary — T1 (402) WAS captured in park 2's chain, but the record keeps
+            // only the deepest, so the conversation entry no longer matches and the shared
+            // pinned root (the pfx entry) is the floor: one recompute, then the journal
+            // re-learns the new branch's boundaries
+            std::vector<int32_t> rollback = P1;
+            for (size_t i = 0; i < 80; ++i) rollback.push_back(int32_t(3500 + i));   // an EDITED turn
+            for (size_t i = 0; i < 60; ++i) rollback.push_back(int32_t(3600 + i));
+            {
+                const auto m = store.best(rollback, {}, false);
+                check(m.tokens == 400, "53: rollback: the floor is the pinned root (the deepest-only record)");
+                auto back = store.take(m, id);
+                check(back.has_value() && engine_resume(*back, rollback) == 400,
+                      "53: rollback: one recompute from the pinned root (documented Option-A limit)");
+            }
+        }
+        // restart: a fresh store reloads the manifest from disk; the folded entry still
+        // restores T2 for request 3
+        {
+            ConversationDiskStore fresh(rdir.string(), 1ull << 30, &id);
+            check(fresh.reload_from_disk(id) >= 1, "53: the restart reloads the spill files");
+            const auto m = fresh.best(P3, {}, false);
+            check(m.tokens == 542, "53: restart: best() still promises T2");
+            auto back = fresh.take(m, id);
+            check(back.has_value() && engine_resume(*back, P3) == 542,
+                  "53: restart: the engine still resumes at T2");
+            // ── Phase 4, the heal: journals the AFFECTED builds (b4a5e5ef..b132fbcf) wrote
+            // carry only the pinned root in their record/sidecar. Simulate turn 3's park as
+            // one of those builds would have written it (the capture's real chain is
+            // [pin, T3], the record keeps the pin alone), and check the two halves of the
+            // recovery: the manifest is HONEST about the loss (the resume floors at the pin
+            // for one request — a recompute, never a mismatch), and the conversation's NEXT
+            // park appends a record carrying the real turn boundary again — self-healing.
+            std::vector<int32_t> a3;
+            for (size_t i = 0; i < 150; ++i) a3.push_back(int32_t(9200 + i));
+            const std::vector<int32_t> live3 = with_private(P3, a3);
+            SavedConversation park3_buggy = ids_image(live3, 3);
+            park3_buggy.checkpoints = {pin};   // what the affected codec serialized
+            check(fresh.put_async(std::move(park3_buggy), 4, id), "53: the affected-build park queues");
+            fresh.flush_pending();
+            std::vector<int32_t> P4 = P3;
+            for (size_t i = 0; i < 50; ++i) P4.push_back(int32_t(3700 + i));   // rendered answer
+            for (size_t i = 0; i < 60; ++i) P4.push_back(int32_t(3800 + i));    // +u4 → 782
+            {
+                const auto m4 = fresh.best(P4, {}, false);
+                check(m4.tokens == 400,
+                      "53: heal: the affected journal's floor is honest (the pinned root)");
+                auto b4 = fresh.take(m4, id);
+                check(b4.has_value() && engine_resume(*b4, P4) == 400,
+                      "53: heal: ONE recompute from the pin — honest, never a mismatch");
+            }
+            // the fixed build's next park of this conversation: the append re-learns the
+            // turn boundary (T4 = the whole of P4), and request 5 restores at it
+            std::vector<int32_t> a4;
+            for (size_t i = 0; i < 120; ++i) a4.push_back(int32_t(9300 + i));
+            SavedConversation park4 = ids_image(with_private(P4, a4), 4);
+            const ConversationCheckpoint T4 = jckpt(P4, 64);
+            park4.checkpoints = {pin, T4};
+            check(fresh.put_async(std::move(park4), 5, id), "53: the fixed build's park queues");
+            fresh.flush_pending();
+            std::vector<int32_t> P5 = P4;
+            for (size_t i = 0; i < 40; ++i) P5.push_back(int32_t(3900 + i));    // rendered answer
+            for (size_t i = 0; i < 50; ++i) P5.push_back(int32_t(4000 + i));    // +u5 → 872
+            {
+                const auto m5 = fresh.best(P5, {}, false);
+                check(m5.tokens == 782, "53: heal: the next park re-learned T4 (782)");
+                auto b5 = fresh.take(m5, id);
+                check(b5.has_value() && engine_resume(*b5, P5) == 782,
+                      "53: heal: request 5 resumes at the re-learned turn boundary");
+            }
+        }
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 

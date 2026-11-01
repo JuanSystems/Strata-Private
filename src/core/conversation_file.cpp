@@ -1126,7 +1126,10 @@ std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vecto
 const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
     // A pinned shared prefix (pin=N) is the resume point the next queries want, so with one in the chain the file
     // keeps the deepest PINNED checkpoint, not a deeper periodic one a long private suffix made past it.  No pin:
-    // the deepest, as before.
+    // the deepest, as before.  (The SPILL path deliberately does NOT use this rule — it uses
+    // spill_resume_checkpoint, inline in the header: the spill's resume point is the deepest
+    // checkpoint, ignoring the pin, because the pinned root is persisted apart as pfx-*.bin and
+    // the turn boundary is what a re-rendering client's next prompt still contains.)
     const ConversationCheckpoint* deepest = nullptr;
     bool any_pinned = false;
     for (const auto& c : chain) any_pinned = any_pinned || c.pinned;

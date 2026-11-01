@@ -5,6 +5,7 @@
 // atomic publish (temp + rename + directory fsync) — the same discipline the store's .bin and
 // .idx writes already use.
 #include "strata/core/conversation_delta.hpp"
+#include "strata/core/conversation_file.hpp"   // spill_resume_checkpoint (the record's ONE checkpoint)
 
 #include <algorithm>
 #include <cstdio>
@@ -121,23 +122,19 @@ std::vector<uint8_t>* state_of(ConversationCheckpoint& c, size_t i) {
     }
 }
 
-// The checkpoint a record carries: the same ONE the v1 session file stores
-// (session_checkpoints_to_save → session_deepest_checkpoint, conversation_file.cpp) — the
-// chain's deepest, or with a pinned shared prefix in the chain the deepest PINNED one.
-// Serializing the whole capture chain here made every turn's append re-send up to
-// --prompt-cache checkpoints (each with its full running state, once per image section), so
-// the .dlt outgrew the .bin it extends — the opposite of the journal's purpose. One
-// checkpoint per record keeps the invariant exact and cheap: fold(base + records) == a full
-// write of the newest park, and the apply's replace semantics (img.checkpoints =
-// sec.checkpoints) lands the folded image on exactly that chain.
+// The checkpoint a record carries: spill_resume_checkpoint's selection — the chain's DEEPEST,
+// ignoring `pinned`. Serializing the whole capture chain here made every turn's append re-send
+// up to --prompt-cache checkpoints (each with its full running state, once per image section),
+// so the .dlt outgrew the .bin it extends — the opposite of the journal's purpose. One
+// checkpoint per record keeps that cheap: fold(base + records) == a full write of the newest
+// park MINUS the checkpoints the record does not carry, and the apply's replace semantics
+// (img.checkpoints = sec.checkpoints) lands the folded image on exactly that chain — so the
+// ONE checkpoint must be the resume point the engine needs: the deepest (the turn boundary a
+// re-rendering client still contains), never the pinned system prompt (that one lives in the
+// pfx-<serial>.bin shared-prefix snapshot, and preferring it here folded the turn boundary
+// away and dropped every delta-restored resume back to the system prompt).
 const ConversationCheckpoint* record_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
-    const ConversationCheckpoint* deepest = nullptr;
-    bool any_pinned = false;
-    for (const auto& c : chain) any_pinned = any_pinned || c.pinned;
-    for (const auto& c : chain)
-        if ((!any_pinned || c.pinned) && (!deepest || c.ids.size() > deepest->ids.size()))
-            deepest = &c;
-    return deepest;
+    return spill_resume_checkpoint(chain);
 }
 
 // The image list a record covers: the main first, then its stage images in order.

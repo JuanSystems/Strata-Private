@@ -58,9 +58,13 @@
 //   u64 ckpt_tokens_i                          this image's deepest checkpoint after applying
 //   u64 state_bytes_i[5]                       this image's live running state sizes
 //   u8[state_bytes_i[0..4]]                    this image's live running state, complete
-//   u32 n_checkpoints_i (0 or 1: the ONE checkpoint a full write of the same park would
-//       store — the chain's deepest, or with a pinned shared prefix the deepest pinned one;
-//       readers accept any count, records written by older builds may carry more) + per
+//   u32 n_checkpoints_i (0 or 1: the ONE checkpoint the record keeps — spill_resume_checkpoint's
+//       selection, the chain's DEEPEST, ignoring `pinned`: the turn boundary a re-rendering
+//       client (zoocode/roocode) still contains, which is the resume point the engine's
+//       post-restore pass takes; the pinned system prompt is persisted apart as a
+//       pfx-<serial>.bin shared-prefix snapshot and must not steal the slot, or the fold
+//       replaces the chain with it and every delta-restored resume falls to the system
+//       prompt. Readers accept any count, records written by older builds may carry more) + per
 //       checkpoint: u64 n_ids; i32 x n_ids; u64 n_cimgs; (i64,u64) x
 //       n_cimgs; u64 sz[5]; u8 x sz[0..4]; u64 used
 //   v3:
@@ -78,7 +82,8 @@
 //   per image:
 //   u64 geometry_hash                  this image's own echo (misalignment reject)
 //   u64 state_sz[5] + the 5 live state byte arrays (gdn, ple, tails, dead, block_pos)
-//   u32 n_ckpt (0 or 1) and, if 1, the full-write checkpoint selection:
+//   u32 n_ckpt (0 or 1) and, if 1, spill_resume_checkpoint's selection (the chain's deepest,
+//       ignoring `pinned` — the same ONE checkpoint the record carries):
 //       u64 n_ids; i32 x n_ids; u64 n_cimgs; (i64,u64) x n_cimgs;
 //       u64 sz[5]; u8 x sz[0..4]; u64 used
 //   trailer: u64 fnv (everything above); u64 total_bytes; u8[4] "ERST"               (20 B)
