@@ -303,6 +303,17 @@ private:
     // for the pre-journal on-disk shape); the constructor decides, this default only matters
     // before it runs.
     bool journal_ = true;
+    // ── v3 journal records (read once in the constructor, DEFAULT ON): the record carries only
+    // the tables and the new K/V, and the running state + checkpoint of every image live in ONE
+    // sidecar, conv-<serial>.rst, replaced atomically by every append — the record stops being
+    // O(model state) per turn and the writer's O(state) front-buffer peak disappears.
+    // STRATA_SPILL_JOURNAL_V3=0 writes v2 records (the escape hatch; the .rst of an entry it
+    // appends to is removed, and the fold falls back to the state inside the records).
+    bool journal_v3_ = true;
+    // ── Per-record diagnostics (read once in the constructor): STRATA_SPILL_DIAG=1 logs the
+    // [delta/diag] line after every successful plan — where the record's bytes are (live state,
+    // checkpoint, K/V sent vs expected). The Phase 0 instrument; off by default.
+    bool diag_ = false;
     // Fresh-serial source for the put() collision guard: reloaded spills keep the serials of
     // the runs that wrote them, while the RAM cache's park counter restarts at 1 every engine
     // start — a colliding park must not replace a DIFFERENT conversation's files. Lifted above
@@ -383,6 +394,14 @@ private:
     std::string path_for(uint64_t serial, bool prefix = false) const;
     // <dir>/conv-<serial>.dlt — a conversation's delta journal (never a prefix snapshot's).
     std::string path_for_dlt(uint64_t serial, bool prefix = false) const;
+    // <dir>/conv-<serial>.rst — the v3 journal's state sidecar: the live running state and
+    // the checkpoint of every image (main + stages) of the LAST appended record, replaced
+    // atomically (temp + rename) by every append. Only conversations keep one (a prefix
+    // snapshot is never a delta base), so the kind is fixed here.
+    std::string path_for_rst(uint64_t serial) const;
+    // The .rst's on-disk size (0 when absent; a stat error reads as 0, never throws) — the
+    // budget accounting needs it before and after an append, whose net cost is the difference.
+    uint64_t rst_file_bytes(uint64_t serial) const;
     // A layer split's spill: one extra self-contained session file per later stage
     // (conv-<serial>.stage<k>.bin; a shared-prefix snapshot's is pfx-<serial>.stage<k>.bin),
     // written by put() BEFORE the main .bin (the main is the commit point of the put) and

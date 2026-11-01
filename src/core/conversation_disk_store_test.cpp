@@ -1844,6 +1844,333 @@ int main() {
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
+    // ── 44. The v3 sidecar end-to-end: every append publishes conv-<serial>.rst, take() folds
+    // through it, and the budget's accounting stays EXACTLY the sum of the files on disk
+    // (main + stages + journal + sidecar) across appends, take, the fast (.idx) reload, the
+    // slow (no .idx) reload and an eviction.
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_v3";
+        // what the store counts: every conv-*/pfx-* file except the .idx metadata
+        auto disk_bytes = [] (const fs::path& d) {
+            uint64_t n = 0;
+            std::error_code ec;
+            for (const auto& f : fs::directory_iterator(d, ec)) {
+                if (ec) break;
+                const std::string name = f.path().filename().string();
+                if (name.rfind("conv-", 0) != 0 && name.rfind("pfx-", 0) != 0) continue;
+                if (name.size() > 4 && name.compare(name.size() - 4, 4, ".idx") == 0) continue;
+                if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) continue;
+                n += (uint64_t) fs::file_size(f, ec);
+            }
+            return n;
+        };
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            SavedConversation a0 = conv_image(1000, 1);
+            SavedConversation a1 = conv_grow(a0, 24, 2);
+            SavedConversation a2 = conv_grow(a1, 24, 3);
+            SavedConversation a3 = conv_grow(a2, 24, 4);
+            check(store.put(std::move(a0), 800, id), "44: the base park");
+            check(!fs::exists(rdir / "conv-800.rst"), "44: no sidecar before any append");
+            check(store.put_async(std::move(a1), 801, id), "44: append 1 queued");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-800.rst"), "44: append 1 published the sidecar");
+            check(store.put_async(std::move(a2), 802, id), "44: append 2 queued");
+            store.flush_pending();
+            check(store.put_async(std::move(a3), 803, id), "44: append 3 queued");
+            store.flush_pending();
+            check(store.bytes() == disk_bytes(rdir), "44: accounting == disk after 3 appends");
+            ConversationCache::Match m;
+            m.serial = 800; m.tokens = 1072; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value(), "44: take folds base + 3 v3 records + sidecar");
+            check(same_conv(*back, conv_grow(conv_grow(conv_grow(conv_image(1000, 1), 24, 2), 24, 3), 24, 4)),
+                  "44: the folded image is turn 3's, byte-exactly");
+            check(store.bytes() == disk_bytes(rdir), "44: accounting == disk after take");
+        }
+        // fast path: the .idx carries it (the .rst's bytes ride inside file_bytes)
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 1, "44: fast-path reload loads the entry");
+            check(store.bytes() == disk_bytes(rdir), "44: accounting == disk after the fast reload");
+            ConversationCache::Match m;
+            m.serial = 800; m.tokens = 1072; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && back->live.ids.size() == 1072, "44: the fast path restores");
+        }
+        // slow path: no .idx — the fold rebuilds the manifest from .bin + .dlt + .rst
+        {
+            fs::remove(rdir / "conv-800.idx");
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 1, "44: slow-path reload loads the entry");
+            check(store.bytes() == disk_bytes(rdir), "44: accounting == disk after the slow reload");
+            ConversationCache::Match m;
+            m.serial = 800; m.tokens = 1072; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && same_conv(*back, conv_grow(conv_grow(conv_grow(conv_image(1000, 1), 24, 2), 24, 3), 24, 4)),
+                  "44: the slow path restores turn 3 byte-exactly");
+        }
+        // eviction: the whole spill goes, sidecar included
+        {
+            ConversationDiskStore store(rdir.string(), 1, &id);   // a 1-byte budget evicts on load
+            store.reload_from_disk(id);
+            check(store.size() == 0, "44: the tight budget evicted the entry");
+            check(!fs::exists(rdir / "conv-800.bin") && !fs::exists(rdir / "conv-800.dlt") &&
+                  !fs::exists(rdir / "conv-800.rst") && !fs::exists(rdir / "conv-800.idx"),
+                  "44: the eviction removed .bin, .dlt, .rst and .idx");
+            check(store.bytes() == disk_bytes(rdir), "44: accounting == disk after the eviction");
+        }
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 45. STRATA_SPILL_JOURNAL_V3=0 (the escape hatch): a reloaded store with v3 OFF
+    // appends v2 records after the v3 ones; the sidecar STAYS (the earlier records chain
+    // through it) and the fold lands the newest state ─────────────────────────────────────
+    {
+        const auto rdir = dir / "journal_v3_off";
+        {
+            jsetenv("STRATA_SPILL_JOURNAL", "1");
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.put(conv_image(1000, 1), 810, id), "45: the base park");
+            check(store.put_async(conv_grow(conv_image(1000, 1), 24, 2), 811, id), "45: v3 append 1");
+            store.flush_pending();
+            check(store.put_async(conv_grow(conv_grow(conv_image(1000, 1), 24, 2), 24, 3), 812, id),
+                  "45: v3 append 2");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-810.rst"), "45: the sidecar is live");
+            junsetenv("STRATA_SPILL_JOURNAL");
+        }
+        {
+            jsetenv("STRATA_SPILL_JOURNAL", "1");
+            jsetenv("STRATA_SPILL_JOURNAL_V3", "0");
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 1, "45: reload with v3 off");
+            // a v2 record lands after the v3 pair; the sidecar survives it
+            check(store.put_async(conv_grow(conv_grow(conv_grow(conv_image(1000, 1), 24, 2), 24, 3), 24, 4), 813, id),
+                  "45: v2 append 3 queued");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-810.rst"),
+                  "45: the v2 append KEPT the sidecar (the v3 records still chain through it)");
+            ConversationCache::Match m;
+            m.serial = 810; m.tokens = 1072; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && back->live.ids.size() == 1072,
+                  "45: the mixed v3,v3,v2 journal folds to turn 3");
+            junsetenv("STRATA_SPILL_JOURNAL_V3");
+            junsetenv("STRATA_SPILL_JOURNAL");
+        }
+    }
+
+    // ── 46. A failed sidecar write rolls the record back: a directory squatting on
+    // conv-<serial>.rst.tmp makes state_write fail; the journal returns to the size the
+    // entry remembers (here: never existed), and the park falls back to the full write ─────
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "journal_rst_fail";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        check(store.put(conv_image(1000, 1), 820, id), "46: the base park");
+        // the blocker: the .rst temp name is taken by a directory
+        fs::create_directories(rdir / "conv-820.rst.tmp");
+        check(store.put_async(conv_grow(conv_image(1000, 1), 24, 2), 821, id),
+              "46: the park is queued");
+        store.flush_pending();
+        check(!fs::exists(rdir / "conv-820.dlt"),
+              "46: the rolled-back journal is gone (it never existed before the append)");
+        check(!fs::exists(rdir / "conv-820.rst"), "46: no sidecar was published");
+        fs::remove_all(rdir / "conv-820.rst.tmp");
+        // the fallback full write replaced the entry: the new serial's .bin carries turn 1
+        check(fs::exists(rdir / "conv-821.bin"), "46: the full write landed under the park's serial");
+        check(!fs::exists(rdir / "conv-820.bin"),
+              "46: the old base went with the entry the full write replaced");
+        ConversationCache::Match m;
+        m.serial = 821; m.tokens = 1024; m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value() && back->live.ids.size() == 1024,
+              "46: the full write's image restores (the fallback)");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 47. purge_on_startup sweeps the v3 sidecar and its temp too ──────────────────────
+    {
+        const auto rdir = dir / "purge_rst";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        check(store.put(conv_image(1000, 1), 830, id), "47: the base park");
+        check(store.put_async(conv_grow(conv_image(1000, 1), 24, 2), 831, id), "47: an append");
+        store.flush_pending();
+        junsetenv("STRATA_SPILL_JOURNAL");
+        check(fs::exists(rdir / "conv-830.rst"), "47: the sidecar exists");
+        { std::FILE* f = std::fopen((rdir / "conv-830.rst.tmp").c_str(), "wb"); std::fputs("x", f); std::fclose(f); }
+        { std::FILE* f = std::fopen((rdir / "keep-rst.txt").c_str(), "wb"); std::fputs("keep", f); std::fclose(f); }
+        store.purge_on_startup();
+        check(!fs::exists(rdir / "conv-830.bin") && !fs::exists(rdir / "conv-830.dlt") &&
+              !fs::exists(rdir / "conv-830.rst") && !fs::exists(rdir / "conv-830.rst.tmp"),
+              "47: the purge removed .bin, .dlt, .rst and .rst.tmp");
+        check(fs::exists(rdir / "keep-rst.txt"), "47: unrelated files stay");
+    }
+
+    // ── 48. Serial collision + layer split (the use_serial fix): a DIFFERENT conversation
+    // colliding with a held serial writes under a fresh serial — its stage files land beside
+    // THEIR main (conv-<fresh>.stage0.bin), and take() finds them through the entry's serial
+    {
+        const auto rdir = dir / "collision_stages";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        check(store.put(conv_image(1000, 1), 840, id), "48: conversation A parks at serial 840");
+        // conversation B: same serial (the cache counter restarted), a layer split, and
+        // different ids (NOT a branch of A) — the collision guard must move it to a fresh serial
+        SavedConversation b = conv_stage_of(1000, 5);
+        const int32_t shift = 500000;
+        for (auto& t : b.live.ids) t += shift;
+        for (auto& c : b.checkpoints) for (auto& t : c.ids) t += shift;
+        for (auto& st : b.stage_images) {
+            for (auto& t : st.live.ids) t += shift;
+            for (auto& c : st.checkpoints) for (auto& t : c.ids) t += shift;
+        }
+        check(store.put(std::move(b), 840, id), "48: conversation B parks under the colliding serial");
+        check(fs::exists(rdir / "conv-841.bin"), "48: B's main landed under the fresh serial 841");
+        check(fs::exists(rdir / "conv-841.stage0.bin"),
+              "48: B's stage landed under the FRESH serial (not beside A's)");
+        check(store.size() == 2, "48: both conversations are held");
+        // B restores WITH its stage
+        ConversationCache::Match mb;
+        mb.serial = 841; mb.tokens = 1000; mb.live = true;
+        auto back_b = store.take(mb, id);
+        check(back_b.has_value(), "48: take() finds B through the fresh serial");
+        check(back_b->stage_images.size() == 1 &&
+                  back_b->stage_images[0].layer_lo == 40 && back_b->stage_images[0].layer_hi == 48,
+              "48: B's stage image restored (the use_serial fix)");
+        // and A is untouched
+        ConversationCache::Match ma;
+        ma.serial = 840; ma.tokens = 1000; ma.live = true;
+        auto back_a = store.take(ma, id);
+        check(back_a.has_value() && back_a->stage_images.empty(),
+              "48: A restores alone, as parked");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 49. Mid-journal corruption with a sidecar: take() fails (the fold is failed), the
+    // entry leaves the manifest and EVERY file stays on disk; a reload without the .idx
+    // skips the entry the same way, keeping the files ─────────────────────────────────────
+    {
+        const auto rdir = dir / "journal_midcorrupt";
+        {
+            jsetenv("STRATA_SPILL_JOURNAL", "1");
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.put(conv_image(1000, 1), 850, id), "49: the base park");
+            check(store.put_async(conv_grow(conv_image(1000, 1), 24, 2), 851, id), "49: append 1");
+            store.flush_pending();
+            check(store.put_async(conv_grow(conv_grow(conv_image(1000, 1), 24, 2), 24, 3), 852, id),
+                  "49: append 2");
+            store.flush_pending();
+            check(store.put_async(conv_grow(conv_grow(conv_grow(conv_image(1000, 1), 24, 2), 24, 3), 24, 4), 853, id),
+                  "49: append 3");
+            store.flush_pending();
+            // corrupt the LAST record's payload (80 bytes before the trailer, inside it)
+            {
+                const uint64_t size = fs::file_size(rdir / "conv-850.dlt");
+                std::FILE* f = std::fopen((rdir / "conv-850.dlt").c_str(), "r+b");
+                std::fseek(f, (long) (size - 100), SEEK_SET);
+                const int c = std::fgetc(f);
+                std::fseek(f, (long) (size - 100), SEEK_SET);
+                std::fputc(c ^ 0xff, f);
+                std::fclose(f);
+            }
+            ConversationCache::Match m;
+            m.serial = 850; m.tokens = 1072; m.live = true;
+            auto back = store.take(m, id);
+            check(!back.has_value(), "49: the take fails (the fold is failed)");
+            check(store.size() == 0, "49: the entry left the manifest");
+            check(fs::exists(rdir / "conv-850.bin") && fs::exists(rdir / "conv-850.dlt") &&
+                  fs::exists(rdir / "conv-850.rst"),
+                  "49: every file KEPT on disk (suspect, not garbage)");
+            junsetenv("STRATA_SPILL_JOURNAL");
+        }
+        // a reload without the .idx: the slow path skips the entry, files still kept (H6)
+        {
+            fs::remove(rdir / "conv-850.idx");
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = store.reload_from_disk(id);
+            check(loaded == 0 && store.size() == 0, "49: the slow-path reload skipped the entry");
+            check(fs::exists(rdir / "conv-850.bin") && fs::exists(rdir / "conv-850.dlt") &&
+                  fs::exists(rdir / "conv-850.rst"),
+                  "49: the reload kept every file (H6: no manifest data from a failed fold)");
+        }
+    }
+
+    // ── 50. Orphan v3 files: a .rst (and .rst.tmp) whose main .bin is gone is swept by the
+    // reload scan ─────────────────────────────────────────────────────────────────────────
+    {
+        const auto rdir = dir / "orphan_rst";
+        fs::create_directories(rdir);
+        { std::FILE* f = std::fopen((rdir / "conv-860.rst").c_str(), "wb"); std::fputs("SRST", f); std::fclose(f); }
+        { std::FILE* f = std::fopen((rdir / "conv-860.rst.tmp").c_str(), "wb"); std::fputs("x", f); std::fclose(f); }
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        store.reload_from_disk(id);
+        check(!fs::exists(rdir / "conv-860.rst") && !fs::exists(rdir / "conv-860.rst.tmp"),
+              "50: the orphan sidecar and its temp were swept");
+    }
+
+    // ── 51. The manifest's checkpoint mirrors the FILE's selection: with a pinned shared
+    // prefix in the chain, the .bin (and every record/sidecar) stores the deepest PINNED
+    // checkpoint — take() must return exactly that one, never the deeper periodic one ─────
+    {
+        const auto rdir = dir / "ckpt_selection";
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation img = conv_image(1024, 1);
+        const std::vector<int32_t> pinned_ids(img.live.ids.begin(), img.live.ids.begin() + 200);
+        ConversationCheckpoint pinned = jckpt(pinned_ids, 61);
+        pinned.pinned = true;
+        ConversationCheckpoint deep = jckpt(
+            std::vector<int32_t>(img.live.ids.begin(), img.live.ids.begin() + 900), 62);
+        img.checkpoints.push_back(pinned);
+        img.checkpoints.push_back(deep);
+        check(store.put(std::move(img), 870, id), "51: the park lands");
+        // an append extends the journal; its record/sidecar carry the pinned selection too
+        SavedConversation next = conv_grow(conv_image(1024, 1), 24, 2);
+        ConversationCheckpoint np = jckpt(pinned_ids, 61);
+        np.pinned = true;
+        next.checkpoints.push_back(np);
+        next.checkpoints.push_back(jckpt(
+            std::vector<int32_t>(next.live.ids.begin(), next.live.ids.begin() + 900), 63));
+        check(store.put_async(std::move(next), 871, id), "51: the append queues");
+        store.flush_pending();
+        ConversationCache::Match m;
+        m.serial = 870; m.tokens = 1048; m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value(), "51: take returns the folded image");
+        check(back->checkpoints.size() == 1 && back->checkpoints[0].ids == pinned_ids,
+              "51: the folded chain is the PINNED checkpoint (the file's selection)");
+        // the manifest's correction kept the same selection (a second take agrees)
+        auto back2 = store.take(m, id);
+        check(back2.has_value() && back2->checkpoints.size() == 1 &&
+                  back2->checkpoints[0].ids == pinned_ids,
+              "51: the manifest's ckpt and the file's agree across takes");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 52. STRATA_SPILL_DIAG=1: the [delta/diag] breakdown line goes to stderr and the
+    // append itself still lands (Phase 0's instrument is inert without the flag) ──────────
+    {
+        const auto rdir = dir / "diag";
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        jsetenv("STRATA_SPILL_DIAG", "1");
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        check(store.put(conv_image(1000, 1), 880, id), "52: the base park");
+        check(store.put_async(conv_grow(conv_image(1000, 1), 24, 2), 881, id), "52: the append queues");
+        store.flush_pending();
+        check(fs::exists(rdir / "conv-880.dlt") && fs::exists(rdir / "conv-880.rst"),
+              "52: with diag ON the append (record + sidecar) still lands");
+        ConversationCache::Match m;
+        m.serial = 880; m.tokens = 1024; m.live = true;
+        auto back = store.take(m, id);
+        check(back.has_value() && back->live.ids.size() == 1024, "52: the fold still restores");
+        junsetenv("STRATA_SPILL_DIAG");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_store_test: %d checks passed\n", checks);
     return 0;

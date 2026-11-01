@@ -1,20 +1,28 @@
 // Delta journal codec implementation. See include/strata/core/conversation_delta.hpp for the
-// record layout and the invariants. Pure host code: no CUDA, no filesystem beyond one file.
-// The reader never seeks beyond the two portable ones (end, to size the file, and back to 0):
-// records are applied strictly front-to-back with sequential reads.
+// record layout and the invariants. Pure host code: no CUDA. The reader never seeks beyond the
+// two portable ones (end, to size the file, and back to 0): records are applied strictly
+// front-to-back with sequential reads. The one filesystem dependency is the v3 state sidecar's
+// atomic publish (temp + rename + directory fsync) — the same discipline the store's .bin and
+// .idx writes already use.
 #include "strata/core/conversation_delta.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <system_error>
 #include <utility>
 
 #if !defined(_WIN32)
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
+#include <filesystem>
+
 namespace strata::core {
+namespace fs = std::filesystem;
+
 namespace {
 
 // ── little-endian scalar codec (the same style as the .idx sidecar's) ──────────────────────
@@ -65,11 +73,13 @@ inline uint64_t fnv_update(uint64_t h, const void* data, size_t n) {
 inline uint64_t fnv_begin() { return 1469598103934665603ull; }
 
 constexpr size_t kHeaderBytes = 129;   // the fixed header, header only (v2: n_images + sections_bytes)
-constexpr size_t kTrailerBytes = 20;   // hash + record_bytes + "EDLT"
+constexpr size_t kTrailerBytes = 20;   // hash + record_bytes + "EDLT" (the .rst uses the same)
 constexpr size_t kLayerHeaderBytes = 7 * 8;
 constexpr size_t kPartTableBytesPerLayer = 5 * 16;
-constexpr size_t kSectionFixedBytes = 4 + 8 + 8 + 40;   // n_layers + geometry + ckpt + state_bytes[5]
-constexpr uint32_t kMaxImages = 64;                     // a sane layer-split bound (63 later stages)
+constexpr size_t kSectionFixedBytes = 4 + 8 + 8 + 40;       // v2: n_layers + geometry + ckpt + state_bytes[5]
+constexpr size_t kSectionFixedBytesV3 = 4 + 8;              // v3: n_layers + geometry (state in the .rst)
+constexpr size_t kStateHeaderBytes = 32;                    // "SRST" + version + seq + hash + n_images + rsv
+constexpr uint32_t kMaxImages = 64;                         // a sane layer-split bound (63 later stages)
 
 // One image's 5 K/V parts. The mutable overload is the apply side's writer.
 const ConversationBuffer* part_of(const ConversationKv& kv, size_t part) {
@@ -165,8 +175,9 @@ void put_shared_region(std::vector<uint8_t>& b, const SavedConversation& image, 
     }
 }
 
-// One checkpoint block (the same layout the v1 small region used).
-void put_checkpoint(std::vector<uint8_t>& b, const ConversationCheckpoint& c) {
+// One checkpoint's identity head (ids + imgs, no state): the .rst writes it, then streams the
+// state arrays after it — the record path reuses it through put_checkpoint.
+void put_checkpoint_head(std::vector<uint8_t>& b, const ConversationCheckpoint& c) {
     put_u64(b, c.ids.size());
     for (int32_t v : c.ids) put_u32(b, uint32_t(v));
     put_u64(b, c.imgs.size());
@@ -174,6 +185,12 @@ void put_checkpoint(std::vector<uint8_t>& b, const ConversationCheckpoint& c) {
         put_i64(b, k.start);
         put_u64(b, k.hash);
     }
+}
+
+// One checkpoint block complete (the same layout the v1 small region used): head + the five
+// state arrays (size + bytes each) + used.
+void put_checkpoint(std::vector<uint8_t>& b, const ConversationCheckpoint& c) {
+    put_checkpoint_head(b, c);
     for (size_t i = 0; i < 5; ++i) {
         const auto& s = *state_of(c, i);
         put_u64(b, s.size());
@@ -182,34 +199,17 @@ void put_checkpoint(std::vector<uint8_t>& b, const ConversationCheckpoint& c) {
     put_u64(b, c.used);
 }
 
-// One section's front matter (everything but its K/V payload): state + the record's ONE
-// checkpoint + table.
-uint64_t section_front_bytes(const SavedConversation& img) {
-    uint64_t n = kSectionFixedBytes;
-    for (size_t i = 0; i < 5; ++i) n += state_of(img.live, i)->size();
-    n += 4;
-    if (const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints)) {
-        n += 8 + sel->ids.size() * sizeof(int32_t) + 8 + sel->imgs.size() * 16 + 40;
-        for (size_t i = 0; i < 5; ++i) n += state_of(*sel, i)->size();
-        n += 8;
-    }
-    n += img.kv.size() * (kLayerHeaderBytes + kPartTableBytesPerLayer);
-    return n;
+// The exact byte size of put_checkpoint's block (put_u64 sizes are 8 B each: 5 array sizes +
+// used, plus the head's own counts).
+uint64_t checkpoint_bytes(const ConversationCheckpoint& c) {
+    uint64_t n = 8 + c.ids.size() * sizeof(int32_t) + 8 + c.imgs.size() * 16 + 40;
+    for (size_t i = 0; i < 5; ++i) n += state_of(c, i)->size();
+    return n + 8;
 }
 
-void put_section_front(std::vector<uint8_t>& b, const SavedConversation& img, uint64_t geometry_hash,
-                       const DeltaImagePlan& plan) {
-    const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints);
-    put_u32(b, uint32_t(img.kv.size()));
-    put_u64(b, geometry_hash);
-    put_u64(b, sel ? (uint64_t) sel->ids.size() : 0);
-    for (size_t i = 0; i < 5; ++i) put_u64(b, state_of(img.live, i)->size());
-    for (size_t i = 0; i < 5; ++i) {
-        const auto& s = *state_of(img.live, i);
-        b.insert(b.end(), s.begin(), s.end());
-    }
-    put_u32(b, sel ? 1u : 0u);   // the record's ONE checkpoint: the full-write selection
-    if (sel) put_checkpoint(b, *sel);
+// The K/V layer headers + the parts table every section carries, both versions (the apply side
+// sizes the record from them alone; the state never enters the table).
+void put_layer_tables(std::vector<uint8_t>& b, const SavedConversation& img, const DeltaImagePlan& plan) {
     for (const auto& kv : img.kv) {
         put_i64(b, kv.format); put_i64(b, kv.cells); put_i64(b, kv.heads);
         put_i64(b, kv.head_dim); put_i64(b, kv.page_size);
@@ -220,6 +220,38 @@ void put_section_front(std::vector<uint8_t>& b, const SavedConversation& img, ui
             put_u64(b, part.at);
             put_u64(b, part.n);
         }
+}
+
+// One section's front matter: v2 adds the live state + the record's ONE checkpoint; v3 carries
+// only the fixed fields + the layer tables (the state lives in the .rst sidecar).
+uint64_t section_front_bytes(const SavedConversation& img, bool v3) {
+    uint64_t n = v3 ? kSectionFixedBytesV3 : kSectionFixedBytes;
+    if (!v3) {
+        for (size_t i = 0; i < 5; ++i) n += state_of(img.live, i)->size();
+        n += 4;
+        if (const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints))
+            n += checkpoint_bytes(*sel);
+    }
+    n += img.kv.size() * (kLayerHeaderBytes + kPartTableBytesPerLayer);
+    return n;
+}
+
+void put_section_front(std::vector<uint8_t>& b, const SavedConversation& img, uint64_t geometry_hash,
+                       const DeltaImagePlan& plan, bool v3) {
+    put_u32(b, uint32_t(img.kv.size()));
+    put_u64(b, geometry_hash);
+    if (!v3) {
+        const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints);
+        put_u64(b, sel ? (uint64_t) sel->ids.size() : 0);
+        for (size_t i = 0; i < 5; ++i) put_u64(b, state_of(img.live, i)->size());
+        for (size_t i = 0; i < 5; ++i) {
+            const auto& s = *state_of(img.live, i);
+            b.insert(b.end(), s.begin(), s.end());
+        }
+        put_u32(b, sel ? 1u : 0u);   // the record's ONE checkpoint: the full-write selection
+        if (sel) put_checkpoint(b, *sel);
+    }
+    put_layer_tables(b, img, plan);
 }
 
 // A parsed section (the apply side). Every count is bounded against the front buffer's own
@@ -262,12 +294,11 @@ bool parse_shared_region(const uint8_t* p, size_t n, uint64_t keep_tokens, uint6
     return at == n;
 }
 
-// Parse one section starting at the cursor `at` (updated past what it consumed). Every count
-// is bounded against the buffer's own size, so no vector can exceed the record's bytes.
-bool parse_section_at(const uint8_t* p, size_t n, size_t& at, ParsedSection& out) {
-    uint32_t n_layers = 0;
-    if (!get_u32(p, n, at, n_layers) || n_layers == 0 || n_layers > (1u << 12)) return false;
-    if (!get_u64(p, n, at, out.geometry_hash) || !get_u64(p, n, at, out.ckpt_tokens)) return false;
+// The v2 section's state + checkpoint block (everything between geometry_hash and the layer
+// headers). Extracted from parse_section_at verbatim so the v3 parser can skip it; the cursor
+// contract and every bound are the original ones.
+bool parse_state_and_checkpoints(const uint8_t* p, size_t n, size_t& at, ParsedSection& out) {
+    if (!get_u64(p, n, at, out.ckpt_tokens)) return false;
     // the five state arrays are laid out sizes-first (the writer's put_section_front): 5 u64
     // sizes, then the 5 byte arrays back to back
     uint64_t state_sz[5] = {};
@@ -308,6 +339,17 @@ bool parse_section_at(const uint8_t* p, size_t n, size_t& at, ParsedSection& out
         }
         if (!get_u64(p, n, at, k.used)) return false;
     }
+    return true;
+}
+
+// Parse one section starting at the cursor `at` (updated past what it consumed). Every count
+// is bounded against the buffer's own size, so no vector can exceed the record's bytes. A v3
+// section carries no state and no checkpoint (they live in the .rst sidecar).
+bool parse_section_at(const uint8_t* p, size_t n, size_t& at, ParsedSection& out, bool v3) {
+    uint32_t n_layers = 0;
+    if (!get_u32(p, n, at, n_layers) || n_layers == 0 || n_layers > (1u << 12)) return false;
+    if (!get_u64(p, n, at, out.geometry_hash)) return false;
+    if (!v3 && !parse_state_and_checkpoints(p, n, at, out)) return false;
     out.layer_headers.resize(size_t(n_layers) * 7);
     for (size_t i = 0; i < out.layer_headers.size(); ++i)
         if (!get_i64(p, n, at, out.layer_headers[i])) return false;
@@ -319,8 +361,10 @@ bool parse_section_at(const uint8_t* p, size_t n, size_t& at, ParsedSection& out
     return true;
 }
 
-// The fixed header as the reader parses it.
+// The fixed header as the reader parses it. v3 overloads state_bytes[0] with the record's seq.
 struct RecordHeader {
+    uint32_t version = 0;
+    uint64_t seq = 0;
     uint64_t record_bytes = 0, applies_to_len = 0, keep_tokens = 0, new_tokens = 0, small_bytes = 0;
     uint64_t geometry_hash = 0, n_imgs = 0, ckpt_tokens = 0, sections_bytes = 0;
     uint64_t state_bytes[5]{};
@@ -335,7 +379,9 @@ bool parse_header(const uint8_t* p, size_t n, RecordHeader& h) {
     for (int i = 0; i < 4; ++i)
         if (p[i] != uint8_t(kDeltaMagic[i])) return false;
     at = 4;
-    if (!get_u32(p, n, at, version) || version != kDeltaVersion) return false;
+    if (!get_u32(p, n, at, version) ||
+        (version != kDeltaVersionV2 && version != kDeltaVersion)) return false;
+    h.version = version;
     if (!get_u64(p, n, at, h.record_bytes) || !get_u64(p, n, at, h.applies_to_len) ||
         !get_u64(p, n, at, h.keep_tokens) || !get_u64(p, n, at, h.new_tokens) ||
         !get_u64(p, n, at, h.small_bytes) || !get_u64(p, n, at, h.geometry_hash))
@@ -347,6 +393,8 @@ bool parse_header(const uint8_t* p, size_t n, RecordHeader& h) {
     for (size_t i = 0; i < 5; ++i)
         if (!get_u64(p, n, at, h.state_bytes[i])) return false;
     if (!get_u64(p, n, at, h.sections_bytes)) return false;
+    // v3: state_bytes[0] is the record's 1-based index within the journal (see the .hpp)
+    if (h.version >= kDeltaVersion) h.seq = h.state_bytes[0];
     // sanity: the counts must fit the record's own bytes, and the chain fields must line up
     const uint64_t min_record = kHeaderBytes + h.small_bytes + h.sections_bytes + kTrailerBytes;
     if (h.record_bytes < min_record || h.record_bytes > (1ull << 40)) return false;
@@ -372,6 +420,150 @@ bool read_record_front(std::FILE* f, const RecordHeader& h, std::vector<uint8_t>
     return true;
 }
 
+// ── The v3 state sidecar's reader helpers (sequential reads, bounded against the file) ──────
+bool read_exact(std::FILE* f, void* dst, size_t n) { return n == 0 || std::fread(dst, 1, n, f) == n; }
+bool read_u32(std::FILE* f, uint32_t& v) {
+    uint8_t t[4]; size_t at = 0;
+    return read_exact(f, t, 4) && get_u32(t, 4, at, v);
+}
+bool read_u64(std::FILE* f, uint64_t& v) {
+    uint8_t t[8]; size_t at = 0;
+    return read_exact(f, t, 8) && get_u64(t, 8, at, v);
+}
+
+// What state_file_probe validated: the sidecar's stamp (seq + record_hash) and exact size.
+struct StateFileInfo {
+    uint64_t seq = 0, record_hash = 0, total = 0;
+    uint32_t n_images = 0;
+};
+
+// Validate a .rst whole (magic, version, streaming FNV over the body, trailer hash + size +
+// end magic) and report its stamp. The load path re-reads without re-hashing: the file cannot
+// move under us (the writer is drained first), so the probe's verdict holds.
+bool state_file_probe(const std::string& path, StateFileInfo& info) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = false;
+    do {
+        if (std::fseek(f, 0, SEEK_END) != 0) break;
+        const long long size = std::ftell(f);
+        if (size < (long long) (kStateHeaderBytes + kTrailerBytes) ||
+            std::fseek(f, 0, SEEK_SET) != 0)
+            break;
+        uint8_t head[kStateHeaderBytes];
+        if (std::fread(head, 1, sizeof(head), f) != sizeof(head)) break;
+        bool magic_ok = true;
+        for (int i = 0; i < 4; ++i) magic_ok = magic_ok && head[i] == uint8_t(kStateMagic[i]);
+        if (!magic_ok) break;
+        {
+            size_t at = 4;
+            uint32_t version = 0, reserved = 0;
+            if (!get_u32(head, sizeof(head), at, version) || version != kStateVersion) break;
+            if (!get_u64(head, sizeof(head), at, info.seq) ||
+                !get_u64(head, sizeof(head), at, info.record_hash) ||
+                !get_u32(head, sizeof(head), at, info.n_images) ||
+                !get_u32(head, sizeof(head), at, reserved))
+                break;
+            if (info.n_images == 0 || info.n_images > kMaxImages) break;
+        }
+        uint64_t h = fnv_update(fnv_begin(), head, sizeof(head));
+        std::vector<uint8_t> chunk;
+        try {
+            chunk.resize(64 * 1024);
+        } catch (const std::exception&) {
+            break;
+        }
+        bool streamed = true;
+        for (uint64_t left = uint64_t(size) - sizeof(head) - kTrailerBytes; left > 0 && streamed;) {
+            const size_t take = size_t(std::min<uint64_t>(left, chunk.size()));
+            streamed = std::fread(chunk.data(), 1, take, f) == take;
+            h = fnv_update(h, chunk.data(), take);
+            left -= take;
+        }
+        if (!streamed) break;
+        uint8_t trailer[kTrailerBytes];
+        if (std::fread(trailer, 1, sizeof(trailer), f) != sizeof(trailer)) break;
+        size_t at = 0;
+        uint64_t stored_hash = 0, stored_total = 0;
+        if (!get_u64(trailer, sizeof(trailer), at, stored_hash) ||
+            !get_u64(trailer, sizeof(trailer), at, stored_total))
+            break;
+        bool end_ok = true;
+        for (int i = 0; i < 4; ++i)
+            end_ok = end_ok && trailer[kTrailerBytes - 4 + i] == uint8_t(kStateEndMagic[i]);
+        if (!end_ok || stored_hash != h || stored_total != uint64_t(size)) break;
+        info.total = uint64_t(size);
+        ok = true;
+    } while (false);
+    std::fclose(f);
+    return ok;
+}
+
+// One checkpoint block from the sidecar (the writer's put_checkpoint_head + arrays + used),
+// bounded by `left` (the bytes the probe said the body holds).
+bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c) {
+    auto take_n = [&](uint64_t n) { if (n > left) return false; left -= n; return true; };
+    uint64_t n_ids = 0, n_imgs = 0;
+    if (!take_n(8) || !read_u64(f, n_ids) || !take_n(n_ids * 4)) return false;
+    c.ids.resize(size_t(n_ids));
+    for (uint64_t i = 0; i < n_ids; ++i) {
+        uint32_t v = 0;
+        if (!read_u32(f, v)) return false;
+        c.ids[size_t(i)] = int32_t(v);
+    }
+    if (!take_n(8) || !read_u64(f, n_imgs) || !take_n(n_imgs * 16)) return false;
+    c.imgs.resize(size_t(n_imgs));
+    for (uint64_t i = 0; i < n_imgs; ++i) {
+        uint64_t start = 0, hash = 0;
+        if (!read_u64(f, start) || !read_u64(f, hash)) return false;
+        c.imgs[size_t(i)] = ConversationImageKey{int64_t(start), hash};
+    }
+    for (size_t i = 0; i < 5; ++i) {
+        uint64_t sz = 0;
+        if (!take_n(8) || !read_u64(f, sz) || !take_n(sz)) return false;
+        auto& dst = *state_of(c, i);
+        dst.resize(size_t(sz));
+        if (!read_exact(f, dst.data(), dst.size())) return false;
+    }
+    return take_n(8) && read_u64(f, c.used);
+}
+
+// Load a PROBED sidecar onto the images the reader holds (main + stages, in order): the live
+// running state and the full-write checkpoint of every image, each guarded by its geometry
+// echo. The ids/dims/K/V are NOT here — the records carry them. `left` must land exactly on
+// zero (a layout drift is a corrupt sidecar).
+bool state_file_load(const std::string& path, const StateFileInfo& info,
+                     const std::vector<SavedConversation*>& images) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = std::fseek(f, (long long) kStateHeaderBytes, SEEK_SET) == 0;
+    uint64_t left = info.total - kStateHeaderBytes - kTrailerBytes;
+    auto take_n = [&](uint64_t n) { if (n > left) return false; left -= n; return true; };
+    for (size_t ii = 0; ok && ii < images.size(); ++ii) {
+        SavedConversation& img = *images[ii];
+        uint64_t geom = 0, sz[5] = {};
+        ok = take_n(8) && read_u64(f, geom) &&
+             geom == conversation_delta_geometry_hash(img.geometry, img.layer_lo, img.layer_hi);
+        for (size_t i = 0; ok && i < 5; ++i) ok = take_n(8) && read_u64(f, sz[i]);
+        for (size_t i = 0; ok && i < 5; ++i) {
+            ok = take_n(sz[i]);
+            if (!ok) break;
+            auto& dst = *state_of(img.live, i);
+            dst.resize(size_t(sz[i]));
+            ok = read_exact(f, dst.data(), dst.size());
+        }
+        uint32_t n_ckpt = 0;
+        ok = ok && take_n(4) && read_u32(f, n_ckpt) && n_ckpt <= 1;
+        img.checkpoints.clear();
+        if (ok && n_ckpt == 1) {
+            img.checkpoints.resize(1);
+            ok = read_checkpoint(f, left, img.checkpoints[0]);
+        }
+    }
+    std::fclose(f);
+    return ok && left == 0;
+}
+
 } // namespace
 
 uint64_t conversation_delta_geometry_hash(const std::array<int64_t, 18>& geometry, int64_t layer_lo,
@@ -384,8 +576,11 @@ uint64_t conversation_delta_geometry_hash(const std::array<int64_t, 18>& geometr
 }
 
 bool conversation_delta_plan(DeltaPlan& plan, const SavedConversation& image, uint64_t base_len,
-                             uint64_t keep_tokens) {
+                             uint64_t keep_tokens, uint64_t seq) {
     plan = DeltaPlan{};
+    plan.seq = seq;
+    plan.version = seq > 0 ? kDeltaVersion : kDeltaVersionV2;
+    const bool v3 = seq > 0;
     const std::vector<const SavedConversation*> images = images_of(image);
     if (images.empty() || images[0]->kv.empty()) return false;
     for (const SavedConversation* img : images)
@@ -449,14 +644,17 @@ bool conversation_delta_plan(DeltaPlan& plan, const SavedConversation& image, ui
     const uint64_t small = shared_region_bytes(image, keep_tokens);
     uint64_t sections = 0;
     for (size_t ii = 0; ii < images.size(); ++ii)
-        sections += section_front_bytes(*images[ii]);
+        sections += section_front_bytes(*images[ii], v3);
     plan.record_bytes = kHeaderBytes + small + sections + payload + kTrailerBytes;
     return true;
 }
 
 bool conversation_delta_append(const std::string& path, const SavedConversation& image, const DeltaPlan& plan,
-                               uint64_t& record_bytes) {
+                               uint64_t& record_bytes, uint64_t* record_hash) {
     record_bytes = 0;
+    if (record_hash) *record_hash = 0;
+    const bool v3 = plan.version >= kDeltaVersion;
+    if (v3 && plan.seq == 0) return false;   // a v3 record is identified by its journal index
     const std::vector<const SavedConversation*> images = images_of(image);
     if (plan.images.size() != images.size() || images.empty()) return false;
     for (size_t ii = 0; ii < images.size(); ++ii) {
@@ -471,7 +669,7 @@ bool conversation_delta_append(const std::string& path, const SavedConversation&
         for (const auto& layer : ip.parts)
             for (const auto& part : layer) payload += part.n;
     for (size_t ii = 0; ii < images.size(); ++ii)
-        sections += section_front_bytes(*images[ii]);
+        sections += section_front_bytes(*images[ii], v3);
     if (plan.record_bytes != kHeaderBytes + small + sections + payload + kTrailerBytes)
         return false;
     std::FILE* f = std::fopen(path.c_str(), "ab");
@@ -479,7 +677,9 @@ bool conversation_delta_append(const std::string& path, const SavedConversation&
     bool ok = false;
     uint64_t h = fnv_begin();
     do {
-        // header + shared region + sections' front matter, hashed and written in one go
+        // header + shared region + sections' front matter, hashed and written in one go. In v3
+        // the front holds no state (the .rst sidecar carries it), so this buffer is O(tables),
+        // not O(model state) — the writer's RAM peak of v2 is gone.
         std::vector<uint8_t> front;
         try {
             front.reserve(kHeaderBytes + size_t(small) + size_t(sections));
@@ -487,7 +687,7 @@ bool conversation_delta_append(const std::string& path, const SavedConversation&
             break;
         }
         for (int i = 0; i < 4; ++i) front.push_back(uint8_t(kDeltaMagic[i]));
-        put_u32(front, kDeltaVersion);
+        put_u32(front, plan.version);
         put_u64(front, plan.record_bytes);
         put_u64(front, plan.applies_to_len);
         put_u64(front, plan.keep_tokens);
@@ -500,11 +700,17 @@ bool conversation_delta_append(const std::string& path, const SavedConversation&
         put_u64(front, image.live.imgs.size());
         const ConversationCheckpoint* main_ckpt = record_checkpoint(image.checkpoints);
         put_u64(front, main_ckpt ? (uint64_t) main_ckpt->ids.size() : 0);
-        for (size_t i = 0; i < 5; ++i) put_u64(front, state_of(image.live, i)->size());
+        if (v3) {
+            // v3: the state_bytes[5] slot carries the record's journal index; [1..4] are zero
+            put_u64(front, plan.seq);
+            for (size_t i = 1; i < 5; ++i) put_u64(front, 0);
+        } else {
+            for (size_t i = 0; i < 5; ++i) put_u64(front, state_of(image.live, i)->size());
+        }
         put_u64(front, sections);
         put_shared_region(front, image, plan.keep_tokens);
         for (size_t ii = 0; ii < images.size(); ++ii)
-            put_section_front(front, *images[ii], plan.images[ii].geometry_hash, plan.images[ii]);
+            put_section_front(front, *images[ii], plan.images[ii].geometry_hash, plan.images[ii], v3);
         h = fnv_update(h, front.data(), front.size());
         if (std::fwrite(front.data(), 1, front.size(), f) != front.size()) break;
         // K/V payloads, streamed straight from each image's buffers (section order)
@@ -538,11 +744,154 @@ bool conversation_delta_append(const std::string& path, const SavedConversation&
         ok = true;
     } while (false);
     if (std::fclose(f) != 0) ok = false;
-    if (ok) record_bytes = plan.record_bytes;
+    if (ok) {
+        record_bytes = plan.record_bytes;
+        if (record_hash) *record_hash = h;   // the sidecar binds to this record through it
+    }
     return ok;
 }
 
-DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& image) {
+uint64_t conversation_delta_state_bytes(const SavedConversation& image) {
+    uint64_t n = kStateHeaderBytes;
+    for (const SavedConversation* img : images_of(image)) {
+        n += 8 + 40 + 4;   // geometry echo + the 5 sizes + the checkpoint count
+        for (size_t i = 0; i < 5; ++i) n += state_of(img->live, i)->size();
+        if (const ConversationCheckpoint* sel = record_checkpoint(img->checkpoints))
+            n += checkpoint_bytes(*sel);
+    }
+    return n + kTrailerBytes;
+}
+
+bool conversation_delta_state_write(const std::string& path, const SavedConversation& image, uint64_t seq,
+                                    uint64_t record_hash, uint64_t& bytes) {
+    bytes = 0;
+    const std::vector<const SavedConversation*> images = images_of(image);
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    uint64_t h = fnv_begin();
+    uint64_t total = 0;
+    bool ok = true;
+    auto emit = [&](const void* p, size_t n) {
+        if (n == 0) return true;
+        h = fnv_update(h, p, n);
+        total += n;
+        return std::fwrite(p, 1, n, f) == n;
+    };
+    auto emit_u32 = [&](uint32_t v) { std::vector<uint8_t> t; put_u32(t, v); return emit(t.data(), t.size()); };
+    auto emit_u64 = [&](uint64_t v) { std::vector<uint8_t> t; put_u64(t, v); return emit(t.data(), t.size()); };
+    do {
+        // the fixed header: magic, version, the record this state belongs to (seq + its
+        // trailer hash), the image count, a reserved word
+        std::vector<uint8_t> head;
+        for (int i = 0; i < 4; ++i) head.push_back(uint8_t(kStateMagic[i]));
+        put_u32(head, kStateVersion);
+        put_u64(head, seq);
+        put_u64(head, record_hash);
+        put_u32(head, uint32_t(images.size()));
+        put_u32(head, 0);
+        if (!(ok = emit(head.data(), head.size()))) break;
+        // per image: the geometry echo, the live running state streamed straight from the
+        // vectors (no front buffer — the O(state) RAM peak of a v2 record never happens here),
+        // and the full-write checkpoint selection
+        for (const SavedConversation* img : images) {
+            ok = emit_u64(conversation_delta_geometry_hash(img->geometry, img->layer_lo, img->layer_hi));
+            for (size_t i = 0; ok && i < 5; ++i) ok = emit_u64(state_of(img->live, i)->size());
+            for (size_t i = 0; ok && i < 5; ++i) {
+                const auto& s = *state_of(img->live, i);
+                ok = emit(s.data(), s.size());
+            }
+            const ConversationCheckpoint* sel = record_checkpoint(img->checkpoints);
+            ok = ok && emit_u32(sel ? 1u : 0u);
+            if (ok && sel) {
+                std::vector<uint8_t> ck;
+                put_checkpoint_head(ck, *sel);
+                ok = emit(ck.data(), ck.size());
+                for (size_t i = 0; ok && i < 5; ++i) {
+                    const auto& s = *state_of(*sel, i);
+                    ok = emit_u64(s.size()) && emit(s.data(), s.size());
+                }
+                ok = ok && emit_u64(sel->used);
+            }
+            if (!ok) break;
+        }
+        if (!ok) break;
+        // trailer: hash over everything above + the exact file size + the end magic
+        std::vector<uint8_t> tail;
+        put_u64(tail, h);
+        put_u64(tail, total + kTrailerBytes);
+        for (int i = 0; i < 4; ++i) tail.push_back(uint8_t(kStateEndMagic[i]));
+        if (std::fwrite(tail.data(), 1, tail.size(), f) != tail.size()) { ok = false; break; }
+        total += tail.size();
+        if (std::fflush(f) != 0) { ok = false; break; }
+#if !defined(_WIN32)
+        (void) ::fsync(::fileno(f));
+#endif
+    } while (false);
+    if (std::fclose(f) != 0) ok = false;
+    if (ok) {
+        // the rename IS the commit: a crash before it leaves the old sidecar (and the record
+        // it belongs to) intact; after it, the new pair is durable together
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return false;
+    }
+#if !defined(_WIN32)
+    // the rename must survive a power cut: flush the directory entry, the same discipline the
+    // store applies to the .bin's publish (Windows has no directory fsync — same exception)
+    const size_t slash = path.find_last_of('/');
+    const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+    }
+#endif
+    bytes = total;
+    return true;
+}
+
+std::string conversation_delta_describe(const SavedConversation& image, const DeltaPlan& plan) {
+    const std::vector<const SavedConversation*> images = images_of(image);
+    auto mib = [](uint64_t v) { return double(v) / (1024.0 * 1024.0); };
+    std::string out;
+    for (size_t ii = 0; ii < images.size() && ii < plan.images.size(); ++ii) {
+        const SavedConversation& img = *images[ii];
+        uint64_t live = 0, ck_state = 0, ck_meta = 0, kv_sent = 0, kv_full = 0;
+        bool pinned = false;
+        size_t ck_ids = 0;
+        for (size_t i = 0; i < 5; ++i) live += state_of(img.live, i)->size();
+        if (const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints)) {
+            for (size_t i = 0; i < 5; ++i) ck_state += state_of(*sel, i)->size();
+            ck_meta = sel->ids.size() * 4 + sel->imgs.size() * 16;
+            ck_ids = sel->ids.size();
+            pinned = sel->pinned;
+        }
+        for (size_t j = 0; j < img.kv.size(); ++j)
+            for (size_t part = 0; part < 5; ++part) {
+                kv_full += part_of(img.kv[j], part)->size();
+                kv_sent += plan.images[ii].parts[j][part].n;
+            }
+        const double per_tok = plan.new_tokens ? double(kv_full) / double(plan.new_tokens) : 0.0;
+        const double expected = per_tok * double(plan.new_tokens - plan.keep_tokens);
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+                      " img%zu{live=%.1f ckpt=%.1f(+%.2f meta, ids=%zu, pinned=%d) "
+                      "kv_sent=%.1f kv_expected=%.1f kv_full=%.1f MiB}",
+                      ii, mib(live), mib(ck_state), mib(ck_meta), ck_ids, pinned ? 1 : 0,
+                      mib(kv_sent), mib(expected), mib(kv_full));
+        out += buf;
+    }
+    return out;
+}
+
+DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& image,
+                                   const std::string& state_path) {
     DeltaFold fold;
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return fold;
@@ -554,6 +903,17 @@ DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& i
         const std::vector<SavedConversation*> images = images_of(image);
         const uint64_t base_geometry =
             conversation_delta_geometry_hash(image.geometry, image.layer_lo, image.layer_hi);
+        // ── v3: validate the state sidecar once (magic, version, streaming hash, size, the
+        // image count). Its stamp (seq + record_hash) is checked per record below and once
+        // more after the loop — a record past its coverage is a torn tail (the crash window
+        // between the record append and the sidecar's rename), never a silent mismatch.
+        StateFileInfo sinfo;
+        const bool state_ok = !state_path.empty() && state_file_probe(state_path, sinfo) &&
+                              sinfo.n_images == images.size();
+        uint32_t last_version = 0;
+        uint64_t last_hash = 0;
+        bool any_v3 = false;   // a .rst is only stale when NO v3 record applied (a v2 record
+                               // appended after v3 ones must not orphan their state source)
         std::vector<uint8_t> front;
         while (offset + kHeaderBytes + kTrailerBytes <= (uint64_t) fsize) {
             // ── header: bounds, magic, version, sanity ──────────────────────────────────────
@@ -583,6 +943,17 @@ DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& i
             // its stage files (a stage lost or replaced is a torn tail — the base restores
             // alone once the caller truncates)
             if (rh.n_images != images.size()) { fold.torn = true; break; }
+            // ── the v3 chain: a light record is only as good as the sidecar behind it. The
+            // sidecar must exist (state_ok), this record must be the NEXT index of the chain
+            // (seq == applied + 1: no gaps, no replays), and the sidecar must cover it
+            // (seq <= sinfo.seq) — the crash window between the .dlt append and the .rst
+            // rename lands here as a torn tail, so the fold ends one record early and the
+            // caller truncates. Nothing is mutated before this point.
+            if (rh.version >= kDeltaVersion &&
+                (!state_ok || rh.seq != fold.applied + 1 || rh.seq > sinfo.seq)) {
+                fold.torn = true;
+                break;
+            }
             // ── shared region + sections' front matter ──────────────────────────────────────
             if (!read_record_front(f, rh, front)) { fold.torn = true; break; }
             ParsedShared shared;
@@ -593,13 +964,14 @@ DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& i
             }
             // the sections walk the rest of the front buffer with one cursor; a section that
             // overruns its share, or a cursor that does not land exactly on the buffer's end,
-            // is a malformed record
+            // is a malformed record. A v3 section carries no state block (the .rst has it).
             std::vector<ParsedSection> sections(rh.n_images);
             {
                 size_t sat = size_t(rh.small_bytes);
                 bool secs_ok = true;
                 for (uint32_t ii = 0; ii < rh.n_images && secs_ok; ++ii)
-                    secs_ok = parse_section_at(front.data(), front.size(), sat, sections[ii]);
+                    secs_ok = parse_section_at(front.data(), front.size(), sat, sections[ii],
+                                               rh.version >= kDeltaVersion);
                 if (!secs_ok || sat != front.size()) { fold.torn = true; break; }
             }
             // ── pre-checks against the images we hold: echoes, per-layer invariants, bounds ──
@@ -670,7 +1042,8 @@ DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& i
             }
             if (!trailer_ok || stored_hash != h || stored_bytes != rh.record_bytes) { fold.torn = true; break; }
             // ── phase 2: apply — ids, images (every image shares them), then per section the
-            // running state, the checkpoints, the dims and the K/V payload ──────────────────
+            // running state (v2 records only — a v3 record's state arrives with the sidecar
+            // after the loop), the checkpoints (same), the dims and the K/V payload (always) ─
             for (SavedConversation* img : images) {
                 img->live.ids.resize(size_t(rh.keep_tokens));
                 img->live.ids.insert(img->live.ids.end(), shared.ids_suffix.begin(), shared.ids_suffix.end());
@@ -679,12 +1052,14 @@ DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& i
             for (uint32_t ii = 0; ii < rh.n_images; ++ii) {
                 const ParsedSection& sec = sections[ii];
                 SavedConversation& img = *images[ii];
-                img.live.gdn = sec.state[0];
-                img.live.ple = sec.state[1];
-                img.live.tails = sec.state[2];
-                img.live.dead = sec.state[3];
-                img.live.block_pos = sec.state[4];
-                img.checkpoints = sec.checkpoints;
+                if (rh.version < kDeltaVersion) {
+                    img.live.gdn = sec.state[0];
+                    img.live.ple = sec.state[1];
+                    img.live.tails = sec.state[2];
+                    img.live.dead = sec.state[3];
+                    img.live.block_pos = sec.state[4];
+                    img.checkpoints = sec.checkpoints;
+                }
                 for (size_t j = 0; j < img.kv.size(); ++j) {
                     const int64_t* lh = &sec.layer_headers[j * 7];
                     ConversationKv& kv = img.kv[j];
@@ -718,10 +1093,31 @@ DeltaFold conversation_delta_apply(const std::string& path, SavedConversation& i
                     break;
                 }
             }
-            // applied: advance the chain
+            // applied: advance the chain (and remember which formats the chain holds)
             current_len = rh.new_tokens;
+            last_version = rh.version;
+            last_hash = stored_hash;
+            if (rh.version >= kDeltaVersion) any_v3 = true;
             offset += rh.record_bytes;
             ++fold.applied;
+        }
+        // ── v3: the running state and the checkpoints arrive ONCE, from the sidecar of the
+        // last record the fold applied. The stamp must land exactly on that record (seq ==
+        // applied, record_hash == the record's trailer hash): anything else means the state
+        // and the K/V would disagree at a byte level the hashes cannot see, so the fold is
+        // failed and the caller discards the images (the files stay on disk). A fold with NO
+        // v3 record at all while a sidecar sits beside the journal reports state_stale: the
+        // .rst describes a generation nothing reaches — the caller deletes it. (A v2 record
+        // appended AFTER v3 ones does NOT make the sidecar stale: the earlier records still
+        // need it, and a tail tear could yet land the fold on one of them.)
+        if (!fold.failed) {
+            if (last_version >= kDeltaVersion) {
+                if (!state_ok || sinfo.seq != fold.applied || sinfo.record_hash != last_hash ||
+                    !state_file_load(state_path, sinfo, images))
+                    fold.failed = true;
+            } else if (state_ok && !any_v3) {
+                fold.state_stale = true;
+            }
         }
     }
     std::fclose(f);

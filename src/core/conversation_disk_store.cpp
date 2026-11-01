@@ -325,6 +325,14 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
     // other value (unset, 1, garbage) leaves the default on.
     journal_ = true;
     if (const char* env = std::getenv("STRATA_SPILL_JOURNAL")) journal_ = std::strcmp(env, "0") != 0;
+    // v3 records (state in the .rst sidecar, not in every record): DEFAULT ON. The escape
+    // hatch writes v2 records again (STRATA_SPILL_JOURNAL_V3=0) — the fold then takes the
+    // state from the records and any .rst left by a v3 run is removed on the next append.
+    journal_v3_ = true;
+    if (const char* env = std::getenv("STRATA_SPILL_JOURNAL_V3")) journal_v3_ = std::strcmp(env, "0") != 0;
+    // The per-record [delta/diag] breakdown: STRATA_SPILL_DIAG=1 (Phase 0's instrument).
+    diag_ = false;
+    if (const char* env = std::getenv("STRATA_SPILL_DIAG")) diag_ = std::strcmp(env, "0") != 0;
     if (budget_ == 0 || dir_.empty()) { budget_ = 0; return; }
     // Create the spill dir (idempotent). 0700: only the engine user can read parked
     // conversations (they may carry prompt contents).
@@ -339,11 +347,16 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
     fs::permissions(dir_, fs::perms::owner_all, ec);   // best-effort; ignore if unsupported
     if (journal_)
         std::fprintf(stderr, "strata serve: conversation spill: delta journal ON (default; "
-                             "STRATA_SPILL_JOURNAL=0 disables it): the .bin is the immutable "
+                             "STRATA_SPILL_JOURNAL=0 disables it)%s: the .bin is the immutable "
                              "parent, written once at the conversation's first park; every "
                              "continued turn appends one conv-<serial>.dlt record (its "
-                             "children) carrying only the newest tokens; take() reads the .bin "
-                             "+ every record — the history is never rewritten\n");
+                             "children) carrying only the newest tokens%s; take() reads the .bin "
+                             "+ every record — the history is never rewritten\n",
+                     journal_v3_
+                         ? ", v3 records (default; STRATA_SPILL_JOURNAL_V3=0 falls back to v2)"
+                         : "",
+                     journal_v3_ ? ", with the running state + checkpoint of every image in one "
+                                    "conv-<serial>.rst sidecar replaced per append" : "");
 }
 
 // The dtor DRAINS: the engine's shutdown auto-spill is queued microseconds before main()
@@ -400,6 +413,19 @@ std::string ConversationDiskStore::path_for_dlt(uint64_t serial, bool prefix) co
     return dir_ + "/" + kind_name(prefix) + std::to_string(serial) + ".dlt";
 }
 
+std::string ConversationDiskStore::path_for_rst(uint64_t serial) const {
+    // Only a conversation keeps a journal, so only one keeps its state sidecar (see the .hpp).
+    return dir_ + "/conv-" + std::to_string(serial) + ".rst";
+}
+
+uint64_t ConversationDiskStore::rst_file_bytes(uint64_t serial) const {
+    std::error_code ec;
+    const std::string p = path_for_rst(serial);
+    if (!fs::exists(p, ec) || ec) return 0;
+    const uint64_t n = fs::file_size(p, ec);
+    return ec ? 0 : n;
+}
+
 // ── Stage files (a layer split's spill) ─────────────────────────────────────────────────────
 // Each later stage's image is a self-contained SavedConversation (its own layer carve and K/V),
 // so each one is written as its own v1 session file next to the main .bin. The main .bin is the
@@ -436,6 +462,26 @@ namespace {
 constexpr char kIdxMagic[4] = {'S', 'I', 'D', 'X'};
 constexpr uint32_t kIdxVersion = 4;   // v4: adds the stage count + each stage file's carve
 
+// The (constant) distance between the file clock's epoch and the system clock's, measured
+// ONCE. Deriving it per call sampled two different "now" instants, and the nanosecond
+// jitter between the samples made read_idx's exact mtime comparison fail on every
+// ns-granular filesystem — the .idx fast path never validated and every reload paid the
+// slow parse. One static sample pins the conversion: the same timestamp always maps to
+// the same value, which is all the freshness check needs (the true offset's sub-µs error
+// cancels because writer and reader share this function).
+std::chrono::nanoseconds file_clock_epoch_offset() {
+    static const std::chrono::nanoseconds offset =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch() -
+            fs::file_time_type::clock::now().time_since_epoch());
+    return offset;
+}
+// A file timestamp as nanoseconds since the system epoch (deterministic — see above).
+int64_t file_time_to_ns(fs::file_time_type ft) {
+    return (std::chrono::duration_cast<std::chrono::nanoseconds>(ft.time_since_epoch()) +
+            file_clock_epoch_offset()).count();
+}
+
 // Layout (little-endian, no struct memcpy — explicit byte writes):
 //   4   magic "SIDX"
 //   4   uint32 version
@@ -445,7 +491,7 @@ constexpr uint32_t kIdxVersion = 4;   // v4: adds the stage count + each stage f
 //   8   int64  layer_lo
 //   8   int64  layer_hi
 //   1   uint8  cvec
-//   8   uint64 file_bytes    (the entry's disk footprint: .bin + stages + journal)
+//   8   uint64 file_bytes    (the entry's disk footprint: .bin + stages + journal + .rst)
 //   8   uint64 bin_size      (fs::file_size of the .bin at write time — freshness check)
 //   8   int64  bin_mtime_ns  (fs::last_write_time as nanoseconds since epoch — freshness check)
 //   8   uint64 journal_size    (the .dlt's size at write time; 0: none — freshness check)
@@ -572,12 +618,7 @@ bool ConversationDiskStore::write_idx(const DiskEntry& e, const std::string& bin
         bin_size = (uint64_t) fs::file_size(bin_path, ec);
         if (ec) bin_size = 0;
         const fs::file_time_type ft = fs::last_write_time(bin_path, ec);
-        if (!ec) {
-            // file_clock → system_clock → nanoseconds since epoch (C++20 chrono).
-            const auto sys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
-                ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-            bin_mtime_ns = sys.time_since_epoch().count();
-        }
+        if (!ec) bin_mtime_ns = file_time_to_ns(ft);
     }
     // The journal's freshness hint, the same way: the .dlt must still be exactly what it was
     // when this .idx is written (an append lands BEFORE the .idx refresh, so the pair is
@@ -594,11 +635,7 @@ bool ConversationDiskStore::write_idx(const DiskEntry& e, const std::string& bin
             journal_size = (uint64_t) fs::file_size(dlt_path, ec2);
             if (ec2) journal_size = 0;
             const fs::file_time_type ft = fs::last_write_time(dlt_path, ec2);
-            if (!ec2) {
-                const auto sys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
-                    ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-                journal_mtime_ns = sys.time_since_epoch().count();
-            }
+            if (!ec2) journal_mtime_ns = file_time_to_ns(ft);
         }
     }
     // Build the payload (everything except the checksum).
@@ -775,10 +812,7 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
     if (ec || actual_bin_size != bin_size) return false;   // size mismatch → fallback
     const fs::file_time_type actual_ft = fs::last_write_time(bin_path, ec);
     if (ec) return false;
-    const auto actual_sys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
-        actual_ft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-    const int64_t actual_mtime_ns = actual_sys.time_since_epoch().count();
-    if (actual_mtime_ns != bin_mtime_ns) return false;   // mtime mismatch → fallback
+    if (file_time_to_ns(actual_ft) != bin_mtime_ns) return false;   // mtime mismatch → fallback
     // The journal must match too: the manifest data in this .idx describes base+journal, so a
     // .dlt that changed since (an append whose .idx refresh never landed) makes it stale. An
     // absent .dlt reads as (0, 0) — a recorded journal_size > 0 with no file is a mismatch.
@@ -790,11 +824,7 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
             actual_journal_size = (uint64_t) fs::file_size(dlt_path, ec);
             if (ec) actual_journal_size = 0;
             const fs::file_time_type jft = fs::last_write_time(dlt_path, ec);
-            if (!ec) {
-                const auto jsys = std::chrono::time_point_cast<std::chrono::nanoseconds>(
-                    jft - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-                actual_journal_mtime_ns = jsys.time_since_epoch().count();
-            }
+            if (!ec) actual_journal_mtime_ns = file_time_to_ns(jft);
         }
         if (actual_journal_size != journal_size || actual_journal_mtime_ns != journal_mtime_ns)
             return false;   // the .dlt changed (or went missing) since this .idx → fallback
@@ -943,14 +973,14 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
     e.path = path_for(use_serial, prefix);
     e.ids = image.live.ids;                  // copy: the manifest keeps these in RAM
     e.imgs = image.live.imgs;
-    // Capture the deepest checkpoint's ids/imgs too — this is the turn boundary that the next
-    // request's prompt actually matches (the client re-renders the history without the
-    // assistant's thinking tokens, so live.ids diverges after the reasoning; ckpt_ids stops
-    // at the <|im_start|> before the new turn, which is what the prompt contains).
-    if (!image.checkpoints.empty()) {
-        const auto& deepest = image.checkpoints.back();
-        e.ckpt_ids = deepest.ids;
-        e.ckpt_imgs = deepest.imgs;
+    // Capture the checkpoint the FILE will restore too — session_deepest_checkpoint's selection
+    // (the chain's deepest, or with a pinned shared prefix the deepest PINNED one), the same
+    // rule session_file_write and the delta codec apply. The raw checkpoints.back() can be a
+    // deeper periodic checkpoint than the pinned selection the .bin stores, and the manifest
+    // would then promise best() a longer ckpt match than take() can deliver.
+    if (const ConversationCheckpoint* deepest = session_deepest_checkpoint(image.checkpoints)) {
+        e.ckpt_ids = deepest->ids;
+        e.ckpt_imgs = deepest->imgs;
     }
     e.geometry = image.geometry;
     e.layer_lo = image.layer_lo;
@@ -997,15 +1027,18 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
         size_t s_written = 0;
         std::string s_error;
         SessionStatus s_status;
-        const std::string spath = path_for_stage(serial, k, prefix);
+        // use_serial (NOT serial): on a serial collision this put writes under the fresh
+        // serial, and the stage files belong with THEIR main .bin — take() looks them up by
+        // the entry's serial, so a stage left under the colliding serial is unreachable.
+        const std::string spath = path_for_stage(use_serial, k, prefix);
         if (!session_file_write(spath, image.stage_images[k], id, s_written, s_error, opts, &s_status)) {
             std::fprintf(stderr, "strata serve: conversation spill: stage %zu/%zu file write failed "
                                  "(%s); spill aborted, nothing published\n",
                          k, n_stages, s_error.c_str());
             std::error_code ec;
             for (size_t j = 0; j <= k; ++j) {
-                fs::remove(path_for_stage(serial, j, prefix), ec);          // the ones that published
-                fs::remove(path_for_stage(serial, j, prefix) + ".tmp", ec); // the one that failed
+                fs::remove(path_for_stage(use_serial, j, prefix), ec);          // the ones that published
+                fs::remove(path_for_stage(use_serial, j, prefix) + ".tmp", ec); // the one that failed
             }
             return false;
         }
@@ -1023,8 +1056,8 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
         std::error_code ec;
         fs::remove(e.path + ".tmp", ec);   // best-effort
         for (size_t k = 0; k < n_stages; ++k) {
-            fs::remove(path_for_stage(serial, k, prefix), ec);
-            fs::remove(path_for_stage(serial, k, prefix) + ".tmp", ec);
+            fs::remove(path_for_stage(use_serial, k, prefix), ec);
+            fs::remove(path_for_stage(use_serial, k, prefix) + ".tmp", ec);
         }
         return false;
     }
@@ -1034,8 +1067,11 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
     e.used = next_used_++;
     bytes_ += e.file_bytes;   // main + stage files: erase()/evict_oldest() subtract the same total
     entries_.push_back(std::move(e));
-    serials_.push_back(serial);
-    ++writes_;
+    // use_serial, NOT serial: serials_ mirrors entries_[i].serial (find_by_serial's lookup —
+    // take() resolves the match's serial through it), and on a collision the entry above holds
+    // the fresh serial. Pushing the colliding serial made the spill unreachable by take().
+    serials_.push_back(use_serial);
+    ++writes_;  // (the cache's serial, if different, is gone with the collision guard)
     // Sidecar .idx: write the manifest metadata next to the .bin so the next start can load
     // the entry without parsing the full .bin. Best-effort: on failure, log and move on — the
     // .bin is valid, the slow path (full parse) takes over on the next start and rewrites the
@@ -1129,18 +1165,23 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
     // chain-checked). A torn or unchainable tail truncates the file at the last good record;
     // a journal whose FIRST record does not chain onto this base is junk for it (a .dlt left
     // by a pre-append-only build's fold that crashed after publishing the new .bin, or a .bin
-    // replaced under a reused serial) — dropped whole.
+    // replaced under a reused serial) — dropped whole. The v3 records' running state comes
+    // from the conv-<serial>.rst sidecar (validated + bound to the last applied record inside
+    // the fold): an absent or corrupt one makes every v3 record a torn tail, and a .rst beside
+    // a v2-only journal is stale (state_stale) — deleted here.
     DeltaFold fold;   // had_journal=false without a .dlt: the correction below is then a no-op
     if (!entry_pfx) {
         const std::string dlt = path_for_dlt(m.serial, false);
+        const std::string rst = path_for_rst(m.serial);
         std::error_code ec;
         if (fs::exists(dlt, ec) && !ec) {
-            fold = conversation_delta_apply(dlt, back);
+            fold = conversation_delta_apply(dlt, back, rst);
             if (fold.failed) {
-                // a mid-apply I/O error: the image is suspect, exactly a corrupt .bin read.
-                // The entry leaves the manifest (not usable right now); every file stays.
+                // a mid-apply I/O error, or a v3 sidecar that does not chain: the image is
+                // suspect, exactly a corrupt .bin read. The entry leaves the manifest (not
+                // usable right now); every file stays.
                 std::fprintf(stderr, "[strata diag] spill take: journal conv-%llu.dlt apply failed "
-                                     "(I/O); entry dropped from the manifest, files KEPT\n",
+                                     "(I/O or state sidecar); entry dropped from the manifest, files KEPT\n",
                              (unsigned long long) m.serial);
                 for (size_t i = 0; i < serials_.size(); ++i) {
                     if (serials_[i] == m.serial) { bytes_ -= entries_[i].file_bytes; erase(i); break; }
@@ -1149,16 +1190,25 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
             }
             if (fold.dropped) {
                 fs::remove(dlt, ec);
+                fs::remove(rst, ec);   // the sidecar of a journal nothing chains onto is junk too
                 std::fprintf(stderr, "strata serve: conversation spill: journal conv-%llu.dlt does not "
                                      "chain onto its base — dropped (the base restores alone)\n",
                              (unsigned long long) m.serial);
-            } else if (fold.torn) {
-                fs::resize_file(dlt, fold.valid_end, ec);
-                std::fprintf(stderr, "strata serve: conversation spill: journal conv-%llu.dlt truncated at "
-                                     "%llu B (torn or unchainable tail; %zu record%s applied)\n",
-                             (unsigned long long) m.serial, (unsigned long long) fold.valid_end,
-                             fold.applied, fold.applied == 1 ? "" : "s");
+            } else {
+                if (fold.torn) {
+                    fs::resize_file(dlt, fold.valid_end, ec);
+                    std::fprintf(stderr, "strata serve: conversation spill: journal conv-%llu.dlt truncated at "
+                                         "%llu B (torn or unchainable tail; %zu record%s applied)\n",
+                                 (unsigned long long) m.serial, (unsigned long long) fold.valid_end,
+                                 fold.applied, fold.applied == 1 ? "" : "s");
+                }
+                if (fold.state_stale)
+                    fs::remove(rst, ec);   // no v3 record applied: the .rst describes a dead generation
             }
+        } else {
+            // No journal at all: a .rst beside a bare base (an old build destroyed the .dlt,
+            // or a crash between the .dlt's creation and its first record) describes nothing.
+            fs::remove(rst, ec);
         }
     }
     // Correct the manifest entry to the state the disk actually restores now, and bump its LRU
@@ -1185,7 +1235,8 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
         }
         en.journal_bytes = fold.dropped ? 0 : fold.journal_bytes;
         en.journal_records = fold.dropped ? 0 : fold.records;
-        en.file_bytes = (uint64_t) read + stage_files_bytes(m.serial, entry_pfx) + en.journal_bytes;
+        en.file_bytes = (uint64_t) read + stage_files_bytes(m.serial, entry_pfx) + en.journal_bytes +
+                        rst_file_bytes(m.serial);
         bytes_ += en.file_bytes - old_bytes;
         en.used = next_used_++;
         break;
@@ -1243,8 +1294,9 @@ void ConversationDiskStore::purge_on_startup() {
         if (ec) break;
         const std::string name = entry.path().filename().string();
         // conv-<serial>.bin / pfx-<serial>.bin (a shared-prefix snapshot), their sidecars .idx,
-        // and any leftover .tmp from an interrupted write (.bin.tmp or .idx.tmp). All are
-        // removed; other files (e.g. keep.txt in the test) are left alone.
+        // the delta journal .dlt, its v3 state sidecar .rst, and any leftover .tmp from an
+        // interrupted write (.bin.tmp, .idx.tmp, .rst.tmp). All are removed; other files
+        // (e.g. keep.txt in the test) are left alone.
         const bool named_conv = name.rfind("conv-", 0) == 0;
         const bool named_pfx = name.rfind("pfx-", 0) == 0;
         const bool is_bin = (named_conv || named_pfx) && name.size() > 4 &&
@@ -1253,8 +1305,10 @@ void ConversationDiskStore::purge_on_startup() {
                             name.compare(name.size() - 4, 4, ".idx") == 0;
         const bool is_dlt = (named_conv || named_pfx) && name.size() > 4 &&
                             name.compare(name.size() - 4, 4, ".dlt") == 0;
+        const bool is_rst = (named_conv || named_pfx) && name.size() > 4 &&
+                            name.compare(name.size() - 4, 4, ".rst") == 0;
         const bool is_tmp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
-        if (is_bin || is_idx || is_dlt || is_tmp) {
+        if (is_bin || is_idx || is_dlt || is_rst || is_tmp) {
             fs::remove(entry.path(), ec);
         }
     }
@@ -1307,6 +1361,11 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
     // through path_for_dlt after the entry loads (the .idx fast path already carries their
     // effect in the manifest data; the slow path folds them into the parsed image).
     std::vector<SpillFile> dlt_files;
+    // v3 state sidecars (conv-<serial>.rst): same orphan rule — a sidecar whose journal's main
+    // .bin is gone describes nothing. The sidecar of a SURVIVING main is validated by the
+    // fold itself (probe + seq/hash binding); a stale-.idx slow path reads it through
+    // path_for_rst. A leftover .rst.tmp is swept by the .tmp pass at the top of the scan.
+    std::vector<SpillFile> rst_files;
     // The highest serial any file names — the fresh-serial floor for the put() collision guard
     // (the park counter restarts at 1 every run; a reloaded serial must never be reused).
     uint64_t max_serial_seen = 0;
@@ -1350,6 +1409,8 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             stage_files.push_back({entry.path(), serial, is_pfx});
         } else if (tail == "dlt") {
             dlt_files.push_back({entry.path(), serial, is_pfx});
+        } else if (tail == "rst") {
+            rst_files.push_back({entry.path(), serial, is_pfx});
         }
         // ".idx" (and anything else) is read through path_for_idx, not scanned here
     }
@@ -1367,6 +1428,13 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
         // serial-prefix sweep takes it too, but a direct removal here also covers a manual
         // delete of the .bin).
         for (const auto& sf : dlt_files) {
+            const std::string main_path = path_for(sf.serial, sf.prefix);
+            if (!fs::exists(main_path, ec2) || ec2) fs::remove(sf.path, ec2);
+        }
+        // Orphan state sidecars: a .rst without its main .bin (the v3 journal's state for a
+        // conversation whose parent is gone). Unreachable — the fold only reads a .rst beside
+        // the .dlt it belongs to, and that .dlt is gone with the main.
+        for (const auto& sf : rst_files) {
             const std::string main_path = path_for(sf.serial, sf.prefix);
             if (!fs::exists(main_path, ec2) || ec2) fs::remove(sf.path, ec2);
         }
@@ -1457,25 +1525,44 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             // state the disk restores (base + journal). The .idx fast path already carries
             // that (the .idx is rewritten after every append); this is the stale-.idx
             // recovery. A journal that does not chain onto this base is junk for it —
-            // dropped whole; a torn tail is truncated.
+            // dropped whole; a torn tail is truncated. The v3 records' state comes from the
+            // conv-<serial>.rst sidecar (absent/corrupt: every v3 record is torn, the fold
+            // ends at the last v2 record or drops the journal whole).
             uint64_t e_journal_bytes = 0;
             uint32_t e_journal_records = 0;
             if (!is_pfx) {
                 const std::string dlt = path_for_dlt(serial, false);
                 std::error_code ec2;
                 if (fs::exists(dlt, ec2) && !ec2) {
-                    const DeltaFold fold = conversation_delta_apply(dlt, image);
+                    const DeltaFold fold = conversation_delta_apply(dlt, image, path_for_rst(serial));
+                    if (fold.failed) {
+                        // H6: a mid-apply I/O error or a sidecar that does not chain leaves
+                        // the image suspect — the manifest data below would describe a state
+                        // that never restored. Skip the entry (files KEPT, like a failed
+                        // read); the next start retries, and a take() may still heal a torn
+                        // tail that is the actual cause.
+                        std::fprintf(stderr, "[strata diag] spill reload: SKIP conv-%llu (journal apply "
+                                             "failed: I/O or state sidecar; KEPT on disk)\n",
+                                     (unsigned long long) serial);
+                        continue;
+                    }
                     if (fold.dropped) {
                         fs::remove(dlt, ec2);
+                        fs::remove(path_for_rst(serial), ec2);
                         std::fprintf(stderr, "strata serve: conversation spill: reload: journal "
                                              "conv-%llu.dlt does not chain onto its base — dropped\n",
                                      (unsigned long long) serial);
-                    } else if (fold.torn) {
-                        fs::resize_file(dlt, fold.valid_end, ec2);
-                        std::fprintf(stderr, "strata serve: conversation spill: reload: journal "
-                                             "conv-%llu.dlt truncated at %llu B (%zu record%s applied)\n",
-                                     (unsigned long long) serial, (unsigned long long) fold.valid_end,
-                                     fold.applied, fold.applied == 1 ? "" : "s");
+                    } else {
+                        if (fold.torn) {
+                            fs::resize_file(dlt, fold.valid_end, ec2);
+                            std::fprintf(stderr, "strata serve: conversation spill: reload: journal "
+                                                 "conv-%llu.dlt truncated at %llu B (%zu record%s applied)\n",
+                                         (unsigned long long) serial, (unsigned long long) fold.valid_end,
+                                         fold.applied, fold.applied == 1 ? "" : "s");
+                        }
+                        if (fold.state_stale) {
+                            fs::remove(path_for_rst(serial), ec2);   // a dead v3 generation's state
+                        }
                     }
                     if (!fold.dropped && fold.applied > 0) {
                         // journal bytes join the entry's disk footprint (put's accounting)
@@ -1510,12 +1597,13 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             }
             // The .bin parse covers the main image only; a layer split's stage files belong to
             // this entry too (put() counted them into its file_bytes, and the fresh .idx fast
-            // path carries that total — the slow path must arrive at the same number). Both
-            // kinds can carry stages (a conversation and a shared-prefix snapshot alike).
+            // path carries that total — the slow path must arrive at the same number), and so
+            // do the journal and its state sidecar. Both kinds can carry stages (a conversation
+            // and a shared-prefix snapshot alike).
             e.file_bytes = bytes_read + stage_files_bytes(serial, is_pfx);
             e.journal_bytes = e_journal_bytes;
             e.journal_records = e_journal_records;
-            e.file_bytes += e_journal_bytes;
+            e.file_bytes += e_journal_bytes + rst_file_bytes(serial);
             e.used = next_used_++;
             { SavedConversation discard = std::move(image); (void) discard; }   // free the K/V
             // LRU evict if over budget: drop the oldest entries (the front of entries_, which
@@ -1676,7 +1764,11 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
         if (!fs::exists(spath, ec2) || ec2) return false;
     }
     DeltaPlan plan;
-    if (!conversation_delta_plan(plan, image, base_len, keep_tokens)) {
+    // v3: seq is the record's 1-based index within the journal — the sidecar binds to it. A
+    // v2 write (journal_v3_ off, the escape hatch) passes 0 and the state rides in the record.
+    const bool v3 = journal_v3_;
+    const uint64_t seq = v3 ? uint64_t(entries_[base_index].journal_records) + 1 : 0;
+    if (!conversation_delta_plan(plan, image, base_len, keep_tokens, seq)) {
         // The selector already applies the codec's own guards (the half rule, keep <= base),
         // so a refusal here means a shape mismatch the selector cannot see (per-layer layout,
         // pooled bounds) — say which cut was refused, the writer's [delta] skip line pairs
@@ -1686,16 +1778,48 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
                      (unsigned long long) keep_tokens, (unsigned long long) base_len);
         return false;
     }
+    // ── Phase 0's instrument: the per-record breakdown (STRATA_SPILL_DIAG=1). The decision
+    // table: live+ckpt dominating the record → the state is the amplification (v3 fixes it);
+    // kv_sent >> kv_expected → the plan over-sends (fix the plan, not the format); keep <<
+    // base_len on every line → the re-render window (inherent); a constant pinned checkpoint
+    // across records → the sidecar repeats itself (the Phase 3 follow-up's trigger).
+    if (diag_) {
+        const size_t base_ckpt = entries_[base_index].ckpt_ids.size();
+        const char* branch = keep_tokens == base_len ? "grew"
+                            : keep_tokens == base_ckpt ? "ckpt" : "common-prefix";
+        std::fprintf(stderr,
+                     "strata serve: conversation spill [delta/diag] serial=%llu base_len=%llu "
+                     "keep=%llu (%s) new=%zu record=%.1f MiB%s\n",
+                     (unsigned long long) base_serial, (unsigned long long) base_len,
+                     (unsigned long long) keep_tokens, branch, image.live.ids.size(),
+                     plan.record_bytes / (1024.0 * 1024.0),
+                     conversation_delta_describe(image, plan).c_str());
+    }
+    // The sidecar's accounting: an append replaces the previous .rst wholesale, so the net
+    // cost inside the budget is the record plus the sidecar's GROWTH (never both files whole).
+    const std::string rst = path_for_rst(base_serial);
+    const uint64_t rst_old = rst_file_bytes(base_serial);
+    const uint64_t rst_new = v3 ? conversation_delta_state_bytes(image) : 0;
+    const uint64_t need = plan.record_bytes + (rst_new > rst_old ? rst_new - rst_old : 0);
     // Make room for the record in the disk budget (put_impl's pattern): the base is marked
     // in use first, so the LRU victim is never it while anything else can go.
     entries_[base_index].used = next_used_++;
-    while (bytes_ + plan.record_bytes > budget_ && !entries_.empty()) {
+    while (bytes_ + need > budget_ && !entries_.empty()) {
         if (!evict_oldest(base_serial)) break;   // nothing else to give: over budget, best effort
     }
     DiskEntry* base = find_by_serial(base_serial);
     if (base == nullptr) return false;   // impossible (it was protected), belt and braces
-    uint64_t rec = 0;
-    if (!conversation_delta_append(dlt, image, plan, rec)) return false;
+    // The free-space check a full write gets from session_file_write's min_free_bytes (the
+    // append path used to skip it — H7): the record AND the sidecar must fit beside the same
+    // 256 MiB headroom before anything is written.
+    {
+        std::error_code sp_ec;
+        const fs::space_info sp = fs::space(dir_, sp_ec);
+        if (!sp_ec && sp.available < plan.record_bytes + rst_new + 256ull * 1024 * 1024)
+            return false;
+    }
+    uint64_t rec = 0, rec_hash = 0;
+    if (!conversation_delta_append(dlt, image, plan, rec, &rec_hash)) return false;
     if (!existed) {
         // The journal's NAME must survive a crash right after its creation: flush the folder,
         // the same discipline the .bin's publish applies to its rename (Windows has no folder
@@ -1708,32 +1832,63 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
         }
 #endif
     }
+    // ── v3: the state sidecar. The record is already durable; publishing the .rst (temp +
+    // fsync + rename) is the COMMIT of the pair. On failure the record is rolled back (the
+    // journal returns to the size the entry remembers, or disappears when it never existed)
+    // and the caller falls to the full write, exactly like any other append anomaly. A v2
+    // append (the escape hatch) LEAVES an existing .rst in place: the journal's earlier v3
+    // records still chain through it, and a later fold that ends on one of them needs it —
+    // the fold itself decides the sidecar's fate (state_stale when no v3 record ever applies
+    // again). Deleting it here would strand every v3 record as a torn tail on the next take().
+    uint64_t rst_bytes = 0;
+    if (v3) {
+        if (!conversation_delta_state_write(rst, image, seq, rec_hash, rst_bytes)) {
+            std::error_code rb;
+            if (existed) fs::resize_file(dlt, base_journal, rb);
+            else fs::remove(dlt, rb);
+            fs::remove(rst + ".tmp", rb);
+            std::fprintf(stderr, "strata serve: conversation spill [delta]: state sidecar write "
+                                 "failed; record rolled back, falling back to a full write\n");
+            return false;
+        }
+    }
     // The entry becomes the post-apply state; the .idx is refreshed so the next start's fast
-    // path carries it (the .dlt's freshness pair rides along).
+    // path carries it (the .dlt's freshness pair rides along, and file_bytes already counts
+    // the .rst — the .idx needs no format change).
     base->ids = image.live.ids;
     base->imgs = image.live.imgs;
-    if (!image.checkpoints.empty()) {
-        const auto& deepest = image.checkpoints.back();
-        base->ckpt_ids = deepest.ids;
-        base->ckpt_imgs = deepest.imgs;
+    // The same full-write checkpoint selection the record/sidecar stores (see put_impl): the
+    // manifest must not promise a ckpt match the fold cannot deliver.
+    if (const ConversationCheckpoint* deepest = session_deepest_checkpoint(image.checkpoints)) {
+        base->ckpt_ids = deepest->ids;
+        base->ckpt_imgs = deepest->imgs;
     } else {
         base->ckpt_ids.clear();
         base->ckpt_imgs.clear();
     }
+    // Accounting: a v3 append's record adds and its sidecar REPLACES (subtract the old .rst,
+    // add the new one's); a v2 append touches the record alone — an existing .rst (from v3
+    // records already in the journal) stays counted, exactly as it stays on disk.
     base->journal_bytes += rec;
     ++base->journal_records;
-    base->file_bytes += rec;
-    bytes_ += rec;
+    if (v3) {
+        base->file_bytes = base->file_bytes - rst_old + rec + rst_bytes;
+        bytes_ = bytes_ - rst_old + rec + rst_bytes;
+    } else {
+        base->file_bytes += rec;
+        bytes_ += rec;
+    }
     if (!write_idx(*base, bin_path, id))
         std::fprintf(stderr, "strata serve: conversation spill: warning: could not refresh "
                              "%s.idx after a delta append (the .dlt is fine; the next start "
                              "parses the .bin and folds the journal)\n", bin_path.c_str());
     std::fprintf(stderr, "strata serve: conversation spill [delta]: +%zu tokens (%.1f MiB) "
-                         "appended to conv-%llu.dlt (base %zu tokens; journal %.1f MiB, %u record%s)\n",
+                         "appended to conv-%llu.dlt (base %zu tokens; journal %.1f MiB, %u record%s; "
+                         "state sidecar %.1f MiB)\n",
                  image.live.ids.size() - size_t(plan.keep_tokens), rec / (1024.0 * 1024.0),
                  (unsigned long long) base_serial, size_t(plan.keep_tokens),
                  base->journal_bytes / (1024.0 * 1024.0), base->journal_records,
-                 base->journal_records == 1 ? "" : "s");
+                 base->journal_records == 1 ? "" : "s", rst_file_bytes(base_serial) / (1024.0 * 1024.0));
     return true;
 }
 

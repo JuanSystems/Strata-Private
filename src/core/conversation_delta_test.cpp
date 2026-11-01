@@ -630,6 +630,427 @@ int main() {
         check(same_image(back2, trimmed_deep), "13: no-pin fold == a full write of the park");
     }
 
+    // ── 14. v3 round-trip, multi-turn: the records carry NO state (the sidecar does), so the
+    // fold must land the state of the LAST turn's image byte-exactly — four turns of growth
+    // and re-render, each append publishing its .rst, one apply at the end ─────────────────
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 200, 2);
+        SavedConversation t2 = grow(t1, 150, 3);
+        SavedConversation t3 = rerender(t2, 120, 4);          // keep < base_len (the ckpt cut)
+        SavedConversation t4 = grow(t3, 260, 5);
+        const SavedConversation* chain[4] = {&t1, &t2, &t3, &t4};
+        uint64_t total = 0;
+        for (size_t turn = 0; turn < 4; ++turn) {
+            const uint64_t prev = turn == 0 ? 1000 : chain[turn - 1]->live.ids.size();
+            const uint64_t keep = turn == 2
+                ? (uint64_t) t2.checkpoints.back().ids.size()   // the re-render's anchor
+                : prev;
+            DeltaPlan plan;
+            check(conversation_delta_plan(plan, *chain[turn], prev, keep, turn + 1),
+                  "14: v3 plan lands");
+            check(plan.version == kDeltaVersion && plan.seq == turn + 1, "14: the plan is v3");
+            uint64_t rec = 0, hash = 0;
+            check(conversation_delta_append(journal, *chain[turn], plan, rec, &hash),
+                  "14: v3 append lands");
+            uint64_t rst_bytes = 0;
+            check(conversation_delta_state_write(rst, *chain[turn], turn + 1, hash, rst_bytes),
+                  "14: the state sidecar lands");
+            check(rst_bytes == conversation_delta_state_bytes(*chain[turn]),
+                  "14: the sidecar's size is the estimate's");
+            // the size bound: the record is the K/V it sends + a fixed slack, NOT O(state)
+            uint64_t kv_sent = 0;
+            for (const auto& layer : plan.images[0].parts)
+                for (const auto& part : layer) kv_sent += part.n;
+            check(plan.record_bytes <= kv_sent + kv_sent / 20 + 64 * 1024,
+                  "14: the record is the K/V + 5% + 64 KiB, nothing else");
+            total += rec;
+        }
+        // the record's size is INDEPENDENT of the live state: the same turn with a 64 KiB
+        // state array plans the same record bytes as with a 2 B one (the state is in the
+        // sidecar, and only there)
+        {
+            SavedConversation big = t4, small = t4;
+            big.live.gdn.assign(64 * 1024, 0xab);
+            small.live.gdn.assign(2, 0xcd);
+            DeltaPlan pb, ps;
+            check(conversation_delta_plan(pb, big, t3.live.ids.size(), t3.live.ids.size(), 5) &&
+                  conversation_delta_plan(ps, small, t3.live.ids.size(), t3.live.ids.size(), 5),
+                  "14: both state shapes plan");
+            check(pb.record_bytes == ps.record_bytes,
+                  "14: the record size does not grow with the state (it is in the sidecar)");
+            check(conversation_delta_state_bytes(big) > conversation_delta_state_bytes(small),
+                  "14: the SIDECAR grows with the state (that is where it lives)");
+        }
+        check(fs::file_size(journal) == total, "14: the journal holds exactly four records");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 4 && !fold.torn && !fold.dropped && !fold.failed,
+              "14: four v3 records applied cleanly");
+        check(same_image(back, t4), "14: base + 4 light records + sidecar == turn 4, byte-exactly");
+        // the sidecar holds turn 4's state: same image regardless of how many records precede
+        check(conversation_delta_state_bytes(t4) == conversation_delta_state_bytes(t4),
+              "14: the sidecar size is a function of the image alone");
+    }
+
+    // ── 15. v3 layer-split round-trip: one record per turn covers BOTH images, the sidecar
+    // carries both states, the fold reproduces main AND stage byte-exactly ─────────────────
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        base.layer_lo = 0; base.layer_hi = 40;
+        {
+            SavedConversation stage = image_of(1000, 9);
+            stage.layer_lo = 40; stage.layer_hi = 48;
+            stage.live = base.live; stage.checkpoints = base.checkpoints;
+            base.stage_images.push_back(std::move(stage));
+        }
+        SavedConversation t1 = grow(base, 120, 2);
+        t1.stage_images.clear();
+        {
+            SavedConversation nstage = grow(base.stage_images[0], 120, 3);
+            nstage.layer_lo = 40; nstage.layer_hi = 48;
+            nstage.live = t1.live; nstage.checkpoints = t1.checkpoints;
+            t1.stage_images.push_back(std::move(nstage));
+        }
+        SavedConversation t2 = grow(t1, 90, 4);
+        t2.stage_images.clear();
+        {
+            SavedConversation nstage = grow(t1.stage_images[0], 90, 5);
+            nstage.layer_lo = 40; nstage.layer_hi = 48;
+            nstage.live = t2.live; nstage.checkpoints = t2.checkpoints;
+            t2.stage_images.push_back(std::move(nstage));
+        }
+        uint64_t rec1 = 0, hash1 = 0, rec2 = 0, hash2 = 0;
+        DeltaPlan p1, p2;
+        {
+            uint64_t rst_bytes = 0;
+            check(conversation_delta_plan(p1, t1, 1000, 1000, 1), "15: v3 plan 1 (2 images)");
+            check(conversation_delta_append(journal, t1, p1, rec1, &hash1), "15: v3 append 1");
+            check(conversation_delta_state_write(rst, t1, 1, hash1, rst_bytes), "15: sidecar 1");
+        }
+        {
+            uint64_t rst_bytes = 0;
+            check(conversation_delta_plan(p2, t2, t1.live.ids.size(), t1.live.ids.size(), 2),
+                  "15: v3 plan 2");
+            check(conversation_delta_append(journal, t2, p2, rec2, &hash2), "15: v3 append 2");
+            check(conversation_delta_state_write(rst, t2, 2, hash2, rst_bytes), "15: sidecar 2");
+        }
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 2 && !fold.torn && !fold.failed, "15: two v3 records applied");
+        check(same_image(back, t2), "15: the main reproduces turn 2 byte-exactly");
+        check(back.stage_images.size() == 1 && same_image(back.stage_images[0], t2.stage_images[0]),
+              "15: the stage reproduces turn 2 byte-exactly");
+    }
+
+    // ── 16. Mixed journal: two v2 records (seq=0) then two v3 — one file, one fold, the
+    // state of the last applied record wins (records 1-2 carry theirs, 3-4 take the sidecar's)
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 100, 2);
+        SavedConversation t2 = grow(t1, 110, 3);
+        SavedConversation t3 = grow(t2, 120, 4);
+        SavedConversation t4 = grow(t3, 130, 5);
+        uint64_t rec = 0, hash = 0;
+        DeltaPlan p;
+        // v2 records first
+        check(conversation_delta_plan(p, t1, 1000, 1000, 0) && p.version == kDeltaVersionV2,
+              "16: plan 1 is v2");
+        check(conversation_delta_append(journal, t1, p, rec), "16: v2 record 1 lands");
+        check(conversation_delta_plan(p, t2, t1.live.ids.size(), t1.live.ids.size(), 0),
+              "16: plan 2 is v2");
+        check(conversation_delta_append(journal, t2, p, rec), "16: v2 record 2 lands");
+        // then v3 records (seq 3 and 4 — their 1-based index within the journal)
+        check(conversation_delta_plan(p, t3, t2.live.ids.size(), t2.live.ids.size(), 3),
+              "16: plan 3 is v3");
+        check(conversation_delta_append(journal, t3, p, rec, &hash), "16: v3 record 3 lands");
+        uint64_t rst_bytes = 0;
+        check(conversation_delta_state_write(rst, t3, 3, hash, rst_bytes), "16: sidecar at 3");
+        check(conversation_delta_plan(p, t4, t3.live.ids.size(), t3.live.ids.size(), 4),
+              "16: plan 4 is v3");
+        check(conversation_delta_append(journal, t4, p, rec, &hash), "16: v3 record 4 lands");
+        rst_bytes = 0;
+        check(conversation_delta_state_write(rst, t4, 4, hash, rst_bytes), "16: sidecar at 4");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 4 && !fold.torn && !fold.failed, "16: the mixed fold applies 4");
+        check(same_image(back, t4), "16: v2 then v3 lands turn 4 byte-exactly");
+    }
+
+    // ── 17. v3 without a usable sidecar: an empty path, a corrupt body, a corrupt trailer
+    // and a truncated file all make the first v3 record a torn tail — the journal drops whole
+    // (nothing chains for the base) and the base restores alone ────────────────────────────
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 150, 2);
+        uint64_t rec = 0, hash = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, t1, 1000, 1000, 1) &&
+              conversation_delta_append(journal, t1, p, rec, &hash) &&
+              conversation_delta_state_write(rst, t1, 1, hash, rec),
+              "17: the v3 pair lands");
+        // (a) no state_path at all
+        SavedConversation back1 = base;
+        const DeltaFold f1 = conversation_delta_apply(journal, back1);
+        check(f1.applied == 0 && f1.torn && f1.dropped, "17: no sidecar → dropped whole");
+        check(same_image(back1, base), "17: (a) the base is untouched");
+        // (b) a corrupt byte in the sidecar's body
+        for (const size_t at : {size_t(40), size_t(60)}) {
+            const std::string bad = (dir / "conv-1.bad.rst").string();
+            fs::copy_file(rst, bad, fs::copy_options::overwrite_existing);
+            {
+                std::FILE* f = std::fopen(bad.c_str(), "r+b");
+                std::fseek(f, (long) at, SEEK_SET);
+                const int c = std::fgetc(f);
+                std::fseek(f, (long) at, SEEK_SET);
+                std::fputc(c ^ 0x5a, f);
+                std::fclose(f);
+            }
+            SavedConversation back2 = base;
+            const DeltaFold f2 = conversation_delta_apply(journal, back2, bad);
+            check(f2.applied == 0 && f2.dropped, "17: a corrupt sidecar body → dropped");
+        }
+        // (c) a corrupt byte in the sidecar's trailer (the hash word)
+        {
+            constexpr size_t kSidecarTrailer = 20;   // u64 hash + u64 total + "ERST"
+            const std::string bad = (dir / "conv-1.bad.rst").string();
+            fs::copy_file(rst, bad, fs::copy_options::overwrite_existing);
+            const uint64_t size = fs::file_size(bad);
+            std::FILE* f = std::fopen(bad.c_str(), "r+b");
+            std::fseek(f, (long) (size - kSidecarTrailer), SEEK_SET);
+            const int c = std::fgetc(f);
+            std::fseek(f, (long) (size - kSidecarTrailer), SEEK_SET);
+            std::fputc(c ^ 0xff, f);
+            std::fclose(f);
+            SavedConversation back3 = base;
+            const DeltaFold f3 = conversation_delta_apply(journal, back3, bad);
+            check(f3.applied == 0 && f3.dropped, "17: a corrupt sidecar trailer → dropped");
+        }
+        // (d) a truncated sidecar
+        {
+            const std::string bad = (dir / "conv-1.bad.rst").string();
+            fs::copy_file(rst, bad, fs::copy_options::overwrite_existing);
+            std::error_code ec;
+            fs::resize_file(bad, fs::file_size(bad) / 2, ec);
+            check(!ec, "17: truncation works");
+            SavedConversation back4 = base;
+            const DeltaFold f4 = conversation_delta_apply(journal, back4, bad);
+            check(f4.applied == 0 && f4.dropped, "17: a truncated sidecar → dropped");
+            fs::remove(bad);
+        }
+        // (e) the intact sidecar still folds (the corruptions above touched copies only)
+        SavedConversation back5 = base;
+        const DeltaFold f5 = conversation_delta_apply(journal, back5, rst);
+        check(f5.applied == 1 && !f5.failed, "17: the intact pair still folds");
+        check(same_image(back5, t1), "17: (e) the image is turn 1's");
+    }
+
+    // ── 18. The crash window between the record append and the sidecar's rename: the .dlt
+    // holds N records but the .rst still describes N-1. The fold applies 1..N-1, flags the
+    // tail torn at record N (its seq passes the sidecar's coverage), and the state loads for
+    // N-1 — the caller truncates the .dlt and the pair is coherent again ──────────────────
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 100, 2);
+        SavedConversation t2 = grow(t1, 110, 3);
+        uint64_t rec1 = 0, hash1 = 0, rec2 = 0, rst_bytes = 0;
+        DeltaPlan p1, p2;
+        check(conversation_delta_plan(p1, t1, 1000, 1000, 1) &&
+              conversation_delta_append(journal, t1, p1, rec1, &hash1) &&
+              conversation_delta_state_write(rst, t1, 1, hash1, rst_bytes),
+              "18: the turn-1 pair lands");
+        // the crash: record 2 appended, the sidecar's rewrite never happened
+        check(conversation_delta_plan(p2, t2, t1.live.ids.size(), t1.live.ids.size(), 2) &&
+              conversation_delta_append(journal, t2, p2, rec2),
+              "18: record 2 lands without its sidecar");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 1 && fold.torn && !fold.failed, "18: the fold ends one record early");
+        check(fold.valid_end == rec1, "18: the valid end is record 1's");
+        check(same_image(back, t1), "18: the state is turn 1's (the sidecar's)");
+        // after the caller truncates, the fold is clean
+        std::error_code ec;
+        fs::resize_file(journal, fold.valid_end, ec);
+        check(!ec, "18: truncate works");
+        SavedConversation again = base;
+        const DeltaFold fold2 = conversation_delta_apply(journal, again, rst);
+        check(fold2.applied == 1 && !fold2.torn && !fold2.failed, "18: the healed pair folds clean");
+        check(same_image(again, t1), "18: the healed pair yields turn 1");
+    }
+
+    // ── 19. A sidecar from ANOTHER generation: its (seq, record_hash) describes a record 2
+    // the journal does not hold (or holds in another form) — the stamp mismatch is `failed`,
+    // never a silent state/K-V mismatch ──────────────────────────────────────────────────
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 100, 2);
+        SavedConversation t2 = grow(t1, 110, 3);
+        uint64_t rec = 0, hash = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, t1, 1000, 1000, 1) &&
+              conversation_delta_append(journal, t1, p, rec, &hash),
+              "19: record 1 lands");
+        // a sidecar stamped seq=1 but the hash of a DIFFERENT record (another generation's
+        // record 1 — e.g. the .dlt was rewritten by a restore under the same serial)
+        uint64_t other_hash = hash ^ 0xdeadbeefdeadbeefull;
+        uint64_t rst_bytes = 0;
+        check(conversation_delta_state_write(rst, t1, 1, other_hash, rst_bytes),
+              "19: the foreign sidecar lands");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 1 && fold.failed, "19: the stamp mismatch is failed");
+    }
+
+    // ── 20. Corruption in the middle: record k < N's payload is corrupt while the sidecar
+    // describes N. The fold tears at k, and the state for k no longer exists anywhere (the
+    // v2 records that carried it are gone) — failed, the images are suspect (Fase 4's case)
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 100, 2);
+        SavedConversation t2 = grow(t1, 110, 3);
+        SavedConversation t3 = grow(t2, 120, 4);
+        uint64_t rec1 = 0, hash1 = 0, rec2 = 0, hash2 = 0, rec3 = 0, hash3 = 0, rst_bytes = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, t1, 1000, 1000, 1) &&
+              conversation_delta_append(journal, t1, p, rec1, &hash1) &&
+              conversation_delta_state_write(rst, t1, 1, hash1, rst_bytes), "20: turn 1 lands");
+        check(conversation_delta_plan(p, t2, t1.live.ids.size(), t1.live.ids.size(), 2) &&
+              conversation_delta_append(journal, t2, p, rec2, &hash2) &&
+              conversation_delta_state_write(rst, t2, 2, hash2, rst_bytes), "20: turn 2 lands");
+        check(conversation_delta_plan(p, t3, t2.live.ids.size(), t2.live.ids.size(), 3) &&
+              conversation_delta_append(journal, t3, p, rec3, &hash3) &&
+              conversation_delta_state_write(rst, t3, 3, hash3, rst_bytes), "20: turn 3 lands");
+        // corrupt record 2's payload (inside rec2's span, past its header)
+        {
+            std::FILE* f = std::fopen(journal.c_str(), "r+b");
+            std::fseek(f, (long) (rec1 + 200), SEEK_SET);
+            const int c = std::fgetc(f);
+            std::fseek(f, (long) (rec1 + 200), SEEK_SET);
+            std::fputc(c ^ 0xff, f);
+            std::fclose(f);
+        }
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 1 && fold.torn && fold.failed,
+              "20: mid-corruption tears at 1 and fails (the state for 1 is gone)");
+    }
+
+    // ── 21. state_stale: a journal of v2 records with a sidecar beside it — the .rst
+    // describes a v3 generation nothing reaches, the fold reports it, the state comes from
+    // the records and the caller deletes the orphan ──────────────────────────────────────
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 100, 2);
+        SavedConversation t2 = grow(t1, 110, 3);
+        uint64_t rec = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, t1, 1000, 1000, 0) &&
+              conversation_delta_append(journal, t1, p, rec), "21: v2 record 1 lands");
+        check(conversation_delta_plan(p, t2, t1.live.ids.size(), t1.live.ids.size(), 0) &&
+              conversation_delta_append(journal, t2, p, rec), "21: v2 record 2 lands");
+        uint64_t rst_bytes = 0;
+        check(conversation_delta_state_write(rst, t2, 9, 0, rst_bytes),
+              "21: an orphan sidecar lands beside the v2 journal");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 2 && !fold.failed && fold.state_stale && !fold.dropped,
+              "21: the v2 fold succeeds and flags the sidecar stale");
+        check(same_image(back, t2), "21: the state comes from the records");
+        fs::remove(rst);
+        SavedConversation again = base;
+        const DeltaFold fold2 = conversation_delta_apply(journal, again, rst);
+        check(fold2.applied == 2 && !fold2.state_stale, "21: without the orphan, no stale flag");
+    }
+
+    // ── 22. An empty journal with a sidecar: nothing applies, the sidecar is stale ───────
+    {
+        const std::string empty = (dir / "conv-empty2.dlt").string();
+        const std::string rst = (dir / "conv-empty2.rst").string();
+        { std::FILE* f = std::fopen(empty.c_str(), "wb"); std::fclose(f); }
+        SavedConversation img = image_of(1000, 1);
+        uint64_t rst_bytes = 0;
+        check(conversation_delta_state_write(rst, img, 1, 0, rst_bytes), "22: the sidecar lands");
+        const DeltaFold fold = conversation_delta_apply(empty, img, rst);
+        check(fold.had_journal && fold.applied == 0 && !fold.dropped && fold.state_stale,
+              "22: an empty journal with a sidecar reports state_stale");
+    }
+
+    // ── 23. The Phase 0 instrument: describe() returns the per-image breakdown with the
+    // markers the [delta/diag] log greps for ─────────────────────────────────────────────
+    {
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation next = grow(base, 300, 2);
+        DeltaPlan plan;
+        check(conversation_delta_plan(plan, next, 1000, 1000), "23: the plan lands");
+        const std::string d = conversation_delta_describe(next, plan);
+        check(d.find("img0") != std::string::npos && d.find("live=") != std::string::npos &&
+              d.find("kv_sent=") != std::string::npos && d.find("kv_expected=") != std::string::npos,
+              "23: describe carries the breakdown markers");
+    }
+
+    // ── 24. The v3 → v2 transition (STRATA_SPILL_JOURNAL_V3=0 after v3 records): a v2 record
+    // appended after v3 ones carries its own state, but the EARLIER records still chain
+    // through the sidecar — the fold applies all of them, takes record 3's state, and the
+    // sidecar is NOT stale (a tail tear could yet land the fold on record 2) ────────────────
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(1000, 1);
+        SavedConversation t1 = grow(base, 100, 2);
+        SavedConversation t2 = grow(t1, 110, 3);
+        SavedConversation t3 = grow(t2, 120, 4);
+        uint64_t rec = 0, hash = 0, rst_bytes = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, t1, 1000, 1000, 1) &&
+              conversation_delta_append(journal, t1, p, rec, &hash) &&
+              conversation_delta_state_write(rst, t1, 1, hash, rst_bytes), "24: v3 record 1");
+        check(conversation_delta_plan(p, t2, t1.live.ids.size(), t1.live.ids.size(), 2) &&
+              conversation_delta_append(journal, t2, p, rec, &hash) &&
+              conversation_delta_state_write(rst, t2, 2, hash, rst_bytes), "24: v3 record 2");
+        // the escape hatch lands a v2 record (seq = 0) and the sidecar stays at seq 2
+        check(conversation_delta_plan(p, t3, t2.live.ids.size(), t2.live.ids.size(), 0) &&
+              p.version == kDeltaVersionV2 && conversation_delta_append(journal, t3, p, rec),
+              "24: v2 record 3 lands");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 3 && !fold.torn && !fold.failed && !fold.state_stale,
+              "24: the mixed v3,v3,v2 fold applies all three and keeps the sidecar live");
+        check(same_image(back, t3), "24: the state is record 3's own (it is v2)");
+        // and a take that truncates back to the v3 pair still restores through the sidecar
+        std::error_code ec;
+        fs::resize_file(journal, fold.valid_end - rec, ec);
+        SavedConversation again = base;
+        const DeltaFold fold2 = conversation_delta_apply(journal, again, rst);
+        check(fold2.applied == 2 && !fold2.failed && !fold2.state_stale,
+              "24: a tail tear onto the v3 pair still folds through the sidecar");
+        check(same_image(again, t2), "24: the sidecar's state lands (record 2's)");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_delta_test: %d checks passed\n", checks);
     return 0;
