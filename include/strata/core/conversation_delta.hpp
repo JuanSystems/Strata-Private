@@ -247,11 +247,6 @@ inline constexpr uint32_t kDeltaVersion = 3;
 /// The state sidecar's magic values (conv-<serial>.rst).
 inline constexpr char kStateMagic[4] = {'S', 'R', 'S', 'T'};
 inline constexpr char kStateEndMagic[4] = {'E', 'R', 'S', 'T'};
-/// v2: the checkpoint a record/sidecar carries now includes its `kind` (1 byte after `used`).
-/// The spill-resume selection reads `kind` to skip `end_of_prompt` checkpoints (the effort-tail
-/// turn the next prompt does not re-send). A v1 .rst (without the kind byte) restores as
-/// `periodic` (the default), and the selection treats it as eligible — retro-compatible with
-/// every spill written before this bump (the bug stays for old .rst, new ones heal).
-inline constexpr uint32_t kStateVersion = 2;
+inline constexpr uint32_t kStateVersion = 1;
 
 } // namespace strata::core
