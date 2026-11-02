@@ -419,6 +419,7 @@ bool read_record_front(std::FILE* f, const RecordHeader& h, std::vector<uint8_t>
 
 // ── The v3 state sidecar's reader helpers (sequential reads, bounded against the file) ──────
 bool read_exact(std::FILE* f, void* dst, size_t n) { return n == 0 || std::fread(dst, 1, n, f) == n; }
+bool read_u8(std::FILE* f, uint8_t& v) { return read_exact(f, &v, 1); }
 bool read_u32(std::FILE* f, uint32_t& v) {
     uint8_t t[4]; size_t at = 0;
     return read_exact(f, t, 4) && get_u32(t, 4, at, v);
@@ -428,15 +429,22 @@ bool read_u64(std::FILE* f, uint64_t& v) {
     return read_exact(f, t, 8) && get_u64(t, 8, at, v);
 }
 
-// What state_file_probe validated: the sidecar's stamp (seq + record_hash) and exact size.
+// What state_file_probe validated: the sidecar's stamp (seq + record_hash), exact size, and
+// the format version (1 = pre-kind, every checkpoint loads as periodic; 2 = kind byte after
+// `used`). The load path branches on `version` to read the kind byte only when present.
 struct StateFileInfo {
     uint64_t seq = 0, record_hash = 0, total = 0;
     uint32_t n_images = 0;
+    uint32_t version = 0;
 };
 
 // Validate a .rst whole (magic, version, streaming FNV over the body, trailer hash + size +
-// end magic) and report its stamp. The load path re-reads without re-hashing: the file cannot
-// move under us (the writer is drained first), so the probe's verdict holds.
+// end magic) and report its stamp. Accepts BOTH v1 (pre-kind: the checkpoint loads as
+// periodic, the spill-resume selection treats it as eligible — retro-compatible with every
+// spill written before the kind byte) and v2 (kind byte after `used`). The streaming hash
+// covers the body exactly as the writer emitted it, so the version's layout difference (the
+// kind byte) is part of the hash for v2 and not for v1 — the probe re-reads the file the
+// writer left, whatever its version.
 bool state_file_probe(const std::string& path, StateFileInfo& info) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -455,7 +463,11 @@ bool state_file_probe(const std::string& path, StateFileInfo& info) {
         {
             size_t at = 4;
             uint32_t version = 0, reserved = 0;
-            if (!get_u32(head, sizeof(head), at, version) || version != kStateVersion) break;
+            if (!get_u32(head, sizeof(head), at, version)) break;
+            // Accept v1 (pre-kind) and v2 (kind byte). A future v3+ is a torn tail: the
+            // writer only emits v2, so anything else is a different generation's file.
+            if (version != 1 && version != kStateVersion) break;
+            info.version = version;
             if (!get_u64(head, sizeof(head), at, info.seq) ||
                 !get_u64(head, sizeof(head), at, info.record_hash) ||
                 !get_u32(head, sizeof(head), at, info.n_images) ||
@@ -496,9 +508,11 @@ bool state_file_probe(const std::string& path, StateFileInfo& info) {
     return ok;
 }
 
-// One checkpoint block from the sidecar (the writer's put_checkpoint_head + arrays + used),
-// bounded by `left` (the bytes the probe said the body holds).
-bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c) {
+// One checkpoint block from the sidecar (the writer's put_checkpoint_head + arrays + used,
+// and for v2 the trailing `kind` byte), bounded by `left` (the bytes the probe said the body
+// holds). `has_kind`: true for a v2 .rst (read the kind byte after `used`); false for v1
+// (the checkpoint loads as periodic — the default, retro-compatible).
+bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c, bool has_kind) {
     auto take_n = [&](uint64_t n) { if (n > left) return false; left -= n; return true; };
     uint64_t n_ids = 0, n_imgs = 0;
     if (!take_n(8) || !read_u64(f, n_ids) || !take_n(n_ids * 4)) return false;
@@ -522,7 +536,13 @@ bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c) {
         dst.resize(size_t(sz));
         if (!read_exact(f, dst.data(), dst.size())) return false;
     }
-    return take_n(8) && read_u64(f, c.used);
+    if (!take_n(8) || !read_u64(f, c.used)) return false;
+    if (has_kind) {
+        uint8_t k = 0;
+        if (!take_n(1) || !read_u8(f, k)) return false;
+        c.kind = CheckpointKind(k);
+    }
+    return true;
 }
 
 // Load a PROBED sidecar onto the images the reader holds (main + stages, in order): the live
@@ -554,7 +574,7 @@ bool state_file_load(const std::string& path, const StateFileInfo& info,
         img.checkpoints.clear();
         if (ok && n_ckpt == 1) {
             img.checkpoints.resize(1);
-            ok = read_checkpoint(f, left, img.checkpoints[0]);
+            ok = read_checkpoint(f, left, img.checkpoints[0], info.version >= kStateVersion);
         }
     }
     std::fclose(f);
@@ -754,7 +774,7 @@ uint64_t conversation_delta_state_bytes(const SavedConversation& image) {
         n += 8 + 40 + 4;   // geometry echo + the 5 sizes + the checkpoint count
         for (size_t i = 0; i < 5; ++i) n += state_of(img->live, i)->size();
         if (const ConversationCheckpoint* sel = record_checkpoint(img->checkpoints))
-            n += checkpoint_bytes(*sel);
+            n += checkpoint_bytes(*sel) + 1;   // +1 for the v2 `kind` byte after `used`
     }
     return n + kTrailerBytes;
 }
@@ -809,6 +829,11 @@ bool conversation_delta_state_write(const std::string& path, const SavedConversa
                     ok = emit_u64(s.size()) && emit(s.data(), s.size());
                 }
                 ok = ok && emit_u64(sel->used);
+                // v2: the checkpoint's kind (1 byte). The spill-resume selection reads it to
+                // skip end_of_prompt checkpoints. put_u8 is the same helper the header uses.
+                std::vector<uint8_t> kb;
+                put_u8(kb, uint8_t(sel->kind));
+                ok = ok && emit(kb.data(), kb.size());
             }
             if (!ok) break;
         }

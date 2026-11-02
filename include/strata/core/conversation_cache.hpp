@@ -27,6 +27,25 @@ struct ConversationImageKey {
     bool operator==(const ConversationImageKey&) const = default;
 };
 
+// Why a checkpoint was created — the spill-resume selection (spill_resume_checkpoint)
+// uses this to skip `end_of_prompt` checkpoints when a `turn` is available: the client
+// (zoocode/roocode) re-renders the history without the assistant's thinking tokens AND
+// without the effort-tail system turn the server inserts at the end of the prompt
+// (--tail-role-token). The checkpoint at n-1 (end_of_prompt) carries that effort-tail
+// turn, so it is NEVER a prefix of the next prompt. The checkpoint at turn_at (~n-30,
+// just before the effort turn) IS a prefix — the resume point the engine needs.
+// Default `periodic` (0) is what every pre-existing checkpoint carries: a v1 .bin or a
+// v1 .rst (without the kind byte) restores as periodic, and the selection treats it as
+// eligible (the deepest wins), preserving today's behavior for old spills.
+enum class CheckpointKind : uint8_t {
+    periodic      = 0, // every --prompt-cache-every tokens during prefill
+    turn          = 1, // turn_at: the last turn-boundary <|im_start|> before the response
+    root          = 2, // root_at: the first <|im_start|> (the system-prompt root)
+    pin           = 3, // pin_at: a pinned shared-prefix checkpoint (also pinned=true)
+    end_of_prompt = 4, // n-1: the checkpoint at the last prompt token (carries the effort-tail turn)
+    message       = 5, // message_at: a message-boundary checkpoint
+};
+
 struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
@@ -36,6 +55,12 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // The checkpoint's kind (see CheckpointKind). Default periodic: retro-compatible with
+    // every spill written before this field existed (v1 .bin / v1 .rst). The spill-resume
+    // selection reads it to skip end_of_prompt checkpoints (the effort-tail turn the next
+    // prompt does not re-send); the full-write .bin does NOT persist it (inferred on read:
+    // end_of_prompt when ids.size()+1 == live.ids.size()), the .rst persists it as 1 byte.
+    CheckpointKind kind = CheckpointKind::periodic;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;

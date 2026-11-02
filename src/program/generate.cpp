@@ -8793,18 +8793,27 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 strata::core::CheckpointKind kind = strata::core::CheckpointKind::periodic) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
                     c.used = ++check_clock;
+                    // Promote the kind: a more specific one (turn/root/pin/end_of_prompt/message)
+                    // overrides periodic, and end_of_prompt overrides turn (the n-1 checkpoint is
+                    // both the turn AND the end-of-prompt when there is no effort tail). A periodic
+                    // re-touch never demotes a specific kind.
+                    if (kind != strata::core::CheckpointKind::periodic &&
+                        c.kind == strata::core::CheckpointKind::periodic)
+                        c.kind = kind;
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
+            c.kind = kind;
             if (parts != nullptr) {
                 if (parts->size() != stages.size() + 1) return false;
                 c.gdn = std::move((*parts)[0].gdn);
@@ -12425,7 +12434,17 @@ int main(int argc, char** argv) {
                 // cells past it. ckpt=0 keeps no checkpoint, as with every other cut.
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at || (req_ckpt && to == n - 1)) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at &&
-                                   to != n - 1)) {   // the tail kind leaves first
+                                   to != n - 1,
+                                   // kind: end_of_prompt for the n-1 cut (carries the effort-tail
+                                   // turn the next prompt does not re-send); turn for turn_at; root
+                                   // for root_at; pin for pin_at; message for message_at. periodic
+                                   // for the rest (the selection treats them as eligible).
+                                   to == n - 1 ? strata::core::CheckpointKind::end_of_prompt
+                                   : to == turn_at ? strata::core::CheckpointKind::turn
+                                   : to == root_at ? strata::core::CheckpointKind::root
+                                   : to == pin_at ? strata::core::CheckpointKind::pin
+                                   : to == message_at ? strata::core::CheckpointKind::message
+                                   : strata::core::CheckpointKind::periodic)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }

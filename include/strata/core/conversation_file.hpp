@@ -200,11 +200,52 @@ const ConversationCheckpoint* session_deepest_checkpoint(const std::vector<Conve
 // client's own render" — an identity a different conversation of the same client never contains.
 // Inline: a pure selection over the chain, and the delta codec's test target links no
 // conversation_file.cpp — an out-of-line definition would break it.
+//
+// The spill's resume checkpoint: the chain's DEEPEST, IGNORING `pinned`, AND skipping
+// `end_of_prompt` checkpoints when a non-end_of_prompt one exists. The end_of_prompt
+// checkpoint (at n-1, the last prompt token) carries the effort-tail system turn the
+// server inserts via --tail-role-token: the next prompt does NOT re-send that turn, so
+// the end_of_prompt checkpoint is NEVER a prefix of the next prompt. The turn_at
+// checkpoint (~n-30, just before the effort turn) IS a prefix — the resume point the
+// engine needs. When the chain has NO non-end_of_prompt checkpoint (e.g. a client with
+// no effort tail, where turn_at == n-1 and the checkpoint at n-1 IS the turn), the
+// deepest wins (today's behavior), so the rule is conservative: it only changes the
+// selection when there is a strictly better choice.
 inline const ConversationCheckpoint* spill_resume_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
     const ConversationCheckpoint* deepest = nullptr;
-    for (const auto& c : chain)
+    const ConversationCheckpoint* best_non_eop = nullptr;
+    for (const auto& c : chain) {
         if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-    return deepest;
+        if (c.kind == CheckpointKind::end_of_prompt) continue;
+        if (!best_non_eop || c.ids.size() > best_non_eop->ids.size()) best_non_eop = &c;
+    }
+    return best_non_eop ? best_non_eop : deepest;
+}
+
+// Infer the `kind` of each checkpoint a v1 .bin restored: the .bin does NOT persist `kind`
+// (the field is new and the format is frozen), so every checkpoint loads as `periodic`. The
+// one case that matters for the spill-resume selection is `end_of_prompt` (the checkpoint at
+// n-1, the last prompt token, which carries the effort-tail turn the next prompt does not
+// re-send): a checkpoint whose ids are exactly [0, live.size()-1) of the restored live is
+// marked `end_of_prompt`. The inference runs BEFORE a delta apply (the .rst's checkpoint, if
+// any, replaces the chain afterwards and carries its own kind), so it only needs to handle
+// the .bin's own chain. False positives (a periodic checkpoint that lands on n-1 by chance)
+// are rare — prompt_cache_every is 16384 by default — and the cost is treating one periodic
+// as end_of_prompt (the selection skips it when a deeper non-end_of_prompt exists, which is
+// the desired behavior anyway).
+inline void infer_checkpoint_kinds(SavedConversation& image) {
+    const size_t live_n = image.live.ids.size();
+    if (live_n == 0) return;
+    for (auto& c : image.checkpoints)
+        if (c.kind == CheckpointKind::periodic && c.ids.size() + 1 == live_n)
+            c.kind = CheckpointKind::end_of_prompt;
+    for (auto& st : image.stage_images) {
+        const size_t st_n = st.live.ids.size();
+        if (st_n == 0) continue;
+        for (auto& c : st.checkpoints)
+            if (c.kind == CheckpointKind::periodic && c.ids.size() + 1 == st_n)
+                c.kind = CheckpointKind::end_of_prompt;
+    }
 }
 
 // What a SAVE copies into RAM besides what the engine already holds, for its RAM preflight.
