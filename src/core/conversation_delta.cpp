@@ -5,7 +5,7 @@
 // atomic publish (temp + rename + directory fsync) — the same discipline the store's .bin and
 // .idx writes already use.
 #include "strata/core/conversation_delta.hpp"
-#include "strata/core/conversation_file.hpp"   // spill_resume_checkpoint (the record's ONE checkpoint)
+#include "strata/core/conversation_file.hpp"   // spill_resume_checkpoint / spill_resume_checkpoints (the record's ONE checkpoint / the .rst's resume SET)
 
 #include <algorithm>
 #include <cstdio>
@@ -135,6 +135,19 @@ std::vector<uint8_t>* state_of(ConversationCheckpoint& c, size_t i) {
 // away and dropped every delta-restored resume back to the system prompt).
 const ConversationCheckpoint* record_checkpoint(const std::vector<ConversationCheckpoint>& chain) {
     return spill_resume_checkpoint(chain);
+}
+
+// The checkpoint SET the v3 state sidecar (.rst) carries per image — spill_resume_checkpoints'
+// selection (the resume points a restore can offer: the deepest, the two deepest turn
+// boundaries, the deepest periodic). The .rst REPLACES itself at every append, so the set's
+// cost is steady-state per conversation, not per record; the fold loads exactly this set as
+// the image's chain, and the manifest's ckpt_lens must promise exactly these lengths.
+// The v2 record keeps its ONE checkpoint (the escape hatch reproduces the pre-v3 shape
+// byte-for-byte; its fold then lands on the deepest alone — honest, and the default path is
+// the one that carries the set).
+void record_checkpoint_set(const std::vector<ConversationCheckpoint>& chain,
+                           std::vector<const ConversationCheckpoint*>& out) {
+    spill_resume_checkpoints(chain, out);
 }
 
 // The image list a record covers: the main first, then its stage images in order.
@@ -428,10 +441,14 @@ bool read_u64(std::FILE* f, uint64_t& v) {
     return read_exact(f, t, 8) && get_u64(t, 8, at, v);
 }
 
-// What state_file_probe validated: the sidecar's stamp (seq + record_hash) and exact size.
+// What state_file_probe validated: the sidecar's stamp (seq + record_hash), exact size, and
+// the format version (1 = pre-set: ONE checkpoint per image, no kind byte; 2 = the resume SET
+// with a kind byte per checkpoint). The load path branches on `version` to read the set (and
+// the kind byte) only when present.
 struct StateFileInfo {
     uint64_t seq = 0, record_hash = 0, total = 0;
     uint32_t n_images = 0;
+    uint32_t version = 0;
 };
 
 // Validate a .rst whole (magic, version, streaming FNV over the body, trailer hash + size +
@@ -455,7 +472,12 @@ bool state_file_probe(const std::string& path, StateFileInfo& info) {
         {
             size_t at = 4;
             uint32_t version = 0, reserved = 0;
-            if (!get_u32(head, sizeof(head), at, version) || version != kStateVersion) break;
+            if (!get_u32(head, sizeof(head), at, version)) break;
+            // Accept BOTH generations: v1 (one checkpoint per image, no kind byte — every sidecar
+            // a pre-set build wrote) and v2 (spill_resume_checkpoints' SET with a kind byte per
+            // checkpoint). Anything else is a different generation's file: a torn tail.
+            if (version != 1 && version != kStateVersion) break;
+            info.version = version;
             if (!get_u64(head, sizeof(head), at, info.seq) ||
                 !get_u64(head, sizeof(head), at, info.record_hash) ||
                 !get_u32(head, sizeof(head), at, info.n_images) ||
@@ -496,9 +518,12 @@ bool state_file_probe(const std::string& path, StateFileInfo& info) {
     return ok;
 }
 
-// One checkpoint block from the sidecar (the writer's put_checkpoint_head + arrays + used),
-// bounded by `left` (the bytes the probe said the body holds).
-bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c) {
+// One checkpoint block from the sidecar (the writer's put_checkpoint_head + arrays + used,
+// and for a v2 sidecar the trailing `kind` byte), bounded by `left` (the bytes the probe said
+// the body holds). `has_kind`: true for a v2 .rst (read the kind byte after `used`); false for
+// v1 (the checkpoint loads as periodic — the default, retro-compatible with every sidecar a
+// pre-set build wrote).
+bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c, bool has_kind) {
     auto take_n = [&](uint64_t n) { if (n > left) return false; left -= n; return true; };
     uint64_t n_ids = 0, n_imgs = 0;
     if (!take_n(8) || !read_u64(f, n_ids) || !take_n(n_ids * 4)) return false;
@@ -522,13 +547,22 @@ bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c) {
         dst.resize(size_t(sz));
         if (!read_exact(f, dst.data(), dst.size())) return false;
     }
-    return take_n(8) && read_u64(f, c.used);
+    if (!take_n(8) || !read_u64(f, c.used)) return false;
+    if (has_kind) {
+        uint8_t k = 0;
+        if (!take_n(1) || !read_exact(f, &k, 1)) return false;
+        c.kind = CheckpointKind(k);
+    }
+    return true;
 }
 
 // Load a PROBED sidecar onto the images the reader holds (main + stages, in order): the live
-// running state and the full-write checkpoint of every image, each guarded by its geometry
-// echo. The ids/dims/K/V are NOT here — the records carry them. `left` must land exactly on
-// zero (a layout drift is a corrupt sidecar).
+// running state and the checkpoint SET of every image, each guarded by its geometry echo. A
+// v2 sidecar carries spill_resume_checkpoints' selection (up to 4 per image, each with its
+// kind byte); a v1 sidecar carries the ONE checkpoint a pre-set build selected (no kind
+// byte — it loads as periodic, today's behavior for old spills). The ids/dims/K/V are NOT
+// here — the records carry them. `left` must land exactly on zero (a layout drift is a
+// corrupt sidecar).
 bool state_file_load(const std::string& path, const StateFileInfo& info,
                      const std::vector<SavedConversation*>& images) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -536,6 +570,8 @@ bool state_file_load(const std::string& path, const StateFileInfo& info,
     bool ok = std::fseek(f, (long long) kStateHeaderBytes, SEEK_SET) == 0;
     uint64_t left = info.total - kStateHeaderBytes - kTrailerBytes;
     auto take_n = [&](uint64_t n) { if (n > left) return false; left -= n; return true; };
+    const bool has_kind = info.version >= kStateVersion;
+    const uint32_t max_ckpt = has_kind ? 8 : 1;   // v2: the resume set (4 written, room to grow)
     for (size_t ii = 0; ok && ii < images.size(); ++ii) {
         SavedConversation& img = *images[ii];
         uint64_t geom = 0, sz[5] = {};
@@ -550,11 +586,12 @@ bool state_file_load(const std::string& path, const StateFileInfo& info,
             ok = read_exact(f, dst.data(), dst.size());
         }
         uint32_t n_ckpt = 0;
-        ok = ok && take_n(4) && read_u32(f, n_ckpt) && n_ckpt <= 1;
+        ok = ok && take_n(4) && read_u32(f, n_ckpt) && n_ckpt <= max_ckpt;
         img.checkpoints.clear();
-        if (ok && n_ckpt == 1) {
-            img.checkpoints.resize(1);
-            ok = read_checkpoint(f, left, img.checkpoints[0]);
+        if (ok && n_ckpt > 0) {
+            img.checkpoints.resize(n_ckpt);
+            for (uint32_t c = 0; ok && c < n_ckpt; ++c)
+                ok = read_checkpoint(f, left, img.checkpoints[c], has_kind);
         }
     }
     std::fclose(f);
@@ -753,8 +790,10 @@ uint64_t conversation_delta_state_bytes(const SavedConversation& image) {
     for (const SavedConversation* img : images_of(image)) {
         n += 8 + 40 + 4;   // geometry echo + the 5 sizes + the checkpoint count
         for (size_t i = 0; i < 5; ++i) n += state_of(img->live, i)->size();
-        if (const ConversationCheckpoint* sel = record_checkpoint(img->checkpoints))
-            n += checkpoint_bytes(*sel);
+        std::vector<const ConversationCheckpoint*> sel;
+        record_checkpoint_set(img->checkpoints, sel);
+        for (const ConversationCheckpoint* c : sel)
+            n += checkpoint_bytes(*c) + 1;   // +1: the v2 `kind` byte after `used`
     }
     return n + kTrailerBytes;
 }
@@ -790,7 +829,7 @@ bool conversation_delta_state_write(const std::string& path, const SavedConversa
         if (!(ok = emit(head.data(), head.size()))) break;
         // per image: the geometry echo, the live running state streamed straight from the
         // vectors (no front buffer — the O(state) RAM peak of a v2 record never happens here),
-        // and the full-write checkpoint selection
+        // and the resume SET (v2: up to spill_resume_checkpoints' picks, each with its kind)
         for (const SavedConversation* img : images) {
             ok = emit_u64(conversation_delta_geometry_hash(img->geometry, img->layer_lo, img->layer_hi));
             for (size_t i = 0; ok && i < 5; ++i) ok = emit_u64(state_of(img->live, i)->size());
@@ -798,17 +837,26 @@ bool conversation_delta_state_write(const std::string& path, const SavedConversa
                 const auto& s = *state_of(img->live, i);
                 ok = emit(s.data(), s.size());
             }
-            const ConversationCheckpoint* sel = record_checkpoint(img->checkpoints);
-            ok = ok && emit_u32(sel ? 1u : 0u);
-            if (ok && sel) {
+            std::vector<const ConversationCheckpoint*> sel;
+            record_checkpoint_set(img->checkpoints, sel);
+            ok = ok && emit_u32(uint32_t(sel.size()));
+            for (const ConversationCheckpoint* c : sel) {
                 std::vector<uint8_t> ck;
-                put_checkpoint_head(ck, *sel);
+                put_checkpoint_head(ck, *c);
                 ok = emit(ck.data(), ck.size());
                 for (size_t i = 0; ok && i < 5; ++i) {
-                    const auto& s = *state_of(*sel, i);
+                    const auto& s = *state_of(*c, i);
                     ok = emit_u64(s.size()) && emit(s.data(), s.size());
                 }
-                ok = ok && emit_u64(sel->used);
+                // v2: the checkpoint's kind — the spill-resume selection of the NEXT append
+                // (and the engine's, once restored) needs the turn/eop distinction to survive
+                // a restart; a v1 reader rejects the whole sidecar (fail-soft, the journal's
+                // v3 records then read as torn tails and the base restores alone). The kind
+                // byte rides AFTER `used` (read_checkpoint's order).
+                ok = ok && emit_u64(c->used);
+                std::vector<uint8_t> kb;
+                put_u8(kb, uint8_t(c->kind));
+                ok = ok && emit(kb.data(), kb.size());
             }
             if (!ok) break;
         }
@@ -863,11 +911,13 @@ std::string conversation_delta_describe(const SavedConversation& image, const De
         bool pinned = false;
         size_t ck_ids = 0;
         for (size_t i = 0; i < 5; ++i) live += state_of(img.live, i)->size();
-        if (const ConversationCheckpoint* sel = record_checkpoint(img.checkpoints)) {
-            for (size_t i = 0; i < 5; ++i) ck_state += state_of(*sel, i)->size();
-            ck_meta = sel->ids.size() * 4 + sel->imgs.size() * 16;
-            ck_ids = sel->ids.size();
-            pinned = sel->pinned;
+        std::vector<const ConversationCheckpoint*> sel;
+        record_checkpoint_set(img.checkpoints, sel);
+        for (const ConversationCheckpoint* c : sel) {
+            for (size_t i = 0; i < 5; ++i) ck_state += state_of(*c, i)->size();
+            ck_meta += c->ids.size() * 4 + c->imgs.size() * 16;
+            ck_ids = std::max(ck_ids, c->ids.size());
+            pinned = pinned || c->pinned;
         }
         for (size_t j = 0; j < img.kv.size(); ++j)
             for (size_t part = 0; part < 5; ++part) {
@@ -878,9 +928,9 @@ std::string conversation_delta_describe(const SavedConversation& image, const De
         const double expected = per_tok * double(plan.new_tokens - plan.keep_tokens);
         char buf[320];
         std::snprintf(buf, sizeof(buf),
-                      " img%zu{live=%.1f ckpt=%.1f(+%.2f meta, ids=%zu, pinned=%d) "
+                      " img%zu{live=%.1f ckpt_set=%zu(max=%zu,%.1f+%.2f meta, pinned=%d) "
                       "kv_sent=%.1f kv_expected=%.1f kv_full=%.1f MiB}",
-                      ii, mib(live), mib(ck_state), mib(ck_meta), ck_ids, pinned ? 1 : 0,
+                      ii, mib(live), sel.size(), ck_ids, mib(ck_state), mib(ck_meta), pinned ? 1 : 0,
                       mib(kv_sent), mib(expected), mib(kv_full));
         out += buf;
     }

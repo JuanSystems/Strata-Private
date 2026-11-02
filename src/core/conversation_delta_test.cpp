@@ -8,6 +8,7 @@
 // rule) while everything above it is fresh data. apply(base + records) must then reproduce
 // the grown image byte-exactly.
 #include "strata/core/conversation_delta.hpp"
+#include "strata/core/conversation_file.hpp"   // spill_resume_checkpoints (inline — no link dependency)
 
 #include <array>
 #include <chrono>
@@ -1050,6 +1051,143 @@ int main() {
         check(fold2.applied == 2 && !fold2.failed && !fold2.state_stale,
               "24: a tail tear onto the v3 pair still folds through the sidecar");
         check(same_image(again, t2), "24: the sidecar's state lands (record 2's)");
+    }
+
+    // ── 25. The v2 sidecar carries spill_resume_checkpoints' SET with the kinds: the deepest
+    // checkpoint of any kind, the two deepest `turn` boundaries and the deepest `periodic` —
+    // the resume points a restore can offer a --tail-role-token client (the deepest alone is
+    // the end-of-prompt checkpoint, which carries the effort tail the next prompt never
+    // re-sends). The fold lands exactly that set on the image's chain.
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(700, 1);
+        SavedConversation next = grow(base, 600, 2);   // live 1300
+        const std::vector<int32_t>& ids = next.live.ids;
+        // the engine's chain at the park of request 2 (with an effort tail):
+        ConversationCheckpoint periodic = ckpt_of(std::vector<int32_t>(ids.begin(), ids.begin() + 256), 70);
+        ConversationCheckpoint pin = ckpt_of(std::vector<int32_t>(ids.begin(), ids.begin() + 400), 61);
+        pin.pinned = true;
+        pin.kind = CheckpointKind::pin;
+        ConversationCheckpoint T1 = ckpt_of(std::vector<int32_t>(ids.begin(), ids.begin() + 600), 62);
+        T1.kind = CheckpointKind::turn;
+        ConversationCheckpoint E1 = ckpt_of(std::vector<int32_t>(ids.begin(), ids.begin() + 699), 63);
+        E1.kind = CheckpointKind::end_of_prompt;
+        ConversationCheckpoint T2 = ckpt_of(std::vector<int32_t>(ids.begin(), ids.begin() + 1000), 64);
+        T2.kind = CheckpointKind::turn;
+        ConversationCheckpoint E2 = ckpt_of(std::vector<int32_t>(ids.begin(), ids.begin() + 1299), 65);
+        E2.kind = CheckpointKind::end_of_prompt;
+        next.checkpoints = {periodic, pin, T1, E1, T2, E2};
+        // the set the selection must pick (deduplicated, ascending)
+        std::vector<const ConversationCheckpoint*> sel;
+        spill_resume_checkpoints(next.checkpoints, sel);
+        check(sel.size() == 4 && sel[0]->ids.size() == 256 && sel[1]->ids.size() == 600 &&
+                  sel[2]->ids.size() == 1000 && sel[3]->ids.size() == 1299 &&
+                  sel[1]->ids == T1.ids && sel[2]->ids == T2.ids && sel[3]->ids == E2.ids,
+              "25: the selection is {periodic, T1, T2, E2} — the pin and E1 are out");
+        const uint64_t want = conversation_delta_state_bytes(next);
+        uint64_t rec = 0, hash = 0, rst_bytes = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, next, 700, 700, 1) &&
+                  conversation_delta_append(journal, next, p, rec, &hash),
+              "25: v3 record 1 lands");
+        check(conversation_delta_state_write(rst, next, 1, hash, rst_bytes) && rst_bytes == want,
+              "25: the sidecar lands at its exact estimated size (the set + the kind bytes)");
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 1 && !fold.failed && !fold.state_stale, "25: the fold applies");
+        check(back.checkpoints.size() == 4, "25: the folded chain is the resume set (4)");
+        check(back.checkpoints[0].ids.size() == 256 &&
+                  back.checkpoints[0].kind == CheckpointKind::periodic &&
+                  back.checkpoints[1].ids.size() == 600 &&
+                  back.checkpoints[1].kind == CheckpointKind::turn &&
+                  back.checkpoints[2].ids.size() == 1000 &&
+                  back.checkpoints[2].kind == CheckpointKind::turn &&
+                  back.checkpoints[3].ids.size() == 1299 &&
+                  back.checkpoints[3].kind == CheckpointKind::end_of_prompt,
+              "25: the set is {periodic 256, T1 600, T2 1000, E2 1299} with kinds intact");
+        check(back.checkpoints[1].gdn == T1.gdn && back.checkpoints[3].used == E2.used,
+              "25: the set's checkpoints keep their own state arrays and stamps");
+    }
+
+    // ── 26. A v1 sidecar (every .rst a pre-set build wrote) still folds: ONE checkpoint, no
+    // kind byte — it loads as periodic, exactly as before the resume-set change. The upgrade
+    // path for the journals already on disk.
+    {
+        fs::remove(journal);
+        const std::string rst = (dir / "conv-1.rst").string();
+        fs::remove(rst);
+        SavedConversation base = image_of(700, 1);
+        SavedConversation next = grow(base, 600, 2);   // live 1300, one checkpoint at 650
+        uint64_t rec = 0, hash = 0;
+        DeltaPlan p;
+        check(conversation_delta_plan(p, next, 700, 700, 1) &&
+                  conversation_delta_append(journal, next, p, rec, &hash),
+              "26: v3 record 1 lands");
+        // hand-write a v1 sidecar bound to this record: the deepest checkpoint, no kind byte
+        const ConversationCheckpoint& deep = next.checkpoints[0];   // 650 of 1300
+        {
+            auto u32 = [](std::vector<uint8_t>& b, uint32_t v) {
+                for (int i = 0; i < 4; ++i) b.push_back(uint8_t((v >> (i * 8)) & 0xFF));
+            };
+            auto u64 = [](std::vector<uint8_t>& b, uint64_t v) {
+                for (int i = 0; i < 8; ++i) b.push_back(uint8_t((v >> (i * 8)) & 0xFF));
+            };
+            std::vector<uint8_t> body;
+            u64(body, conversation_delta_geometry_hash(next.geometry, next.layer_lo, next.layer_hi));
+            const std::vector<uint8_t>* live_state[] = {&next.live.gdn, &next.live.ple, &next.live.tails,
+                                                        &next.live.dead, &next.live.block_pos};
+            for (const auto* arr : live_state) u64(body, arr->size());   // the 5 sizes FIRST
+            for (const auto* arr : live_state)                            // then the 5 arrays
+                body.insert(body.end(), arr->begin(), arr->end());
+            u32(body, 1);   // n_ckpt — the v1 shape carries ONE
+            u64(body, deep.ids.size());
+            for (int32_t v : deep.ids) u32(body, uint32_t(v));
+            u64(body, deep.imgs.size());
+            for (const auto& k : deep.imgs) {
+                u64(body, uint64_t(k.start));
+                u64(body, k.hash);
+            }
+            const std::vector<uint8_t>* ck_state[] = {&deep.gdn, &deep.ple, &deep.tails,
+                                                      &deep.dead, &deep.block_pos};
+            for (const auto* arr : ck_state) {
+                u64(body, arr->size());
+                body.insert(body.end(), arr->begin(), arr->end());
+            }
+            u64(body, deep.used);   // v1: NO kind byte after used
+            std::vector<uint8_t> head;
+            head.push_back('S'); head.push_back('R'); head.push_back('S'); head.push_back('T');
+            u32(head, 1);           // version 1
+            u64(head, 1);           // seq: record 1
+            u64(head, hash);        // this record's trailer hash
+            u32(head, 1);           // one image
+            u32(head, 0);           // reserved
+            const uint64_t total = head.size() + body.size() + 20;
+            uint64_t h = 1469598103934665603ull;
+            auto fnv = [&](const uint8_t* p_, size_t n) {
+                for (size_t i = 0; i < n; ++i) { h ^= p_[i]; h *= 1099511628211ull; }
+            };
+            fnv(head.data(), head.size());
+            fnv(body.data(), body.size());
+            std::FILE* f = std::fopen(rst.c_str(), "wb");
+            check(f != nullptr, "26: the v1 sidecar file opens");
+            std::fwrite(head.data(), 1, head.size(), f);
+            std::fwrite(body.data(), 1, body.size(), f);
+            head.clear();          // the trailer is its own 20 bytes (u64 appends, it does not overwrite)
+            u64(head, h);
+            u64(head, total);
+            head.push_back('E'); head.push_back('R'); head.push_back('S'); head.push_back('T');
+            std::fwrite(head.data(), 1, head.size(), f);
+            std::fclose(f);
+        }
+        SavedConversation back = base;
+        const DeltaFold fold = conversation_delta_apply(journal, back, rst);
+        check(fold.applied == 1 && !fold.failed && !fold.state_stale,
+              "26: the v1 sidecar folds (probe accepts both generations)");
+        check(back.checkpoints.size() == 1 && back.checkpoints[0].kind == CheckpointKind::periodic &&
+                  back.checkpoints[0].ids == deep.ids,
+              "26: the v1 checkpoint loads as periodic — today's behavior for old spills");
     }
 
     fs::remove_all(dir);

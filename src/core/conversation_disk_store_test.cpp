@@ -175,6 +175,36 @@ SavedConversation conv_image(size_t tokens, uint8_t seed) {
     return s;
 }
 
+// conv_image with EXPLICIT ids (cases 54/55's re-render models need their own tokens):
+// capture-consistent, the same shape conv_image builds.
+SavedConversation ids_conv_image(const std::vector<int32_t>& ids, uint8_t seed) {
+    SavedConversation s;
+    for (size_t i = 0; i < s.geometry.size(); ++i) s.geometry[i] = int64_t(200 + i);
+    s.layer_lo = 0; s.layer_hi = 40;
+    s.cvec = false;
+    s.live = jckpt(ids, seed);
+    const size_t tokens = ids.size();
+    const int64_t cells = jcells(tokens);
+    for (int layer = 0; layer < 3; ++layer) {
+        ConversationKv kv;
+        kv.format = 1; kv.cells = cells; kv.heads = JHeads; kv.head_dim = JHeadDim;
+        kv.page_size = JPage;
+        kv.pooled_rows = layer < 2 && tokens > 0 ? (int64_t) tokens / JIdxBlock + 1 : 0;
+        kv.idx_dim = JIdxDim;
+        kv.k = jfill(size_t(cells) * size_t(JHeads * JHeadDim * 2), uint8_t(layer * 10 + seed));
+        kv.v = jfill(size_t(cells) * size_t(JHeads * JHeadDim * 2), uint8_t(layer * 10 + seed + 1));
+        kv.k_scale = layer < 2 ? jfill(size_t(cells) * size_t(JHeads * 2), uint8_t(layer * 10 + seed + 2))
+                               : ConversationBuffer{};
+        kv.v_scale = layer < 2 ? jfill(size_t(cells) * size_t(JHeads * 2), uint8_t(layer * 10 + seed + 3))
+                               : ConversationBuffer{};
+        kv.pooled = layer < 2 && tokens > 0
+                        ? jfill(size_t(kv.pooled_rows) * size_t(JIdxDim * 4), uint8_t(layer * 10 + seed + 4))
+                        : ConversationBuffer{};
+        s.kv.push_back(std::move(kv));
+    }
+    return s;
+}
+
 // The next turn of `base`: `extra` more tokens; fresh bytes from the completed-page boundary
 // of base's length on (exactly what a capture re-sends), everything below it identical.
 SavedConversation conv_grow(const SavedConversation& base, size_t extra, uint8_t seed) {
@@ -2250,11 +2280,16 @@ int main() {
             live.insert(live.end(), a.begin(), a.end());
             return live;
         };
-        // park k's capture: live = P_k + a_k, chain = [the pinned root, T_{k-1}?, T_k]
+        // park k's capture: live = P_k + a_k, chain = [the pinned root, T_{k-1}?, T_k]. The
+        // kinds are what the engine sets at the cut sites (turn_at → turn, the pin → pin) — the
+        // spill's resume-set selection reads them.
         ConversationCheckpoint pin = jckpt(sys, 61);
         pin.pinned = true;
-        const ConversationCheckpoint T1 = jckpt(P1, 62);
-        const ConversationCheckpoint T2 = jckpt(P2, 63);
+        pin.kind = CheckpointKind::pin;
+        ConversationCheckpoint T1 = jckpt(P1, 62);
+        T1.kind = CheckpointKind::turn;
+        ConversationCheckpoint T2 = jckpt(P2, 63);
+        T2.kind = CheckpointKind::turn;
         SavedConversation park1 = ids_image(with_private(P1, a1), 1);
         park1.checkpoints = {pin, T1};
         SavedConversation park2 = ids_image(with_private(P2, a2), 2);
@@ -2284,32 +2319,36 @@ int main() {
             store.flush_pending();
             check(fs::exists(rdir / "conv-2.dlt") && fs::file_size(rdir / "conv-2.dlt") > 0,
                   "53: park 2 appended a journal record");
-            // request 3 restores through the fold: the record carried T2 (the deepest), so the
-            // resume lands on the previous turn boundary — NOT the 400-token pinned root
+            // request 3 restores through the fold: the .rst's resume set carries T2 (the
+            // deepest turn) AND T1 (the previous boundary) — the engine resumes at T2, and a
+            // rewind past it still finds T1 below
             {
                 const auto m = store.best(P3, {}, false);
                 check(m.tokens == 542 && m.serial == 2, "53: request 3: best() promises T2 (542)");
                 auto back = store.take(m, id);
                 check(back.has_value(), "53: request 3: take restores");
-                check(back->checkpoints.size() == 1 && back->checkpoints[0].ids == T2.ids,
-                      "53: the folded chain carries T2 (the deepest, never the pinned root)");
+                check(back->checkpoints.size() == 2 &&
+                          back->checkpoints[0].ids == T1.ids && back->checkpoints[1].ids == T2.ids,
+                      "53: the folded chain carries the resume set {T1, T2}, never the pinned root");
+                check(back->checkpoints[0].kind == CheckpointKind::turn &&
+                          back->checkpoints[1].kind == CheckpointKind::turn,
+                      "53: the folded set keeps the kinds (the .rst v2 kind byte)");
                 check(engine_resume(*back, P3) == 542,
                       "53: request 3: the engine resumes at T2, not the pinned root");
             }
-            // rollback (the documented Option-A limit): a prompt that rewinds PAST the last
-            // turn boundary — T1 (402) WAS captured in park 2's chain, but the record keeps
-            // only the deepest, so the conversation entry no longer matches and the shared
-            // pinned root (the pfx entry) is the floor: one recompute, then the journal
-            // re-learns the new branch's boundaries
+            // rollback (an EDITED turn): a prompt that rewinds PAST the last turn boundary.
+            // The resume set carries T1 too (the previous boundary, still a prefix of the
+            // edited render), so the restore lands on the PREVIOUS TURN instead of the pinned
+            // root — the old deepest-only record collapsed here to the 400-token pin.
             std::vector<int32_t> rollback = P1;
             for (size_t i = 0; i < 80; ++i) rollback.push_back(int32_t(3500 + i));   // an EDITED turn
             for (size_t i = 0; i < 60; ++i) rollback.push_back(int32_t(3600 + i));
             {
                 const auto m = store.best(rollback, {}, false);
-                check(m.tokens == 400, "53: rollback: the floor is the pinned root (the deepest-only record)");
+                check(m.tokens == 402, "53: rollback: best() promises T1 (the previous boundary)");
                 auto back = store.take(m, id);
-                check(back.has_value() && engine_resume(*back, rollback) == 400,
-                      "53: rollback: one recompute from the pinned root (documented Option-A limit)");
+                check(back.has_value() && engine_resume(*back, rollback) == 402,
+                      "53: rollback: resume at T1 — one message re-read, not the whole history");
             }
         }
         // restart: a fresh store reloads the manifest from disk; the folded entry still
@@ -2352,7 +2391,8 @@ int main() {
             std::vector<int32_t> a4;
             for (size_t i = 0; i < 120; ++i) a4.push_back(int32_t(9300 + i));
             SavedConversation park4 = ids_image(with_private(P4, a4), 4);
-            const ConversationCheckpoint T4 = jckpt(P4, 64);
+            ConversationCheckpoint T4 = jckpt(P4, 64);
+            T4.kind = CheckpointKind::turn;
             park4.checkpoints = {pin, T4};
             check(fresh.put_async(std::move(park4), 5, id), "53: the fixed build's park queues");
             fresh.flush_pending();
@@ -2366,6 +2406,322 @@ int main() {
                 check(b5.has_value() && engine_resume(*b5, P5) == 782,
                       "53: heal: request 5 resumes at the re-learned turn boundary");
             }
+        }
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 54. The 2026-11-02 Kaggle restart regression, EXACTLY as the log shows it: a
+    // --tail-role-token client (zoocode) whose prompt ends with the server's reasoning-effort
+    // system turn, parked through the delta journal (the .bin parent + one .dlt record per
+    // turn), the engine restarted, and the client's retry re-rendering the LAST user message
+    // with a refreshed environment_details timestamp — the divergence lands INSIDE that
+    // message, PAST the last request's turn boundary (T2) but BEFORE the previous one (T1).
+    // The chain at the last park is {periodic, pin, T1, E1, T2, E2}; only T1 and below survive
+    // the retry's rewrite. The old manifest promised only the deepest (E2, which carries the
+    // effort tail the next prompt NEVER re-sends) and the journal folded the chain down to
+    // that one checkpoint — so best() missed the conversation's own entry and the restore
+    // collapsed to the pinned root (the log: disk_best=22259 of a 43552-token conversation,
+    // 21023 tokens re-read at 197 tok/s, 106 s). The fix: the .rst carries the resume SET
+    // {periodic, T1, T2, E2} and the manifest's ckpt_lens lets best() match any of them.
+    {
+        const auto rdir = dir / "effort_tail_restart";
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        auto engine_resume = [](const SavedConversation& img, const std::vector<int32_t>& prompt) {
+            int64_t resume = 0;
+            if (conversation_prefix(img.live, prompt, {}) > 0) resume = (int64_t) img.live.ids.size();
+            for (const auto& c : img.checkpoints)
+                resume = std::max(resume, conversation_prefix(c, prompt, {}));
+            return resume;
+        };
+        auto rng = [](int32_t base, size_t n) {
+            std::vector<int32_t> v;
+            for (size_t i = 0; i < n; ++i) v.push_back(base + int32_t(i));
+            return v;
+        };
+        auto cat = [](std::vector<int32_t> a, const std::vector<int32_t>& b) {
+            a.insert(a.end(), b.begin(), b.end());
+            return a;
+        };
+        // ── the turn model (a 1:50 scale of the log's 43k-token conversation) ──
+        // sys(400) u1(60) effort1(10) header1(2) = P1 (472); T1 = 460 (before the effort turn),
+        // E1 = 471 (n-1: the end-of-prompt checkpoint, carrying effort1 + header1)
+        const std::vector<int32_t> sys = rng(3000, 400);
+        const std::vector<int32_t> u1 = rng(3400, 60);
+        const std::vector<int32_t> effort1 = rng(5000, 10);
+        const std::vector<int32_t> header1 = rng(6000, 2);
+        const std::vector<int32_t> P1 = cat(cat(cat(sys, u1), effort1), header1);
+        const std::vector<int32_t> a1 = rng(9000, 80);        // the private reply (thinking + answer)
+        const std::vector<int32_t> live1 = cat(P1, a1);       // 552
+        // P2 = sys u1 a1r(40) u2(50) effort2(10) header2(2) = 562; T2 = 550, E2 = 561. The
+        // client strips the thinking and the effort turn; u2's environment_details timestamp
+        // sits at P2[520].
+        const std::vector<int32_t> a1r = rng(3100, 40);
+        const std::vector<int32_t> u2 = rng(3200, 50);
+        const std::vector<int32_t> effort2 = rng(5010, 10);
+        const std::vector<int32_t> header2 = rng(6002, 2);
+        const std::vector<int32_t> P2 = cat(cat(cat(cat(cat(sys, u1), a1r), u2), effort2), header2);
+        const std::vector<int32_t> a2 = rng(9100, 60);
+        const std::vector<int32_t> live2 = cat(P2, a2);       // 622
+        // the retry after the restart: u2 RE-RENDERED with the timestamp refreshed (P3[520]
+        // changes) — the divergence sits inside the last user message, past T2 (550) but before
+        // T1 (460): only T1 and below are still prefixes. The clean restart keeps u2 verbatim
+        // and diverges at the effort turn (550): T2 is the resume.
+        std::vector<int32_t> u2r = u2; u2r[20] = 4999;
+        const std::vector<int32_t> a2r = rng(3300, 35);
+        const std::vector<int32_t> u3 = rng(3500, 40);
+        const std::vector<int32_t> effort3 = rng(5020, 10);
+        const std::vector<int32_t> header3 = rng(6004, 2);
+        const std::vector<int32_t> P3_retry =
+            cat(cat(cat(cat(cat(cat(cat(sys, u1), a1r), u2r), a2r), u3), effort3), header3);   // 637
+        std::vector<int32_t> P3_clean = P3_retry; P3_clean[520] = u2[20];
+        check(P1.size() == 472 && P2.size() == 562 && P3_retry.size() == 637, "54: the model's lengths");
+        {
+            auto diverge_at = [](const std::vector<int32_t>& x, const std::vector<int32_t>& y) {
+                const size_t m = std::min(x.size(), y.size());
+                size_t d = 0;
+                while (d < m && x[d] == y[d]) ++d;
+                return d;
+            };
+            check(diverge_at(live2, P3_retry) == 520, "54: the retry diverges at 520 (the timestamp)");
+            check(diverge_at(live2, P3_clean) == 550, "54: the clean restart diverges at 550 (the effort turn)");
+        }
+        // the engine's chain at park 2, kinds as the cut sites set them
+        ConversationCheckpoint periodic = jckpt(std::vector<int32_t>(live2.begin(), live2.begin() + 256), 70);
+        ConversationCheckpoint pin = jckpt(sys, 61);
+        pin.pinned = true;
+        pin.kind = CheckpointKind::pin;
+        ConversationCheckpoint T1 = jckpt(std::vector<int32_t>(P1.begin(), P1.begin() + 460), 62);
+        T1.kind = CheckpointKind::turn;
+        ConversationCheckpoint E1 = jckpt(std::vector<int32_t>(P1.begin(), P1.begin() + 471), 63);   // n-1
+        E1.kind = CheckpointKind::end_of_prompt;
+        ConversationCheckpoint T2 = jckpt(std::vector<int32_t>(P2.begin(), P2.begin() + 550), 64);
+        T2.kind = CheckpointKind::turn;
+        ConversationCheckpoint E2 = jckpt(std::vector<int32_t>(P2.begin(), P2.begin() + 561), 65);   // n-1
+        E2.kind = CheckpointKind::end_of_prompt;
+        SavedConversation park1 = ids_conv_image(live1, 1);
+        park1.checkpoints = {periodic, pin, T1, E1};
+        SavedConversation park2 = ids_conv_image(live2, 2);
+        park2.checkpoints = {periodic, pin, T1, E1, T2, E2};
+
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            SavedConversation pfx = ids_conv_image(sys, 9);
+            pfx.checkpoints = {pin};
+            check(store.put(std::move(pfx), 1, id, {}, true), "54: the pfx entry lands");
+            check(store.put(std::move(park1), 2, id), "54: park 1 lands (the full write)");
+            // RC1, the manifest: a full write's .bin stores the whole chain, so best() must be
+            // able to promise T1 (460) — not just the deepest (E1, 471, which carries the
+            // effort tail P2 never re-sends). Before the fix this fell to the pfx (400).
+            {
+                const auto m = store.best(P2, {}, false);
+                check(m.tokens == 460 && m.serial == 2, "54: request 2: best() promises T1 (460)");
+            }
+            check(store.put_async(std::move(park2), 3, id), "54: park 2 queues");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-2.dlt"), "54: park 2 appended a journal record");
+            // RC2+RC2b, the journal: the fold delivers the resume SET, and the retry's
+            // divergence inside the last user message falls back to T1 (the PREVIOUS turn)
+            {
+                const auto mc = store.best(P3_clean, {}, false);
+                check(mc.tokens == 550 && mc.serial == 2, "54: clean restart: best() promises T2 (550)");
+                const auto mr = store.best(P3_retry, {}, false);
+                check(mr.tokens == 460 && mr.serial == 2,
+                      "54: retry with a refreshed timestamp: best() promises T1 (460)");
+                auto back = store.take(mr, id);
+                check(back.has_value(), "54: the retry's take restores");
+                check(back->checkpoints.size() == 4, "54: the folded chain is the resume set (4)");
+                check(back->checkpoints[0].ids.size() == 256 &&
+                          back->checkpoints[0].kind == CheckpointKind::periodic &&
+                          back->checkpoints[1].ids.size() == 460 &&
+                          back->checkpoints[1].kind == CheckpointKind::turn &&
+                          back->checkpoints[2].ids.size() == 550 &&
+                          back->checkpoints[2].kind == CheckpointKind::turn &&
+                          back->checkpoints[3].ids.size() == 561 &&
+                          back->checkpoints[3].kind == CheckpointKind::end_of_prompt,
+                      "54: the set is {periodic 256, T1 460, T2 550, E2 561} with kinds intact");
+                check(engine_resume(*back, P3_retry) == 460,
+                      "54: the engine resumes at T1 — 177 tokens re-read, not 237 from the pin");
+                check(engine_resume(*back, P3_clean) == 550,
+                      "54: the same restored chain serves the clean restart at T2");
+            }
+        }
+        // the restart itself: a fresh store reloads (the .idx v6 fast path), and the same
+        // promises hold — the exact E-of-the-log scenario
+        {
+            ConversationDiskStore fresh(rdir.string(), 1ull << 30, &id);
+            check(fresh.reload_from_disk(id) >= 1, "54: the restart reloads the spill files");
+            const auto mr = fresh.best(P3_retry, {}, false);
+            check(mr.tokens == 460, "54: restart: best() promises T1 (460) for the timestamp retry");
+            auto back = fresh.take(mr, id);
+            check(back.has_value() && engine_resume(*back, P3_retry) == 460,
+                  "54: restart: the engine resumes at T1");
+            const auto mc = fresh.best(P3_clean, {}, false);
+            check(mc.tokens == 550, "54: restart: best() promises T2 (550) for the clean next turn");
+        }
+        // the escape hatch: STRATA_SPILL_RESUME_SET=0 degenerates the set to today's ONE
+        // deepest checkpoint — honest (best() falls to the pfx for the retry), never a mismatch
+        {
+            const auto edir = dir / "effort_tail_escape";
+            ConversationDiskStore store(edir.string(), 1ull << 30, &id);
+            SavedConversation pfx = ids_conv_image(sys, 9);
+            pfx.checkpoints = {pin};
+            check(store.put(std::move(pfx), 1, id, {}, true), "54: escape: the pfx entry lands");
+            SavedConversation park2b = ids_conv_image(live2, 5);
+            park2b.checkpoints = {periodic, pin, T1, E1, T2, E2};
+            check(store.put(std::move(park2b), 2, id), "54: escape hatch: the full write lands");
+            const std::vector<int32_t> a2b = rng(9400, 60);
+            SavedConversation park3b = ids_conv_image(cat(live2, a2b), 6);
+            ConversationCheckpoint T3 = jckpt(live2, 66);       // the deepest of the new chain
+            T3.kind = CheckpointKind::turn;
+            park3b.checkpoints = {periodic, pin, T1, E1, T2, E2, T3};
+            jsetenv("STRATA_SPILL_RESUME_SET", "0");
+            check(store.put_async(std::move(park3b), 3, id), "54: escape hatch: the append queues");
+            store.flush_pending();
+            junsetenv("STRATA_SPILL_RESUME_SET");
+            const auto m = store.best(P3_retry, {}, false);
+            check(m.tokens == 400,
+                  "54: escape hatch: the retry floors at the pinned root (today's behavior)");
+            auto back = store.take(m, id);
+            check(back.has_value() && engine_resume(*back, P3_retry) == 400,
+                  "54: escape hatch: ONE recompute from the pin — honest, never a mismatch");
+        }
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 55. A layer split's journal keeps the per-image resume sets ALIGNED: the split copies
+    // each checkpoint's kind to its stage parts, so the main's and the stage's selections pick
+    // the same lengths, the fold lands the same chain on every image, and the engine's
+    // conversation_checkpoints_merge finds them aligned (a disagreeing selection made merge
+    // fail and the engine dropped the whole restored chain — the cd647d10 regression).
+    {
+        const auto rdir = dir / "split_resume_set";
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        auto rng = [](int32_t base, size_t n) {
+            std::vector<int32_t> v;
+            for (size_t i = 0; i < n; ++i) v.push_back(base + int32_t(i));
+            return v;
+        };
+        auto cat = [](std::vector<int32_t> a, const std::vector<int32_t>& b) {
+            a.insert(a.end(), b.begin(), b.end());
+            return a;
+        };
+        // a checkpoint WITH a stage part (what the engine's checks hold under a split)
+        auto chained = [&](const std::vector<int32_t>& live, size_t len, uint8_t seed, CheckpointKind k) {
+            ConversationCheckpoint c = jckpt(std::vector<int32_t>(live.begin(), live.begin() + len), seed);
+            c.kind = k;
+            ConversationCheckpoint part;
+            part.ids = c.ids;
+            part.gdn = {uint8_t(seed + 1)};
+            part.ple = {uint8_t(seed + 2)};
+            part.tails = {uint8_t(seed + 3)};
+            part.dead = {uint8_t(seed + 4)};
+            part.block_pos = {uint8_t(seed + 5)};
+            c.stage_parts.push_back(std::move(part));
+            return c;
+        };
+        // the same turn model as 54, one stage
+        const std::vector<int32_t> sys = rng(3000, 400);
+        const std::vector<int32_t> u1 = rng(3400, 60);
+        const std::vector<int32_t> effort1 = rng(5000, 10);
+        const std::vector<int32_t> header1 = rng(6000, 2);
+        const std::vector<int32_t> P1 = cat(cat(cat(sys, u1), effort1), header1);
+        const std::vector<int32_t> a1 = rng(9000, 80);
+        const std::vector<int32_t> live1 = cat(P1, a1);            // 552
+        const std::vector<int32_t> a1r = rng(3100, 40);
+        const std::vector<int32_t> u2 = rng(3200, 50);
+        const std::vector<int32_t> effort2 = rng(5010, 10);
+        const std::vector<int32_t> header2 = rng(6002, 2);
+        const std::vector<int32_t> P2 = cat(cat(cat(cat(cat(sys, u1), a1r), u2), effort2), header2);
+        const std::vector<int32_t> a2 = rng(9100, 60);
+        const std::vector<int32_t> live2 = cat(P2, a2);            // 622
+        // park 1's chain: {periodic 256, pin 400, T1 460, E1 471}; park 2 adds {T2 550, E2 561}
+        auto chain_of = [&](const std::vector<int32_t>& live, bool with_t2) {
+            std::vector<ConversationCheckpoint> checks = {
+                chained(live, 256, 70, CheckpointKind::periodic),
+                chained(live, 400, 61, CheckpointKind::pin),
+                chained(live, 460, 62, CheckpointKind::turn),
+                chained(live, 471, 63, CheckpointKind::end_of_prompt),
+            };
+            checks[1].pinned = true;
+            if (with_t2) {
+                checks.push_back(chained(live, 550, 64, CheckpointKind::turn));
+                checks.push_back(chained(live, 561, 65, CheckpointKind::end_of_prompt));
+            }
+            return checks;
+        };
+        // the engine's park: split the chain apart, main gets stage0, the stage image parts[0]
+        auto split_park = [&](const std::vector<int32_t>& live, uint8_t seed, bool with_t2) {
+            strata::core::ConversationCheckpointSplit cs =
+                strata::core::conversation_checkpoints_split(chain_of(live, with_t2), 1);
+            SavedConversation main = ids_conv_image(live, seed);
+            main.checkpoints = std::move(cs.stage0);
+            SavedConversation stage = ids_conv_image(live, uint8_t(seed + 8));
+            stage.layer_lo = 40; stage.layer_hi = 48;   // the other card's carve
+            stage.live = main.live;
+            stage.checkpoints = std::move(cs.parts[0]);
+            main.stage_images.push_back(std::move(stage));
+            return main;
+        };
+        // the selections agree before anything is written (the split copies the kind)
+        {
+            strata::core::ConversationCheckpointSplit cs =
+                strata::core::conversation_checkpoints_split(chain_of(live2, true), 1);
+            std::vector<const ConversationCheckpoint*> sel_main, sel_stage;
+            spill_resume_checkpoints(cs.stage0, sel_main);
+            spill_resume_checkpoints(cs.parts[0], sel_stage);
+            check(sel_main.size() == sel_stage.size() && sel_main.size() == 4,
+                  "55: the main's and the stage's sets agree (4: periodic, T1, T2, E2)");
+            bool same = true;
+            for (size_t i = 0; same && i < sel_main.size(); ++i)
+                same = sel_main[i]->ids.size() == sel_stage[i]->ids.size() &&
+                       sel_main[i]->kind == sel_stage[i]->kind;
+            check(same, "55: the two sets are the same lengths and kinds");
+        }
+        // through the store: full write → one delta append → take → the ENGINE's merge
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            // the pinned root FIRST: without it find_delta_base has no pin_len and the
+            // re-rendered park 2 (whose cut is neither the base's end nor its checkpoint)
+            // cannot chain — a full write would land instead of the journal record
+            SavedConversation pfx = ids_conv_image(sys, 9);
+            ConversationCheckpoint pin55 = jckpt(sys, 61);
+            pin55.pinned = true;
+            pin55.kind = CheckpointKind::pin;
+            pfx.checkpoints = {pin55};
+            check(store.put(std::move(pfx), 1, id, {}, true), "55: the pfx entry lands");
+            SavedConversation park1 = split_park(live1, 1, false);
+            check(store.put(std::move(park1), 2, id), "55: park 1 (main + stage) lands");
+            SavedConversation park2 = split_park(live2, 2, true);
+            check(store.put_async(std::move(park2), 3, id), "55: park 2 queues");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-2.dlt"), "55: park 2 appended a journal record");
+            // the next prompt re-renders without the effort turn: it shares [0, 550) of live2
+            const std::vector<int32_t> a2r = rng(3300, 35);
+            const std::vector<int32_t> u3 = rng(3500, 40);
+            const std::vector<int32_t> effort3 = rng(5020, 10);
+            const std::vector<int32_t> header3 = rng(6004, 2);
+            const std::vector<int32_t> P3 =
+                cat(cat(cat(cat(cat(cat(cat(sys, u1), a1r), u2), a2r), u3), effort3), header3);
+            const auto m = store.best(P3, {}, false);
+            check(m.tokens == 550, "55: best() promises T2 (550) through the split journal");
+            auto back = store.take(m, id);
+            check(back.has_value() && back->stage_images.size() == 1, "55: the take restores both images");
+            check(back->checkpoints.size() == 4 && back->stage_images[0].checkpoints.size() == 4,
+                  "55: both folded chains carry the same 4-checkpoint set");
+            bool aligned = true;
+            for (size_t i = 0; aligned && i < 4; ++i)
+                aligned = back->checkpoints[i].ids == back->stage_images[0].checkpoints[i].ids;
+            check(aligned, "55: the two sets are index-aligned (merge's requirement)");
+            // the engine's own reassembly (generate.cpp after a restore)
+            strata::core::ConversationCheckpointSplit cs;
+            cs.stage0 = std::move(back->checkpoints);
+            cs.parts.push_back(std::move(back->stage_images[0].checkpoints));
+            std::vector<ConversationCheckpoint> merged;
+            check(strata::core::conversation_checkpoints_merge(std::move(cs), merged) && merged.size() == 4,
+                  "55: conversation_checkpoints_merge succeeds — the restored chain survives");
+            check(merged[1].kind == CheckpointKind::turn && merged[2].kind == CheckpointKind::turn &&
+                      merged[3].kind == CheckpointKind::end_of_prompt && merged[1].stage_parts.size() == 1,
+                  "55: the merged chain keeps the kinds and the stage parts");
         }
         junsetenv("STRATA_SPILL_JOURNAL");
     }

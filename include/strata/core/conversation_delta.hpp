@@ -78,15 +78,24 @@
 //
 // Sidecar conv-<serial>.rst layout (little-endian; the state of EVERY image of the spill —
 // the main first, then the stages — for the LAST record the journal holds):
-//   u8[4] "SRST"   u32 version = 1   u64 seq   u64 record_hash   u32 n_images   u32 reserved (32 B)
+//   u8[4] "SRST"   u32 version = 2   u64 seq   u64 record_hash   u32 n_images   u32 reserved (32 B)
 //   per image:
 //   u64 geometry_hash                  this image's own echo (misalignment reject)
 //   u64 state_sz[5] + the 5 live state byte arrays (gdn, ple, tails, dead, block_pos)
-//   u32 n_ckpt (0 or 1) and, if 1, spill_resume_checkpoint's selection (the chain's deepest,
-//       ignoring `pinned` — the same ONE checkpoint the record carries):
+//   u32 n_ckpt (0..4) and, per checkpoint, spill_resume_checkpoints' SELECTION (the resume
+//       set: the chain's deepest of any kind, its two deepest `turn` boundaries and its
+//       deepest `periodic` — deduplicated by length, ascending):
 //       u64 n_ids; i32 x n_ids; u64 n_cimgs; (i64,u64) x n_cimgs;
-//       u64 sz[5]; u8 x sz[0..4]; u64 used
+//       u64 sz[5]; u8 x sz[0..4]; u64 used; u8 kind (CheckpointKind)
 //   trailer: u64 fnv (everything above); u64 total_bytes; u8[4] "ERST"               (20 B)
+//
+// v1 (every sidecar a pre-set build wrote) carries ONE checkpoint per image (the chain's
+// deepest) and no kind byte; the probe accepts both generations, a v1 checkpoint loads as
+// `periodic`, and a v2 kind byte an old reader cannot parse makes it reject the whole sidecar
+// (fail-soft: the journal's v3 records read as torn tails and the base restores alone).
+// The set is what a restore can offer as resume points — see spill_resume_checkpoints
+// (conversation_file.hpp) for why the deepest alone loses every restart resume of a
+// --tail-role-token client.
 //
 // The at_bytes boundary mirrors conversation_kv_save's reuse rule: completed pages (and
 // completed indexer rows) strictly below the kept tokens are byte-identical between the base
@@ -181,17 +190,18 @@ bool conversation_delta_append(const std::string& path, const SavedConversation&
                                uint64_t& record_bytes, uint64_t* record_hash = nullptr);
 
 /// The exact on-disk size of the state sidecar for `image` (main + stage images): the live
-/// running state and the full-write checkpoint selection of every image, one file. The
-/// store's budget accounting needs it BEFORE the write (the sidecar replaces its previous
-/// self, so the net cost is the difference).
+/// running state and the RESUME SET of every image (spill_resume_checkpoints' selection,
+/// each checkpoint with its kind byte), one file. The store's budget accounting needs it
+/// BEFORE the write (the sidecar replaces its previous self, so the net cost is the
+/// difference).
 uint64_t conversation_delta_state_bytes(const SavedConversation& image);
 
 /// Write the state sidecar for `image` to `path` (conv-<serial>.rst): the live state and the
-/// checkpoint of EVERY image, stamped with `seq` (the record's 1-based journal index) and
-/// `record_hash` (the trailer hash conversation_delta_append reported for that record) so the
-/// reader can bind the sidecar to exactly one record. Streams straight from the images'
-/// state vectors (no O(state) front buffer), then publishes atomically: temp + fflush +
-/// fsync + rename + directory fsync — the rename IS the commit. On any failure the temp is
+/// resume-set checkpoints of EVERY image, stamped with `seq` (the record's 1-based journal
+/// index) and `record_hash` (the trailer hash conversation_delta_append reported for that
+/// record) so the reader can bind the sidecar to exactly one record. Streams straight from the
+/// images' state vectors (no O(state) front buffer), then publishes atomically: temp + fflush
+/// + fsync + rename + directory fsync — the rename IS the commit. On any failure the temp is
 /// removed and `path` keeps its previous contents. `bytes` receives the file's exact size.
 bool conversation_delta_state_write(const std::string& path, const SavedConversation& image, uint64_t seq,
                                     uint64_t record_hash, uint64_t& bytes);
@@ -247,6 +257,10 @@ inline constexpr uint32_t kDeltaVersion = 3;
 /// The state sidecar's magic values (conv-<serial>.rst).
 inline constexpr char kStateMagic[4] = {'S', 'R', 'S', 'T'};
 inline constexpr char kStateEndMagic[4] = {'E', 'R', 'S', 'T'};
-inline constexpr uint32_t kStateVersion = 1;
+/// v2: the sidecar carries spill_resume_checkpoints' SET per image (up to 4 checkpoints:
+/// the deepest, the two deepest turn boundaries, the deepest periodic), each with a `kind`
+/// byte after `used`. v1 (one checkpoint, no kind) is still accepted on read — every sidecar
+/// a pre-set build wrote restores exactly as before.
+inline constexpr uint32_t kStateVersion = 2;
 
 } // namespace strata::core

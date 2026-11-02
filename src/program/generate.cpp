@@ -8793,18 +8793,30 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 strata::core::CheckpointKind kind = strata::core::CheckpointKind::periodic) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) {
                     c.used = ++check_clock;
+                    // Promote the kind, never demote: a periodic re-touch (another cut landing on
+                    // the same length) keeps the specific kind the position already had, and a
+                    // `turn` re-touch promotes an end_of_prompt (the position was the last prompt's
+                    // end and is now a surviving turn boundary of the re-rendered history — the
+                    // spill's resume set wants it as a turn).
+                    if (kind != strata::core::CheckpointKind::periodic &&
+                        (c.kind == strata::core::CheckpointKind::periodic ||
+                         (c.kind == strata::core::CheckpointKind::end_of_prompt &&
+                          kind == strata::core::CheckpointKind::turn)))
+                        c.kind = kind;
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
             ConvCheckpoint c;
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
+            c.kind = kind;
             if (parts != nullptr) {
                 if (parts->size() != stages.size() + 1) return false;
                 c.gdn = std::move((*parts)[0].gdn);
@@ -12423,9 +12435,18 @@ int main(int argc, char** argv) {
                 // The state here is exactly [0, n - 1): the last token is decoded by the first
                 // window below, so the checkpoint is complete and every later window rewrites
                 // cells past it. ckpt=0 keeps no checkpoint, as with every other cut.
+                // The kind: turn_at/root_at/pin_at/message_at name WHY the cut exists, and
+                // n - 1 is end_of_prompt — under --tail-role-token that one carries the
+                // effort-tail system turn the next prompt does NOT re-send (never a prefix),
+                // which is exactly the distinction the spill's resume-set selection reads.
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at || (req_ckpt && to == n - 1)) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at &&
-                                   to != n - 1)) {   // the tail kind leaves first
+                                   to != n - 1,
+                                   to == n - 1 ? strata::core::CheckpointKind::end_of_prompt
+                                   : to == turn_at ? strata::core::CheckpointKind::turn
+                                   : to == root_at ? strata::core::CheckpointKind::root
+                                   : to == pin_at ? strata::core::CheckpointKind::pin
+                                   : strata::core::CheckpointKind::message)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }

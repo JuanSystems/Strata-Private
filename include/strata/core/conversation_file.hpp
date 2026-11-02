@@ -12,6 +12,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <optional>
 #include <string>
@@ -205,6 +207,68 @@ inline const ConversationCheckpoint* spill_resume_checkpoint(const std::vector<C
     for (const auto& c : chain)
         if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
     return deepest;
+}
+
+// The checkpoint SET a spill persists as the resume points a RESTORE can offer (the v2 state
+// sidecar carries it; a full write's .bin carries the whole capture chain, of which this is a
+// subset). The deepest alone — today's rule — is the end-of-prompt checkpoint when the server
+// runs --tail-role-token (the reasoning-effort turn sits at the prompt's end), and that one is
+// NEVER a prefix of the next prompt: the client does not re-send the effort turn. Worse, a
+// RETRY after a restart (zoocode) re-renders the last user message with a refreshed
+// environment_details timestamp, so even the last request's TURN checkpoint can diverge
+// (measured on the 2026-11-02 Kaggle log: the divergence lands ~700 ids below the prompt's
+// end, inside the last user message — past its turn boundary but before the previous one).
+// The set that covers every observed shape:
+//   1. the DEEPEST checkpoint of any kind — the identity spill_resume_checkpoint() already
+//      promises (a pure retry of the same prompt resumes at it) and today's only pick;
+//   2. the two deepest `turn` checkpoints — the last request's boundary (the clean next turn)
+//      and the one before it (the retry that refreshed the last user message's timestamp);
+//   3. the deepest `periodic` — the mid-conversation fallback when the rewrite goes deeper
+//      (an edited or compacted history), between the pinned root and the turns.
+// root/pin/message kinds are left out: the pinned root lives on disk as its own pfx-<serial>.bin
+// shared-prefix snapshot, and a message boundary adds nothing a turn does not. Deduplicated by
+// length and ordered by length (ascending, the engine chain's own order), so the per-image
+// selections of a layer-split spill agree (every image's chain holds the same lengths) and
+// conversation_checkpoints_merge finds them aligned after a fold.
+//
+// STRATA_SPILL_RESUME_SET=0 opts out (the A/B escape): the set degenerates to today's ONE
+// deepest checkpoint. Read per call (a test toggles it mid-process).
+inline bool spill_resume_set_enabled() {
+    const char* e = std::getenv("STRATA_SPILL_RESUME_SET");
+    return e == nullptr || std::strcmp(e, "0") != 0;
+}
+inline void spill_resume_checkpoints(const std::vector<ConversationCheckpoint>& chain,
+                                     std::vector<const ConversationCheckpoint*>& out) {
+    out.clear();
+    if (chain.empty()) return;
+    if (!spill_resume_set_enabled()) {
+        if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(chain)) out.push_back(deepest);
+        return;
+    }
+    const ConversationCheckpoint* deepest = nullptr;                 // any kind (today's pick)
+    const ConversationCheckpoint* turn1 = nullptr, *turn2 = nullptr; // two deepest turn boundaries
+    const ConversationCheckpoint* periodic1 = nullptr;               // deepest periodic
+    for (const auto& c : chain) {
+        if (c.ids.empty()) continue;
+        if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        if (c.kind == CheckpointKind::turn) {
+            if (!turn1 || c.ids.size() > turn1->ids.size()) { turn2 = turn1; turn1 = &c; }
+            else if (!turn2 || c.ids.size() > turn2->ids.size()) turn2 = &c;
+        } else if (c.kind == CheckpointKind::periodic) {
+            if (!periodic1 || c.ids.size() > periodic1->ids.size()) periodic1 = &c;
+        }
+    }
+    const ConversationCheckpoint* picks[] = {deepest, turn1, turn2, periodic1};
+    for (const ConversationCheckpoint* p : picks) {
+        if (p == nullptr) continue;
+        bool dup = false;
+        for (const ConversationCheckpoint* q : out) dup = dup || q->ids.size() == p->ids.size();
+        if (!dup) out.push_back(p);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const ConversationCheckpoint* a, const ConversationCheckpoint* b) {
+                  return a->ids.size() < b->ids.size();
+              });
 }
 
 // What a SAVE copies into RAM besides what the engine already holds, for its RAM preflight.

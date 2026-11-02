@@ -36,8 +36,9 @@ namespace strata::core {
 struct DiskEntry {
     uint64_t serial = 0;                              // unique, mirrors ConversationCache's serials_
     std::string path;                                  // <spill_dir>/conv-<serial>.bin
-    // The checkpoint prefix the next turn's `best()` matches against — `live` and the deepest
-    // checkpoint of a parked conversation (the rest are discarded by session_checkpoints_to_save).
+    // The prefix data the next turn's `best()` matches against: the entry's live ids plus
+    // its checkpoint lengths (ckpt_ids and ckpt_lens below — a full write's .bin stores the
+    // whole capture chain, so every length is a promise the file keeps).
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
     // The deepest checkpoint's ids/imgs (the turn boundary — what the next request's prompt
@@ -46,6 +47,16 @@ struct DiskEntry {
     // the client strips), best() falls back to matching against ckpt_ids.
     std::vector<int32_t> ckpt_ids;
     std::vector<ConversationImageKey> ckpt_imgs;
+    // EVERY checkpoint length the entry's files can deliver as a resume point (the whole
+    // capture chain for a bare .bin; spill_resume_checkpoints' set for a journal-folded
+    // entry — the .rst carries exactly those). The deepest alone (ckpt_ids) is the
+    // end-of-prompt checkpoint under --tail-role-token, which carries the reasoning-effort
+    // tail turn the next prompt NEVER re-sends — so it is never a prefix of the next prompt
+    // and best() cannot see past it. A checkpoint of length L is a prefix of the live ids (a
+    // cut at position L), so the LENGTH plus the live's ids is enough to match it against a
+    // prompt: L is a resume point when L < prompt.size() and L <= the live/prompt common
+    // prefix (the images below L must align too). Populated everywhere ckpt_ids is.
+    std::vector<uint32_t> ckpt_lens;
     std::array<int64_t, 18> geometry{};
     int64_t layer_lo = 0, layer_hi = 0;
     bool cvec = true;
@@ -260,6 +271,11 @@ public:
     }
     const std::vector<ConversationImageKey>* entry_imgs(size_t i) const {
         return i < entries_.size() ? &entries_[i].imgs : nullptr;
+    }
+    // The entry's checkpoint lengths (every resume point the files can deliver) — used by the
+    // restore_from_disk_or_ram diagnostic to show what best() could match against.
+    const std::vector<uint32_t>* entry_ckpt_lens(size_t i) const {
+        return i < entries_.size() ? &entries_[i].ckpt_lens : nullptr;
     }
     uint64_t entry_serial(size_t i) const {
         return i < serials_.size() ? serials_[i] : 0;
@@ -517,10 +533,16 @@ size_t spill_reload_from_disk(ConversationDiskStore* disk, const SessionFileIden
 
 namespace detail {
 
-// Non-template helper used by the template best(): builds a ConversationCheckpoint view from
-// the manifest entry and calls conversation_prefix(). Defined in conversation_disk_store.cpp.
+// Non-template helper used by the template best(): matches the manifest entry against the
+// prompt — the live ids as a strict prefix (conversation_prefix), the deepest checkpoint the
+// same way, AND every checkpoint length in `ckpt_lens` (a checkpoint of length L is a prefix
+// of the live ids, so it matches the prompt up to min(L, common_prefix(live, prompt)); the
+// images below L must align). Defined in conversation_disk_store.cpp.
 int64_t best_match_tokens(const std::vector<int32_t>& entry_ids,
                           const std::vector<ConversationImageKey>& entry_imgs,
+                          const std::vector<uint32_t>& ckpt_lens,
+                          const std::vector<int32_t>& ckpt_ids,
+                          const std::vector<ConversationImageKey>& ckpt_imgs,
                           const std::vector<int32_t>& prompt,
                           const std::vector<ConversationImageKey>& prompt_imgs);
 
@@ -542,14 +564,14 @@ ConversationCache::Match ConversationDiskStore::best(const std::vector<Token>& p
     for (size_t i = entries_.size(); i-- > 0;) {
         const auto& e = entries_[i];
         if (e.cvec != cvec) continue;
-        // Try matching against the live ids first (the full conversation state including
-        // reasoning tokens). If that fails (the client strips thinking tokens), try the
-        // deepest checkpoint's ids (the turn boundary — what the next request's prompt
-        // actually contains).
-        int64_t n = detail::best_match_tokens(e.ids, e.imgs, prompt32, images);
-        if (n <= 0 && !e.ckpt_ids.empty()) {
-            n = detail::best_match_tokens(e.ckpt_ids, e.ckpt_imgs, prompt32, images);
-        }
+        // best_match_tokens considers, in order: the live ids (a strict prefix — the plain
+        // growth case), the deepest checkpoint's own ids, and EVERY checkpoint length in
+        // ckpt_lens. The deepest alone is the end-of-prompt checkpoint under
+        // --tail-role-token (it carries the effort-tail turn the next prompt does NOT
+        // re-send — never a prefix); ckpt_lens lets best() see past it to the turn boundaries
+        // the client's re-render still contains.
+        int64_t n = detail::best_match_tokens(e.ids, e.imgs, e.ckpt_lens, e.ckpt_ids, e.ckpt_imgs,
+                                              prompt32, images);
         if (n > best.tokens) {
             best.tokens = n;
             best.serial = e.serial;
@@ -574,16 +596,25 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
     prompt32.reserve(prompt.size());
     for (const auto& t : prompt) prompt32.push_back(static_cast<int32_t>(t));
     auto disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);
-    // ── DIAGNOSTIC: when the disk has entries but no match (or a match below the floor), say so.
-    // This pinpoints whether the issue is (a) no matching prefix (the manifest entries' ids don't
-    // line up with the prompt's) or (b) a matching prefix that the floor caps out below.
+    // ── DIAGNOSTIC: when the disk cannot beat the RAM floor, say WHICH of the two cases it is:
+    // (a) "no usable disk match" — no entry matches the prompt at all (best() == 0: the manifest
+    //     ids do not line up with the prompt anywhere), or
+    // (b) "disk not better than live resume" — the disk HAS a match but the live session is at
+    //     least as deep (disk_best <= ram_floor): the NORMAL case for an in-process request that
+    //     already holds the conversation; nothing is wrong and no alarm is needed.
     if (disk_match.tokens <= ram_floor) {
-        std::fprintf(stderr, "[strata diag] restore_from_disk_or_ram: no usable disk match "
+        const char* why = disk_match.tokens > 0 ? "disk not better than live resume"
+                                                : "no usable disk match";
+        std::fprintf(stderr, "[strata diag] restore_from_disk_or_ram: %s "
                               "(disk_size=%zu, disk_best=%lld, ram_floor=%lld, prompt=%zu, cvec=%d, prompt_imgs=%zu)\n",
-                     disk->size(), (long long) disk_match.tokens, (long long) ram_floor,
+                     why, disk->size(), (long long) disk_match.tokens, (long long) ram_floor,
                      prompt.size(), (int) cvec, images.size());
-        // Print the first/last few ids of each manifest entry vs the prompt, to see where the
-        // mismatch is (when the manifest has entries but best() returns 0).
+        // Show the prompt's first/last few ids, then the manifest entries RANKED by their common
+        // prefix with the prompt (the old first-4 hid the conversation's own entry whenever the
+        // manifest held more than 4 — exactly the restart case the 2026-11-02 log shows). Each
+        // entry also prints its ckpt_lens: the resume points best() could match past the ids'
+        // own divergence (a turn boundary inside the common prefix IS a match even when the
+        // live ids diverge above it).
         if (disk->size() > 0) {
             std::fprintf(stderr, "[strata diag]   prompt first 5 ids:");
             for (size_t i = 0; i < prompt.size() && i < 5; ++i)
@@ -592,44 +623,66 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
             for (size_t i = prompt32.size() >= 5 ? prompt32.size() - 5 : 0; i < prompt32.size(); ++i)
                 std::fprintf(stderr, " %d", (int) prompt32[i]);
             std::fprintf(stderr, "\n");
-            // Show the manifest entries' ids too, so we can compare against the prompt
-            for (size_t i = 0; i < disk->size() && i < 4; ++i) {   // first 4 entries
+            struct Ranked { size_t idx; size_t cp; };
+            std::vector<Ranked> ranked;
+            ranked.reserve(disk->size());
+            for (size_t i = 0; i < disk->size(); ++i) {
                 const std::vector<int32_t>* e_ids = disk->entry_ids(i);
-                if (e_ids && !e_ids->empty()) {
-                    std::fprintf(stderr, "[strata diag]   manifest[%zu] serial=%llu n_ids=%zu first 5:",
-                                 i, (unsigned long long) disk->entry_serial(i), e_ids->size());
-                    for (size_t k = 0; k < e_ids->size() && k < 5; ++k)
-                        std::fprintf(stderr, " %d", (int) (*e_ids)[k]);
-                    std::fprintf(stderr, " | last 5:");
-                    for (size_t k = e_ids->size() >= 5 ? e_ids->size() - 5 : 0; k < e_ids->size(); ++k)
-                        std::fprintf(stderr, " %d", (int) (*e_ids)[k]);
-                    const std::vector<ConversationImageKey>* e_imgs = disk->entry_imgs(i);
-                    std::fprintf(stderr, " imgs=%zu cvec=%d\n", e_imgs ? e_imgs->size() : 0, (int) cvec);
-                    // Show where the manifest and prompt diverge: compare byte by byte until
-                    // the first mismatch. This tells us exactly which token broke the prefix.
-                    const size_t cmp_n = std::min(e_ids->size(), prompt32.size());
-                    size_t diverge = 0;
-                    while (diverge < cmp_n && (*e_ids)[diverge] == prompt32[diverge]) ++diverge;
-                    if (diverge < cmp_n) {
-                        std::fprintf(stderr, "[strata diag]     diverge at token %zu: manifest=%d prompt=%d\n",
-                                     diverge, (int) (*e_ids)[diverge], (int) prompt32[diverge]);
-                        // Show 3 tokens around the divergence point
-                        const size_t show_start = diverge >= 3 ? diverge - 3 : 0;
-                        const size_t show_end = std::min(diverge + 4, cmp_n);
-                        std::fprintf(stderr, "[strata diag]     around divergence:");
-                        for (size_t k = show_start; k < show_end; ++k) {
-                            const char* mark = (k == diverge) ? ">>" : "  ";
-                            std::fprintf(stderr, " %s[%zu]m=%d p=%d", mark, k, (int) (*e_ids)[k], (int) prompt32[k]);
-                        }
-                        std::fprintf(stderr, "\n");
-                    } else if (e_ids->size() < prompt32.size()) {
-                        std::fprintf(stderr, "[strata diag]     manifest is a strict prefix of prompt "
-                                     "(all %zu tokens match; prompt has %zu more)\n",
-                                     e_ids->size(), prompt32.size() - e_ids->size());
-                    } else if (e_ids->size() == prompt32.size()) {
-                        std::fprintf(stderr, "[strata diag]     manifest and prompt have the same length "
-                                     "and all %zu tokens match — but best() still returned 0?\n", e_ids->size());
+                if (e_ids == nullptr || e_ids->empty()) { ranked.push_back({i, 0}); continue; }
+                const size_t cmp_n = std::min(e_ids->size(), prompt32.size());
+                size_t d = 0;
+                while (d < cmp_n && (*e_ids)[d] == prompt32[d]) ++d;
+                ranked.push_back({i, d});
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const Ranked& a, const Ranked& b) { return a.cp > b.cp; });
+            const size_t show = std::min<size_t>(4, ranked.size());
+            for (size_t r = 0; r < show; ++r) {
+                const size_t i = ranked[r].idx;
+                const std::vector<int32_t>* e_ids = disk->entry_ids(i);
+                if (e_ids == nullptr || e_ids->empty()) continue;
+                std::fprintf(stderr, "[strata diag]   manifest[%zu] serial=%llu n_ids=%zu cp=%zu first 5:",
+                             i, (unsigned long long) disk->entry_serial(i), e_ids->size(), ranked[r].cp);
+                for (size_t k = 0; k < e_ids->size() && k < 5; ++k)
+                    std::fprintf(stderr, " %d", (int) (*e_ids)[k]);
+                std::fprintf(stderr, " | last 5:");
+                for (size_t k = e_ids->size() >= 5 ? e_ids->size() - 5 : 0; k < e_ids->size(); ++k)
+                    std::fprintf(stderr, " %d", (int) (*e_ids)[k]);
+                const std::vector<ConversationImageKey>* e_imgs = disk->entry_imgs(i);
+                std::fprintf(stderr, " imgs=%zu", e_imgs ? e_imgs->size() : 0);
+                const std::vector<uint32_t>* e_lens = disk->entry_ckpt_lens(i);
+                if (e_lens != nullptr && !e_lens->empty()) {
+                    std::fprintf(stderr, " ckpt_lens=");
+                    const size_t show_lens = std::min<size_t>(8, e_lens->size());
+                    for (size_t k = 0; k < show_lens; ++k)
+                        std::fprintf(stderr, "%s%u", k ? "," : "", (*e_lens)[k]);
+                    if (e_lens->size() > show_lens) std::fprintf(stderr, "...");
+                }
+                std::fprintf(stderr, " cvec=%d\n", (int) cvec);
+                // Show where the manifest and prompt diverge: compare byte by byte until
+                // the first mismatch. This tells us exactly which token broke the prefix.
+                const size_t cmp_n = std::min(e_ids->size(), prompt32.size());
+                size_t diverge = 0;
+                while (diverge < cmp_n && (*e_ids)[diverge] == prompt32[diverge]) ++diverge;
+                if (diverge < cmp_n) {
+                    std::fprintf(stderr, "[strata diag]     diverge at token %zu: manifest=%d prompt=%d\n",
+                                 diverge, (int) (*e_ids)[diverge], (int) prompt32[diverge]);
+                    // Show 3 tokens around the divergence point
+                    const size_t show_start = diverge >= 3 ? diverge - 3 : 0;
+                    const size_t show_end = std::min(diverge + 4, cmp_n);
+                    std::fprintf(stderr, "[strata diag]     around divergence:");
+                    for (size_t k = show_start; k < show_end; ++k) {
+                        const char* mark = (k == diverge) ? ">>" : "  ";
+                        std::fprintf(stderr, " %s[%zu]m=%d p=%d", mark, k, (int) (*e_ids)[k], (int) prompt32[k]);
                     }
+                    std::fprintf(stderr, "\n");
+                } else if (e_ids->size() < prompt32.size()) {
+                    std::fprintf(stderr, "[strata diag]     manifest is a strict prefix of prompt "
+                                         "(all %zu tokens match; prompt has %zu more)\n",
+                                 e_ids->size(), prompt32.size() - e_ids->size());
+                } else if (e_ids->size() == prompt32.size()) {
+                    std::fprintf(stderr, "[strata diag]     manifest and prompt have the same length "
+                                         "and all %zu tokens match — but best() still returned 0?\n", e_ids->size());
                 }
             }
         }
@@ -643,8 +696,12 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
     // the part worth saving. Bounded: three attempts, each a manifest scan and (on failure) a
     // cheap refused read — never a long drain of a big manifest.
     for (int attempt = 0; attempt < 3 && disk_match.tokens > ram_floor; ++attempt) {
-        if (auto image = const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits))
+        if (auto image = const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits)) {
+            std::fprintf(stderr, "[strata diag] disk match: serial=%llu via=%s, tokens=%lld (prompt=%zu)\n",
+                         (unsigned long long) disk_match.serial, disk_match.live ? "live/ckpt" : "ckpt",
+                         (long long) disk_match.tokens, prompt.size());
             return image;
+        }
         disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);
     }
     return std::nullopt;

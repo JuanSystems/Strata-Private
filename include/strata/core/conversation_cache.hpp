@@ -27,6 +27,26 @@ struct ConversationImageKey {
     bool operator==(const ConversationImageKey&) const = default;
 };
 
+// Why a checkpoint exists — the spill's resume-set selection (spill_resume_checkpoints,
+// conversation_file.hpp) reads it to keep the checkpoints a RE-RENDERING client's next prompt
+// still contains. The one that is NEVER such a prefix is `end_of_prompt` (n-1, the last
+// prompt token): with --tail-role-token the server appends a short reasoning-effort system
+// turn at the prompt's end, and the next prompt does NOT re-send it, so the n-1 checkpoint
+// diverges at the effort turn (~30 ids below its end). The `turn` checkpoint (turn_at, just
+// before the effort turn) IS a prefix — and so is the PREVIOUS request's turn checkpoint when
+// the client also refreshes a timestamp inside the last user message (zoocode's retry after a
+// restart re-renders its environment_details). Default `periodic` is what every checkpoint
+// carried before the field existed: a v1 .bin or a v1 .rst restores as periodic, and the
+// selection treats it as the deep fallback it always was.
+enum class CheckpointKind : uint8_t {
+    periodic      = 0, // every --prompt-cache-every tokens during prefill
+    turn          = 1, // turn_at: the last turn boundary before the effort tail
+    root          = 2, // root_at: the first turn boundary (the system-prompt root)
+    pin           = 3, // pin_at: a pinned shared-prefix checkpoint (also pinned=true)
+    end_of_prompt = 4, // n-1: the checkpoint at the last prompt token (carries the effort tail)
+    message       = 5, // message_at: a message-boundary checkpoint (opt-in)
+};
+
 struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
@@ -36,6 +56,13 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    // Why the checkpoint was created (see CheckpointKind). NOT persisted in the v1 .bin (the
+    // format is frozen — a .bin restore reads periodic); the v2 state sidecar (.rst) persists
+    // it so a journal-folded chain keeps its kinds across restarts, and
+    // conversation_checkpoints_split copies it to every stage part so the per-image resume-set
+    // selections agree (a disagreeing selection makes conversation_checkpoints_merge fail and
+    // the engine would drop the whole restored chain).
+    CheckpointKind kind = CheckpointKind::periodic;
     // Ordinary layer-split checkpoints retain each device's running state.
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
@@ -107,6 +134,8 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.kind = c.kind;   // the kind is part of the checkpoint's identity: the per-image
+                                  // spill-resume selections must agree or merge() fails downstream
             out.parts[k].push_back(std::move(part));
         }
     }

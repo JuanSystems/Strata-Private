@@ -469,7 +469,13 @@ constexpr char kIdxMagic[4] = {'S', 'I', 'D', 'X'};
 // under-report, and the same-client cleanups would mistake the shared root for a turn
 // boundary), so every v4 .idx regenerates through the slow path (parse .bin + fold journal)
 // on the first reload after the upgrade. Self-healing: every put/append/take rewrites it.
-constexpr uint32_t kIdxVersion = 5;
+// v6: the manifest also carries `ckpt_lens` — EVERY checkpoint length the entry's files can
+// deliver (the whole chain for a bare .bin; the resume set for a journal-folded entry), so
+// best() can match the turn boundaries the deepest checkpoint alone hides (the end-of-prompt
+// one under --tail-role-token is never a prefix of the next prompt). A v5 .idx has no
+// ckpt_lens: rejected here, regenerated with them through the slow path on the next start.
+// Self-healing, same as every prior bump.
+constexpr uint32_t kIdxVersion = 6;
 
 // The (constant) distance between the file clock's epoch and the system clock's, measured
 // ONCE. Deriving it per call sampled two different "now" instants, and the nanosecond
@@ -596,6 +602,12 @@ std::vector<uint8_t> build_idx_payload(const DiskEntry& e, const SessionFileIden
         write_le_i64(buf, im.start);
         write_le_u64(buf, im.hash);
     }
+    // v6: EVERY checkpoint length the files deliver as a resume point (the whole chain for a
+    // bare .bin; the .rst's resume set for a journal-folded entry). A checkpoint of length L is
+    // a prefix of the live ids, so the length plus the live's ids is enough for best() — no
+    // need to store the ids per checkpoint.
+    write_le_u32(buf, uint32_t(e.ckpt_lens.size()));
+    for (uint32_t L : e.ckpt_lens) write_le_u32(buf, L);
     return buf;
 }
 
@@ -799,6 +811,18 @@ bool ConversationDiskStore::read_idx(const std::string& idx_path, DiskEntry& out
             e.ckpt_imgs.push_back(ConversationImageKey{start, hash});
         }
     }
+    // v6: EVERY checkpoint length (the resume set). The checksum below covers them; a v5 .idx
+    // ends here and fails the checksum bound (pos + 8 > buf.size()) → the slow path regenerates.
+    {
+        uint32_t n_ckpt_lens = 0;
+        if (!read_le_u32(buf, pos, n_ckpt_lens) || n_ckpt_lens > (1u << 16)) return false;
+        try { e.ckpt_lens.reserve(n_ckpt_lens); } catch (const std::exception&) { return false; }
+        for (uint32_t i = 0; i < n_ckpt_lens; ++i) {
+            uint32_t L = 0;
+            if (!read_le_u32(buf, pos, L)) return false;
+            e.ckpt_lens.push_back(L);
+        }
+    }
     // Checksum: the last 8 bytes of the buffer must equal idx_checksum(everything before).
     if (pos + 8 > buf.size()) return false;
     const uint64_t stored_cs = [&] {
@@ -994,6 +1018,14 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
         e.ckpt_ids = deepest->ids;
         e.ckpt_imgs = deepest->imgs;
     }
+    // EVERY checkpoint length the file delivers as a resume point: a full write's .bin stores
+    // the WHOLE capture chain (put_payload serializes it), and the engine picks the longest
+    // restored checkpoint that prefixes the next prompt — so every length is a promise the
+    // file can keep. A later delta append narrows this to the resume set the .rst carries.
+    e.ckpt_lens.clear();
+    e.ckpt_lens.reserve(image.checkpoints.size());
+    for (const auto& c : image.checkpoints)
+        if (!c.ids.empty()) e.ckpt_lens.push_back(uint32_t(c.ids.size()));
     e.geometry = image.geometry;
     e.layer_lo = image.layer_lo;
     e.layer_hi = image.layer_hi;
@@ -1103,18 +1135,73 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
     return true;
 }
 
-// Non-template helper for the templated ConversationDiskStore::best<Token>(): builds a
-// ConversationCheckpoint view from the manifest entry and calls conversation_prefix(). The
-// template (in the header) converts the prompt to int32_t once, then calls this for each entry.
+// Non-template helper for the templated ConversationDiskStore::best<Token>(): matches one
+// manifest entry against the prompt. The template (in the header) converts the prompt to
+// int32_t once, then calls this for each entry.
+//
+// Three sources of a match, in order of strength:
+//   1. the live ids as a STRICT prefix (conversation_prefix) — the plain growth case;
+//   2. the deepest checkpoint's own ids the same way (kept for entries without ckpt_lens —
+//      a pre-v6 .idx that has not been regenerated yet);
+//   3. EVERY checkpoint length in `ckpt_lens`: a checkpoint of length L is a prefix of the
+//      live ids (a cut at position L), so it is a strict prefix of the prompt exactly when
+//      L < prompt.size() and L <= cp, where cp is the live/prompt common prefix — no need to
+//      store the ids per checkpoint. The images below L must align: the prompt's images with
+//      start < L must equal the entry's, in order (conversation_prefix's own rule, applied to
+//      the cut's image list).
+//
+// Source 3 is what fixes the --tail-role-token restart: the deepest checkpoint is the
+// end-of-prompt one (it carries the effort-tail turn the next prompt never re-sends), and
+// without the lens best() cannot see the turn boundaries the client's re-render still
+// contains — every restart resume collapsed to the pinned root (measured: 22259 restored of
+// 43552 on disk, 21023 tokens re-read, 106 s).
 namespace detail {
 int64_t best_match_tokens(const std::vector<int32_t>& entry_ids,
                           const std::vector<ConversationImageKey>& entry_imgs,
+                          const std::vector<uint32_t>& ckpt_lens,
+                          const std::vector<int32_t>& ckpt_ids,
+                          const std::vector<ConversationImageKey>& ckpt_imgs,
                           const std::vector<int32_t>& prompt,
                           const std::vector<ConversationImageKey>& prompt_imgs) {
-    ConversationCheckpoint live_view;
-    live_view.ids = entry_ids;
-    live_view.imgs = entry_imgs;
-    return conversation_prefix(live_view, prompt, prompt_imgs);
+    int64_t best = 0;
+    {
+        ConversationCheckpoint live_view;
+        live_view.ids = entry_ids;
+        live_view.imgs = entry_imgs;
+        best = std::max(best, conversation_prefix(live_view, prompt, prompt_imgs));
+    }
+    if (best <= 0 && !ckpt_ids.empty()) {
+        ConversationCheckpoint ckpt_view;
+        ckpt_view.ids = ckpt_ids;
+        ckpt_view.imgs = ckpt_imgs;
+        best = std::max(best, conversation_prefix(ckpt_view, prompt, prompt_imgs));
+    }
+    if (!ckpt_lens.empty() && !entry_ids.empty() && prompt.size() > 1) {
+        const size_t cp = ids_common_prefix(entry_ids, prompt);
+        if (cp == 0) return best;
+        // conversation_prefix's image rule at a cut of length L: the prompt's images with
+        // start < L must equal the entry's images with start < L, pairwise and in order.
+        auto imgs_below_align = [&](uint32_t L) -> bool {
+            size_t pi = 0, ei = 0;
+            for (;;) {
+                while (pi < prompt_imgs.size() && prompt_imgs[pi].start >= (int64_t) L) ++pi;
+                while (ei < entry_imgs.size() && entry_imgs[ei].start >= (int64_t) L) ++ei;
+                const bool pdone = pi == prompt_imgs.size(), edone = ei == entry_imgs.size();
+                if (pdone && edone) return true;
+                if (pdone != edone) return false;
+                if (!(prompt_imgs[pi] == entry_imgs[ei])) return false;
+                ++pi;
+                ++ei;
+            }
+        };
+        for (uint32_t L : ckpt_lens) {
+            if (L == 0 || L >= prompt.size()) continue;   // not a strict prefix (the last token starts the verify window)
+            if ((size_t) L > cp) continue;                // the checkpoint extends past the live/prompt divergence
+            if (!imgs_below_align(L)) continue;
+            best = std::max(best, int64_t(L));
+        }
+    }
+    return best;
 }
 } // namespace detail
 
@@ -1249,6 +1336,12 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
             en.ckpt_ids.clear();
             en.ckpt_imgs.clear();
         }
+        // Every resume point the files just delivered (a fold leaves the .rst's resume set;
+        // a bare .bin the whole written chain) — exactly what best() may promise next time.
+        en.ckpt_lens.clear();
+        en.ckpt_lens.reserve(back.checkpoints.size());
+        for (const auto& c : back.checkpoints)
+            if (!c.ids.empty()) en.ckpt_lens.push_back(uint32_t(c.ids.size()));
         en.journal_bytes = fold.dropped ? 0 : fold.journal_bytes;
         en.journal_records = fold.dropped ? 0 : fold.records;
         en.file_bytes = (uint64_t) read + stage_files_bytes(m.serial, entry_pfx) + en.journal_bytes +
@@ -1595,11 +1688,17 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             e.ids = image.live.ids;
             e.imgs = image.live.imgs;
             // Capture the manifest data; the heavy K/V is dropped right after. Same rule as
-            // put(): the spill-resume selection (the deepest checkpoint of the RESTORED chain).
+            // put(): the spill-resume selection (the deepest checkpoint of the RESTORED chain),
+            // plus every length that chain holds (a fold leaves the resume set the .rst
+            // carried; a bare .bin the whole written chain).
             if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints)) {
                 e.ckpt_ids = deepest->ids;
                 e.ckpt_imgs = deepest->imgs;
             }
+            e.ckpt_lens.clear();
+            e.ckpt_lens.reserve(image.checkpoints.size());
+            for (const auto& c : image.checkpoints)
+                if (!c.ids.empty()) e.ckpt_lens.push_back(uint32_t(c.ids.size()));
             e.geometry = image.geometry;
             e.layer_lo = image.layer_lo;
             e.layer_hi = image.layer_hi;
@@ -1875,13 +1974,28 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
     base->imgs = image.live.imgs;
     // The same spill-resume selection the record/sidecar stores (see put_impl): the manifest
     // must promise exactly the checkpoint the fold delivers — the chain's deepest, ignoring
-    // `pinned` (the turn boundary), never the pinned system prompt.
+    // `pinned` (the turn boundary), never the pinned system prompt. ckpt_lens narrows to the
+    // resume SET the new .rst carries (the next fold delivers exactly that set, not the whole
+    // capture chain this image holds).
     if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints)) {
         base->ckpt_ids = deepest->ids;
         base->ckpt_imgs = deepest->imgs;
     } else {
         base->ckpt_ids.clear();
         base->ckpt_imgs.clear();
+    }
+    base->ckpt_lens.clear();
+    if (v3) {
+        std::vector<const ConversationCheckpoint*> sel;
+        spill_resume_checkpoints(image.checkpoints, sel);
+        base->ckpt_lens.reserve(sel.size());
+        for (const ConversationCheckpoint* c : sel)
+            if (!c->ids.empty()) base->ckpt_lens.push_back(uint32_t(c->ids.size()));
+    } else {
+        // a v2 record carries ONE checkpoint (the escape hatch keeps the pre-v3 shape): the
+        // next fold delivers the deepest alone
+        if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints))
+            base->ckpt_lens.push_back(uint32_t(deepest->ids.size()));
     }
     // Accounting: a v3 append's record adds and its sidecar REPLACES (subtract the old .rst,
     // add the new one's); a v2 append touches the record alone — an existing .rst (from v3
