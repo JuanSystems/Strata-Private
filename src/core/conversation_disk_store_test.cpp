@@ -2662,6 +2662,14 @@ int main() {
             main.stage_images.push_back(std::move(stage));
             return main;
         };
+        // the next prompt re-renders without the effort turn: it shares [0, 550) of live2
+        // (declared at this scope: the restart blocks below ask best() the same question)
+        const std::vector<int32_t> a2r = rng(3300, 35);
+        const std::vector<int32_t> u3 = rng(3500, 40);
+        const std::vector<int32_t> effort3 = rng(5020, 10);
+        const std::vector<int32_t> header3 = rng(6004, 2);
+        const std::vector<int32_t> P3 =
+            cat(cat(cat(cat(cat(cat(cat(sys, u1), a1r), u2), a2r), u3), effort3), header3);
         // the selections agree before anything is written (the split copies the kind)
         {
             strata::core::ConversationCheckpointSplit cs =
@@ -2695,13 +2703,6 @@ int main() {
             check(store.put_async(std::move(park2), 3, id), "55: park 2 queues");
             store.flush_pending();
             check(fs::exists(rdir / "conv-2.dlt"), "55: park 2 appended a journal record");
-            // the next prompt re-renders without the effort turn: it shares [0, 550) of live2
-            const std::vector<int32_t> a2r = rng(3300, 35);
-            const std::vector<int32_t> u3 = rng(3500, 40);
-            const std::vector<int32_t> effort3 = rng(5020, 10);
-            const std::vector<int32_t> header3 = rng(6004, 2);
-            const std::vector<int32_t> P3 =
-                cat(cat(cat(cat(cat(cat(cat(sys, u1), a1r), u2), a2r), u3), effort3), header3);
             const auto m = store.best(P3, {}, false);
             check(m.tokens == 550, "55: best() promises T2 (550) through the split journal");
             auto back = store.take(m, id);
@@ -2722,6 +2723,45 @@ int main() {
             check(merged[1].kind == CheckpointKind::turn && merged[2].kind == CheckpointKind::turn &&
                       merged[3].kind == CheckpointKind::end_of_prompt && merged[1].stage_parts.size() == 1,
                   "55: the merged chain keeps the kinds and the stage parts");
+        }
+        // ── 56. The RESTART the whole resume-set work exists for: a FRESH store on the same
+        // dir reloads the journal entry and best() still promises the turn — first through the
+        // .idx fast path (the append refreshed it), then through the SLOW path (the .idx gone:
+        // parse the .bin + fold the .dlt + the .rst — the self-healing a version bump or a
+        // lost .idx takes). The 2026-11-02 Kaggle log: the post-restart restore fell back to
+        // the pfx because the capture had lost every kind and the manifest promised only
+        // ckpt_lens=[n-1]; the slow path must arrive at the SAME set the fast path carries,
+        // or an .idx bump silently costs the conversation its resume points.
+        {
+            ConversationDiskStore fresh(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = fresh.reload_from_disk(id);
+            check(loaded == 2 && fresh.size() == 2,
+                  "56: fast path: the restart reloads the pfx and the journal entry");
+            const auto m = fresh.best(P3, {}, false);
+            check(m.tokens == 550, "56: fast path: best() still promises T2 (550) after a restart");
+            auto back = fresh.take(m, id);
+            check(back.has_value() && back->checkpoints.size() == 4 &&
+                      back->checkpoints[2].kind == CheckpointKind::turn,
+                  "56: fast path: the restored chain is the resume set with its kinds");
+        }
+        {
+            fs::remove(rdir / "conv-2.idx");   // a lost/stale/bumped .idx: the slow path's door
+            ConversationDiskStore fresh(rdir.string(), 1ull << 30, &id);
+            const size_t loaded = fresh.reload_from_disk(id);
+            check(loaded == 2 && fresh.size() == 2,
+                  "56: slow path: the .bin is parsed and the journal folded back in");
+            const auto m = fresh.best(P3, {}, false);
+            check(m.tokens == 550, "56: slow path: best() still promises T2 (550) after a restart");
+            auto back = fresh.take(m, id);
+            check(back.has_value() && back->stage_images.size() == 1 &&
+                      back->checkpoints.size() == 4 &&
+                      back->checkpoints[2].kind == CheckpointKind::turn &&
+                      back->stage_images[0].checkpoints.size() == 4,
+                  "56: slow path: the fold lands the set with kinds on both images");
+            bool aligned = true;
+            for (size_t i = 0; aligned && i < back->checkpoints.size(); ++i)
+                aligned = back->checkpoints[i].ids == back->stage_images[0].checkpoints[i].ids;
+            check(aligned, "56: slow path: the two chains stay index-aligned (merge's requirement)");
         }
         junsetenv("STRATA_SPILL_JOURNAL");
     }

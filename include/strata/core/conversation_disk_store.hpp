@@ -700,6 +700,42 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
             std::fprintf(stderr, "[strata diag] disk match: serial=%llu via=%s, tokens=%lld (prompt=%zu)\n",
                          (unsigned long long) disk_match.serial, disk_match.live ? "live/ckpt" : "ckpt",
                          (long long) disk_match.tokens, prompt.size());
+            // Say what the match beat: the entries with the deepest common prefix and their
+            // ckpt_lens — the resume points the restore could have offered. The 2026-11-02
+            // post-restart log showed a pfx winning at 22 259 while the conversation's own
+            // journal entry (38 329 tokens) sat unusable with ckpt_lens=[n-1] — invisible,
+            // because the ranked dump only printed when NOTHING matched. One line per entry,
+            // the top 3 by prefix; "<- restored" marks the winner.
+            {
+                struct Ranked { size_t idx; size_t cp; };
+                std::vector<Ranked> ranked;
+                ranked.reserve(disk->size());
+                for (size_t i = 0; i < disk->size(); ++i) {
+                    const std::vector<int32_t>* e_ids = disk->entry_ids(i);
+                    if (e_ids == nullptr || e_ids->empty()) continue;
+                    const size_t cmp_n = std::min(e_ids->size(), prompt32.size());
+                    size_t d = 0;
+                    while (d < cmp_n && (*e_ids)[d] == prompt32[d]) ++d;
+                    ranked.push_back({i, d});
+                }
+                std::sort(ranked.begin(), ranked.end(),
+                          [](const Ranked& a, const Ranked& b) { return a.cp > b.cp; });
+                for (size_t r = 0; r < ranked.size() && r < 3; ++r) {
+                    const std::vector<int32_t>* e_ids = disk->entry_ids(ranked[r].idx);
+                    const std::vector<uint32_t>* e_lens = disk->entry_ckpt_lens(ranked[r].idx);
+                    std::fprintf(stderr, "[strata diag]   ranked[%zu] serial=%llu n_ids=%zu cp=%zu",
+                                 r, (unsigned long long) disk->entry_serial(ranked[r].idx),
+                                 e_ids->size(), ranked[r].cp);
+                    if (e_lens != nullptr && !e_lens->empty()) {
+                        std::fprintf(stderr, " ckpt_lens=");
+                        for (size_t k = 0; k < e_lens->size() && k < 8; ++k)
+                            std::fprintf(stderr, "%s%u", k ? "," : "", (*e_lens)[k]);
+                    }
+                    std::fprintf(stderr, "%s\n",
+                                 disk->entry_serial(ranked[r].idx) == disk_match.serial
+                                     ? "  <- restored" : "");
+                }
+            }
             return image;
         }
         disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);

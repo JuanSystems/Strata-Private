@@ -7078,8 +7078,24 @@ def main() -> int:
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
     if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older
-        import webbrowser                                  # run-<model>.bat still passes --open)
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        # run-<model>.bat still passes --open). Headless-safe: on a machine with no desktop
+        # session (Kaggle/Colab, a VPS, docker, plain ssh) webbrowser falls through to
+        # xdg-open, which prints "no method available for opening 'http://...:8080/'" over
+        # the log — noise that read exactly like a resume failure. Only try when a graphical
+        # session (or an explicit $BROWSER) exists; any refusal or exception degrades to the
+        # printed URL. The server is up and serving either way.
+        import webbrowser
+        url = f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/"
+        graphical = (os.name != "posix" or bool(os.environ.get("DISPLAY"))
+                     or bool(os.environ.get("WAYLAND_DISPLAY")) or bool(os.environ.get("BROWSER")))
+        try:
+            if not graphical:
+                print(f"[strata] headless machine: no browser to open — the chat page is {url} "
+                      "(open it from a machine that can reach this one)", flush=True)
+            elif not webbrowser.open(url):
+                print(f"[strata] no browser opened (none available) — the chat page is {url}", flush=True)
+        except Exception:
+            print(f"[strata] opening the browser failed — the chat page is {url}", flush=True)
     # #96: docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
     # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
     # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.
