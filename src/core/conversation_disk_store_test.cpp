@@ -2217,14 +2217,27 @@ int main() {
             }
             return s;
         };
-        // the engine's resume derivation after a disk restore: the live if a strict prefix of
-        // the prompt, else the longest restored checkpoint that is (generate.cpp's rule — the
-        // turn boundary survives the client stripping the thinking tokens; the live does not)
+        // the engine's resume derivation after a disk restore (generate.cpp's rule, post-fix):
+        // the DIVERGENCE POINT between the live (or a checkpoint) and the prompt — the first
+        // token where they differ. The K/V below it is valid by causality (position i depends
+        // only on tokens <= i), so the engine reuses it and re-reads from there. A disk-restored
+        // image can be LONGER than the prompt (the conversation on disk carries the assistant's
+        // thinking tokens; the client's next prompt is a re-render without them), so the old
+        // "strict prefix of the prompt" rule (conversation_prefix's n >= prompt.size() → 0)
+        // left resume=0 and the engine re-read everything — the very regression the spill fix
+        // was meant to cure. Mirrors generate.cpp's match_len lambda for the disk-restore path.
         auto engine_resume = [](const SavedConversation& img, const std::vector<int32_t>& prompt) {
-            int64_t resume = 0;
-            if (conversation_prefix(img.live, prompt, {}) > 0) resume = (int64_t) img.live.ids.size();
+            auto match_len = [&](const std::vector<int32_t>& pre) -> int64_t {
+                if (pre.empty() || prompt.empty()) return 0;
+                const int64_t m = std::min<int64_t>((int64_t) pre.size(), (int64_t) prompt.size());
+                int64_t i = 0;
+                while (i < m && pre[(size_t) i] == prompt[(size_t) i]) ++i;
+                if (i >= (int64_t) prompt.size()) i = (int64_t) prompt.size() - 1;
+                return i;
+            };
+            int64_t resume = match_len(img.live.ids);
             for (const auto& c : img.checkpoints)
-                resume = std::max(resume, conversation_prefix(c, prompt, {}));
+                resume = std::max(resume, match_len(c.ids));
             return resume;
         };
         // the conversation: a 400-token pinned system prompt; turn k's prompt P_k, the
@@ -2296,20 +2309,24 @@ int main() {
                 check(engine_resume(*back, P3) == 542,
                       "53: request 3: the engine resumes at T2, not the pinned root");
             }
-            // rollback (the documented Option-A limit): a prompt that rewinds PAST the last
-            // turn boundary — T1 (402) WAS captured in park 2's chain, but the record keeps
-            // only the deepest, so the conversation entry no longer matches and the shared
-            // pinned root (the pfx entry) is the floor: one recompute, then the journal
-            // re-learns the new branch's boundaries
+            // rollback: a prompt that rewinds PAST the last turn boundary — T1 (402) WAS
+            // captured in park 2's chain, but the record keeps only the deepest (T2 at 542),
+            // so the folded chain no longer carries T1. The conversation entry's live ids
+            // (P2 + a2 = 742) still share P1 (402) with the rollback prompt — the K/V below
+            // the divergence at 402 is valid by causality — so best() promises 402 (the
+            // divergence point) and the engine reuses it, NOT the 400-token pinned root.
+            // The OLD rule (n >= prompt.size() → 0) missed this and fell to the pin; the
+            // fix's divergence-point match catches it. One recompute from 402, then the
+            // journal re-learns the new branch's boundaries.
             std::vector<int32_t> rollback = P1;
             for (size_t i = 0; i < 80; ++i) rollback.push_back(int32_t(3500 + i));   // an EDITED turn
             for (size_t i = 0; i < 60; ++i) rollback.push_back(int32_t(3600 + i));
             {
                 const auto m = store.best(rollback, {}, false);
-                check(m.tokens == 400, "53: rollback: the floor is the pinned root (the deepest-only record)");
+                check(m.tokens == 402, "53: rollback: the live's divergence at P1 (402), not the pinned root (400)");
                 auto back = store.take(m, id);
-                check(back.has_value() && engine_resume(*back, rollback) == 400,
-                      "53: rollback: one recompute from the pinned root (documented Option-A limit)");
+                check(back.has_value() && engine_resume(*back, rollback) == 402,
+                      "53: rollback: one recompute from the divergence point (402), honest — never a mismatch");
             }
         }
         // restart: a fresh store reloads the manifest from disk; the folded entry still
@@ -2326,9 +2343,12 @@ int main() {
             // carry only the pinned root in their record/sidecar. Simulate turn 3's park as
             // one of those builds would have written it (the capture's real chain is
             // [pin, T3], the record keeps the pin alone), and check the two halves of the
-            // recovery: the manifest is HONEST about the loss (the resume floors at the pin
-            // for one request — a recompute, never a mismatch), and the conversation's NEXT
-            // park appends a record carrying the real turn boundary again — self-healing.
+            // recovery: the manifest is HONEST about the loss — the affected journal's only
+            // checkpoint is the pin (400), so the chain can't promise T3; but the live ids
+            // (P3 + a3 = 822) still share P3 (672) with P4, and the divergence-point match
+            // reuses that — honest (no mismatch), one recompute from 672, never a fall to
+            // the pinned root. The conversation's NEXT park appends a record carrying the
+            // real turn boundary again — self-healing.
             std::vector<int32_t> a3;
             for (size_t i = 0; i < 150; ++i) a3.push_back(int32_t(9200 + i));
             const std::vector<int32_t> live3 = with_private(P3, a3);
@@ -2341,11 +2361,11 @@ int main() {
             for (size_t i = 0; i < 60; ++i) P4.push_back(int32_t(3800 + i));    // +u4 → 782
             {
                 const auto m4 = fresh.best(P4, {}, false);
-                check(m4.tokens == 400,
-                      "53: heal: the affected journal's floor is honest (the pinned root)");
+                check(m4.tokens == 672,
+                      "53: heal: the live's divergence at P3 (672) — honest, never the pinned root (400)");
                 auto b4 = fresh.take(m4, id);
-                check(b4.has_value() && engine_resume(*b4, P4) == 400,
-                      "53: heal: ONE recompute from the pin — honest, never a mismatch");
+                check(b4.has_value() && engine_resume(*b4, P4) == 672,
+                      "53: heal: ONE recompute from the divergence point (672) — honest, never a mismatch");
             }
             // the fixed build's next park of this conversation: the append re-learns the
             // turn boundary (T4 = the whole of P4), and request 5 restores at it

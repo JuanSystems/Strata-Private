@@ -11643,12 +11643,34 @@ int main(int argc, char** argv) {
                     resume = 0;
                     from_live = false;
                     if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
-                        if (starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
-                        for (const ConvCheckpoint& c : checks)
-                            if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
-                                resume = (int64_t) c.ids.size();
-                                from_live = false;
-                            }
+                        // A disk-restored image can be LONGER than this prompt (the conversation
+                        // on disk carries the assistant's thinking tokens; the client's next
+                        // prompt is a re-render without them). The OLD `starts_with` rule
+                        // (L <= n - 1 AND every token matches) rejected anything longer than or
+                        // diverging from the prompt, so a delta-restored chain whose ONE checkpoint
+                        // sits past the turn boundary left resume=0 and the engine re-read the
+                        // whole prompt — the very regression the spill fix was meant to cure.
+                        // Derive the resume from the DIVERGENCE POINT: the first token where the
+                        // live (or a checkpoint) and the prompt differ. The K/V below it is valid
+                        // by causality (position i depends only on tokens <= i), so the engine
+                        // reuses it and re-reads from there. When the prompt is a strict prefix
+                        // of the restored state (a sibling query, or an exact-equal case), the
+                        // whole prompt minus the last token (which always starts the next verify
+                        // window) is the match.
+                        auto match_len = [&](const std::vector<int32_t>& pre) -> int64_t {
+                            if (pre.empty()) return 0;
+                            const int64_t m = std::min<int64_t>((int64_t) pre.size(), n);
+                            int64_t i = 0;
+                            while (i < m && pre[(size_t) i] == ids[(size_t) i]) ++i;
+                            if (i >= n) i = n - 1;   // leave the last prompt token for the verify window
+                            return i;
+                        };
+                        const int64_t live_match = match_len(live);
+                        if (live_match > 0) { resume = live_match; from_live = true; }
+                        for (const ConvCheckpoint& c : checks) {
+                            const int64_t ck_match = match_len(c.ids);
+                            if (ck_match > resume) { resume = ck_match; from_live = false; }
+                        }
                     }
                 } else {
                     resume = parked.tokens;   // the RAM cache's match — unchanged behavior
