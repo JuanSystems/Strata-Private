@@ -1106,50 +1106,15 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
 // Non-template helper for the templated ConversationDiskStore::best<Token>(): builds a
 // ConversationCheckpoint view from the manifest entry and calls conversation_prefix(). The
 // template (in the header) converts the prompt to int32_t once, then calls this for each entry.
-//
-// A spill entry can be LONGER than the next prompt: the conversation on disk carries the
-// assistant's thinking tokens, and the client's next prompt is a re-render WITHOUT them. The
-// shared conversation_prefix() rejects that case outright (n >= prompt.size() → 0), so without
-// this override best() would skip the conversation and fall back to a shorter pinned-prefix
-// snapshot — every delta-restored resume collapsed to the system root, the very regression
-// the spill fix was meant to cure. The DIVERGENCE POINT is the real match length: the first
-// token where the entry and the prompt differ. The K/V below it is valid by causality
-// (position i depends only on tokens <= i), so the engine reuses it and re-reads from there.
-// When the prompt is a strict prefix of the entry (a sibling query that stops inside the
-// assistant's turn, or an exact-equal case), the whole prompt minus the last token (which
-// always starts the next verify window) is the match. The RAM cache's best() shares
-// conversation_prefix() and is unaffected — its entries are the in-RAM state, normally
-// shorter than the next prompt; only the disk path sees the longer-with-thinking shape.
 namespace detail {
 int64_t best_match_tokens(const std::vector<int32_t>& entry_ids,
                           const std::vector<ConversationImageKey>& entry_imgs,
                           const std::vector<int32_t>& prompt,
                           const std::vector<ConversationImageKey>& prompt_imgs) {
-    const size_t n = entry_ids.size();
-    if (n == 0 || prompt.empty()) return 0;
-    if (n < prompt.size()) {
-        // The common case: the entry is a strict prefix of the prompt. Use the shared rule
-        // (it checks the image list too).
-        ConversationCheckpoint live_view;
-        live_view.ids = entry_ids;
-        live_view.imgs = entry_imgs;
-        return conversation_prefix(live_view, prompt, prompt_imgs);
-    }
-    // The entry is equal to or longer than the prompt. Find the divergence point.
-    const size_t m = prompt.size();
-    size_t match = 0;
-    while (match < m && entry_ids[match] == prompt[match]) ++match;
-    // The last prompt token always starts the next verify window.
-    if (match >= prompt.size()) match = prompt.size() - 1;
-    if (match == 0) return 0;
-    // The image list must line up too (mirrors conversation_prefix's check).
-    size_t j = 0;
-    for (const auto& image : prompt_imgs) {
-        if (image.start >= (int64_t) match) continue;
-        if (j == entry_imgs.size() || !(entry_imgs[j++] == image)) return 0;
-    }
-    if (j != entry_imgs.size()) return 0;
-    return (int64_t) match;
+    ConversationCheckpoint live_view;
+    live_view.ids = entry_ids;
+    live_view.imgs = entry_imgs;
+    return conversation_prefix(live_view, prompt, prompt_imgs);
 }
 } // namespace detail
 
