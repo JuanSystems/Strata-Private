@@ -145,6 +145,97 @@ este fork; la versión original de Strata no la tiene.
 
 ---
 
+## Compilar el motor desde el código fuente (Linux + CUDA)
+
+El motor se puede compilar a mano cuando quieres una arquitectura de CUDA concreta, una build para tu
+tarjeta exacta o una versión que el instalador no trae. Los dos ajustes que más importan:
+
+### Release, no Debug (esto es lo que más pesa)
+
+**Compila siempre con `-DCMAKE_BUILD_TYPE=Release`.** Una build `Debug` (o una build sin tipo, que es lo
+que CMake hace si no le dices nada) apaga las optimizaciones del compilador: los kernels de decodificación
+dejan de usar los registros y las instrucciones vectorizadas que asumen, y el motor pasa de unos **30
+tokens/s a dificilmente 15 tokens/s** en una tarjeta que antes iba bien. El síntoma engaña porque la build
+funciona y da respuestas correctas — solo va a la mitad. Si compilaste una vez en `Debug` y no entiendes
+la caída de velocidad, no busques en los parámetros del modelo ni en el `--conversation-cache-mib`: vuelve
+a configurar el proyecto en `Release` con un directorio de build limpio.
+
+```sh
+rm -rf build   # una build Debug NO se convierte en Release cambiando una opción: hay que empezar de cero
+```
+
+### La arquitectura de CUDA es la de TU tarjeta
+
+`-DCMAKE_CUDA_ARCHITECTURES` no es un valor fijo: es el *compute capability* de la tarjeta donde va a
+correr el motor. Si pones un número que no es el tuyo, el motor arranca pero no aprovecha los kernels de
+la generación correcta (o directamente no arranca).
+
+| Tarjeta | Valor |
+|---------|-------|
+| RTX 20xx (Turing) | `75` |
+| RTX 30xx (Ampere) | `86` |
+| RTX 40xx (Ada) | `89` |
+| RTX 50xx (Blackwell) | `120` |
+| Sin especificar | [`CMakeLists.txt`](CMakeLists.txt:194) usa `120` |
+
+Puedes poner varias separadas por punto y coma (`-DCMAKE_CUDA_ARCHITECTURES="75;86;89"`) si el binario
+va a circular entre varias máquinas, pero cada arquitectura extra alarga la compilación. El proyecto
+rechaza cualquier valor por debajo de `75` salvo que compiles con `-DSTRATA_EXPERIMENTAL_SM60=ON`
+([`CMakeLists.txt`](CMakeLists.txt:193), solo CUDA 12.x).
+
+### El comando completo
+
+Necesitas CMake 3.24 o más nuevo, Ninja, un compilador C++17 y el *toolkit* de CUDA instalado. El comando
+busca el toolkit con `nvcc` en el `PATH`, así que no lleva rutas de una versión concreta de CUDA: funciona
+con la que tengas (12.x o 13.x) sin editarlo.
+
+```sh
+# 1. Localiza el toolkit que tienes instalado (sirve para 12.x y 13.x)
+CUDA_HOME="$(dirname "$(dirname "$(readlink -f "$(which nvcc)")")")"
+echo "CUDA toolkit: $CUDA_HOME"   # p. ej. /usr/local/cuda-13.0
+
+# 2. Configura
+cmake -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=75 \
+  -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/nvidia/lib64 -L$CUDA_HOME/targets/x86_64-linux/lib -Wl,--no-as-needed -lcuda -lcublas_static -lcublasLt_static -lculibos -lpthread -ldl -lrt -Wl,--as-needed -static-libgcc -static-libstdc++" \
+  -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/nvidia/lib64 -L$CUDA_HOME/targets/x86_64-linux/lib -Wl,--no-as-needed -lcuda -lcublas_static -lcublasLt_static -lculibos -lpthread -ldl -lrt -Wl,--as-needed -static-libgcc -static-libstdc++" \
+  -DCMAKE_MODULE_LINKER_FLAGS="-L/usr/local/nvidia/lib64 -L$CUDA_HOME/targets/x86_64-linux/lib -Wl,--no-as-needed -lcuda -lcublas_static -lcublasLt_static -lculibos -lpthread -ldl -lrt -Wl,--as-needed -static-libgcc -static-libstdc++"
+
+# 3. Compila el motor
+cmake --build build --target strata -j2
+```
+
+Cambia `-DCMAKE_CUDA_ARCHITECTURES=75` por el valor de tu tarjeta de la tabla de arriba. Sube `-j2` si
+tienes RAM suficiente para más procesos de `nvcc` a la vez (cada uno puede consumir varios GB).
+
+Por qué los tres bloques de `*_LINKER_FLAGS` llevan las rutas del toolkit: enlazan `libcublas`,
+`libcublasLt` y `libcuda` de forma **estática** (`-lcublas_static`, `-lcublasLt_static`). El binario
+resultante no depende de las `.so` del toolkit en tiempo de ejecución, así que funciona en un contenedor o
+en una máquina con otro CUDA instalado. Si no necesitas eso, puedes omitir los tres bloques y dejar que
+CMake enlace con los *imported targets* de `CUDA::cublas` y `CUDA::cudart` que ya usa
+([`CMakeLists.txt`](CMakeLists.txt:191)).
+
+`-DCMAKE_C_COMPILER_LAUNCHER=ccache` (y sus dos hermanos) son opcionales, pero con `ccache` instalado
+una recompilación después de tocar un solo archivo pasa de minutos a segundos.
+
+### Comprobar que quedó en Release
+
+```sh
+# Debe decir CMAKE_BUILD_TYPE:STRING=Release (vacío o Debug = vuelve al paso 1)
+grep CMAKE_BUILD_TYPE build/CMakeCache.txt
+```
+
+Si `CMAKE_BUILD_TYPE` sale vacío o `Debug`, la velocidad de generación se queda a la mitad aunque todo
+compile y responda bien.
+
+---
+
 ## Cómo subir tu GGUF perforado a Hugging Face
 
 Un GGUF perforado **no se puede subir tal cual**. Hugging Face no guarda archivos sparse: cuando subes un
