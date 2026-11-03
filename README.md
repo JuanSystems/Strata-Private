@@ -13,8 +13,9 @@ o entender Strata en sí (modelos, motores, la app, la Terminal, las APIs), ve a
 
 ## Qué añade este fork
 
-Dos cosas, las dos alrededor del mismo problema: **el archivo `experts.bin` ocupa entre 35 y 50 GB que
-quizá no tienes.**
+Tres cosas. Dos giran alrededor del mismo problema — **el archivo `experts.bin` ocupa entre 35 y 50 GB
+que quizá no tienes** — y la tercera es una función que el motor original no trae: **guardar las
+conversaciones en disco para que un reinicio o una expulsión de la caché no las deseche.**
 
 ### 1. Modo low-RAM que no escribe `experts.bin`
 
@@ -94,6 +95,53 @@ Si una fase se interrumpe, las fases 1 y 2 retoman desde las capas registradas e
 **La herramienta comprueba antes de tocar nada que tu sistema de archivos soporte hole-punch.** Si no
 lo soporta, aborta con un mensaje en vez de dejarte creyendo que ahorraste 35 GB que en realidad no se
 liberaron.
+
+### 3. Conversaciones que sobreviven al disco: `--conversation-spill-gib`
+
+El motor de Strata guarda en RAM las conversaciones en pausa (las "parked") para que el siguiente turno
+empiece en segundos. Cuando esa RAM se llena, la conversación más antigua se descartaba: el turno
+siguiente volvía a leer el prompt entero (unos 210 s para 72K tokens). Este fork añade un **segundo
+nivel en disco**: la conversación expulsada se escribe a un archivo y el turno siguiente la restaura en
+1-2 s. Nada se pierde mientras quede disco.
+
+Se activa con un argumento del motor, apagado por defecto:
+
+```sh
+--conversation-spill-gib 64
+```
+
+| Argumento | Qué hace | Por defecto |
+|-----------|----------|-------------|
+| `--conversation-spill-gib N` | Presupuesto en GiB del nivel de disco. `0` lo apaga y el motor se comporta exactamente como antes | `0` (apagado) |
+| `--conversation-spill-path PATH` | Carpeta de los archivos de conversación | `<data_dir>/strata-spill/` |
+| `--conversation-spill-min-tokens N` | Solo se guardan conversaciones de al menos N tokens | hereda `--conversation-cache-min-tokens` |
+| `--conversation-idle-spill-seconds N` | Tras el `DONE`, espera N s a otro turno; si no llega, respalda la conversación viva al disco. `0` respalda al instante; negativo lo apaga | `5` |
+
+Lo que conviene saber antes de activarlo:
+
+- **Sobrevive a reinicios.** Al arrancar, el motor relee el manifiesto del disco; una conversación que
+guardó la ejecución anterior se puede restaurar sin releer el prompt. Los archivos de una ejecución
+interrumpida a medias se limpian solos.
+- **El presupuesto es un LRU.** Cuando el nivel de disco se llena, se borra la conversación usada hace
+más tiempo, no la más nueva.
+- **Un prefijo compartido (`pin=N`) también se guarda.** Su instantánea `pfx-*.bin` queda en el mismo
+directorio, así que el caché entre conversaciones tampoco depende de que el prefijo se acabe de crear en
+el request actual.
+- **Si el disco está lleno o el archivo está corrupto, no rompe nada.** La conversación se descarta y el
+motor cae en el comportamiento de siempre: releer el prompt.
+- **A/B seguro.** Con `--conversation-spill-gib 0` no se crea ningún archivo y el camino es el del motor
+original, byte por byte.
+
+En la configuración `strata-<model>.json` de la app se escribe como un bloque, y el servidor lo traduce a
+los argumentos de arriba:
+
+```json
+"conversation_spill": { "budget_gib": 64, "path": "D:/strata-spill", "min_tokens": 2000, "idle_seconds": 5 }
+```
+
+Cada GiB de presupuesto es espacio en disco, no en RAM: una conversación de 72K tokens ocupa cerca de
+1.4 GiB de archivo. Un valor entre 32 y 128 GiB cubre un día de trabajo normal. Esta función es propia de
+este fork; la versión original de Strata no la tiene.
 
 ---
 
