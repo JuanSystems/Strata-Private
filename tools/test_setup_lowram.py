@@ -136,9 +136,11 @@ class NoExpertsBinGate(unittest.TestCase):
 
     def test_the_gate_is_read_before_need_is_summed(self):
         gate = self.SRC.index('_no_ebin = os.environ.get("STRATA_NO_EXPERTS_BIN") == "1"')
-        need = self.SRC.index('need = to_fetch +')
+        need = self.SRC.index('real = to_fetch +')          # upstream 0.2.x sums real, then adds margin
         self.assertLess(gate, need)
-        self.assertIn("(0 if _no_ebin else", self.SRC[need:need + 400])
+        copy = self.SRC.index('copy_gb = ')
+        self.assertLess(gate, copy)
+        self.assertIn("not _no_ebin", self.SRC[copy:copy + 400])
 
     def test_the_write_of_experts_bin_is_skipped_when_the_gate_is_on(self):
         at = self.SRC.index('if low_ram and not ready and not (pack / "experts.bin").exists() and')
@@ -157,6 +159,25 @@ class NoExpertsBinGate(unittest.TestCase):
         # the else branch is the old one line, byte for byte
         self.assertIn('        else:\n            args += ["--resident-experts" if resident else "--mmap-experts"]',
                       self.SRC)
+
+
+class DraftLayerCountsInTheFit(unittest.TestCase):
+    """The draft layer (MTP) takes about 1 GB of graphics memory out of the expert cache: every fit check counts it while it is on."""
+
+    def test_the_card_holds_one_gb_less_with_mtp_on(self):
+        on = setup.low_ram_gpu_gb("IQ3_XXS", 12.0)
+        off = setup.low_ram_gpu_gb("IQ3_XXS", 12.0, mtp=False)
+        self.assertAlmostEqual(off - on, setup.MTP_VRAM_GB)
+        self.assertEqual(setup.MTP_VRAM_GB, 1.0)
+        self.assertAlmostEqual(setup.low_ram_gpu_share("IQ3_XXS", 12.0, mtp=False) - setup.low_ram_gpu_share("IQ3_XXS", 12.0),
+                               1.0 / setup.MODELS["IQ3_XXS"]["arena_gb"])
+
+    def test_the_edge_of_what_fits_moves_by_the_draft_layer(self):
+        arena = setup.MODELS["IQ1_M"]["arena_gb"]
+        ram = arena + 6 - 7.0 + 0.5            # a card of 12 GB holds 7 GB beside the dense part; the draft layer needs one of them
+        self.assertFalse(setup.low_ram_fits("IQ1_M", ram, 12.0))
+        self.assertTrue(setup.low_ram_fits("IQ1_M", ram, 12.0, mtp=False))
+
 
 
 if __name__ == "__main__":
