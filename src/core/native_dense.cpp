@@ -205,7 +205,9 @@ void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le 
 // The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
 // reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not
 // on the card when the split search prices that stage, and `load` runs one cudaMalloc per matrix (#1238).  The two
-// have to stay in step.  A repeated name is skipped rather than refused (`load` refuses it).
+// have to stay in step.  A repeated name is skipped rather than refused; `load` refuses a repeat inside
+// one shard, and skips one across shards: the earlier shard serves it (the PLE shard of a noPLE native
+// repeats the projections of the layers it holds).
 bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
                                    int64_t lb, int64_t le, uint64_t& out, std::string& err) {
     out = 0;
@@ -290,7 +292,6 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         int max_in = 0;
         uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
         uint64_t split_count = 0, split_tensors = 0;
-        std::set<uint64_t> split_numbers;
         bool have_architecture = false;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
@@ -306,15 +307,26 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     split_count = count->u;
                     split_tensors = tensors->u;
                 }
-            } else if (!have_architecture || !split_count || !count || !number || !tensors ||
-                       count->u != split_count || number->u == 0 || number->u >= split_count ||
-                       tensors->u != split_tensors) {
-                err = "native dense: additional shard must match the architecture-validated first shard's split metadata";
+            } else if (!have_architecture || !count || !number || !tensors ||
+                       count->u <= 1 || number->u == 0 || number->u >= count->u) {
+                // A single-file --native (Gyro-S/M TQ2_0-noPLE: one file, no split keys at all) opens no
+                // split set, so an additional shard cannot be asked to match the first shard's split
+                // metadata: the shard a noPLE model's --ple-gguf points at belongs to another file. It
+                // only has to be a well-formed split shard of its own.
+                err = "native dense: additional shard must be a well-formed split shard "
+                      "(split metadata present, split.no in [1, split.count))";
                 return false;
+            } else if (split_count == 0 || count->u != split_count || tensors->u != split_tensors) {
+                // A shard of another file: the PLE source a noPLE native's --ple-gguf points at, appended
+                // after the native shards. Its count and tensor total describe its own file, not the
+                // native model's; read after the native shards it serves the tensors they lack, and a
+                // tensor both files carry stays with the native model's quant (the earlier shard wins).
+                std::fprintf(stderr, "native dense: %s is a shard of another file (split.no %llu of %llu, "
+                                     "%llu tensors): it serves what the earlier shards lack\n",
+                             path.c_str(), (unsigned long long) number->u, (unsigned long long) count->u,
+                             (unsigned long long) tensors->u);
             }
-            if (number && !split_numbers.insert(number->u).second) {
-                err = "native dense: duplicate split shard number"; return false;
-            }
+            std::set<std::string> file_seen;   // this shard's own names: a repeat inside one file is malformed
             std::vector<uint64_t> offsets;
             for (const auto& tensor : gguf.tensors()) offsets.push_back(tensor.offset);
             std::sort(offsets.begin(), offsets.end());
@@ -357,9 +369,16 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
                 if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
-                if (!seen.insert(tensor.name).second) {
-                    err = "native dense: duplicate tensor " + tensor.name; return false;
+                if (!file_seen.insert(tensor.name).second) {
+                    err = "native dense: duplicate tensor " + tensor.name + " in " + path; return false;
                 }
+                if (seen.count(tensor.name)) {
+                    // the PLE shard of a noPLE native repeats the projections of the layers it holds: the
+                    // native model's quant was chosen to serve them, so the earlier shard wins and this
+                    // one contributes only what the earlier shards lack
+                    continue;
+                }
+                seen.insert(tensor.name);
                 auto found = table.table_.find(tensor.name);
                 if (found == table.table_.end()) {
                     err = "native dense: tensor absent from canonical table: " + tensor.name; return false;
