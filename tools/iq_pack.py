@@ -591,6 +591,17 @@ def read_json(path: pathlib.Path):
         return None
 
 
+def gguf_is_punched(p: pathlib.Path) -> bool:
+    """True when the file is sparse: fewer 512-byte blocks in use than its size would need.  A GGUF as
+    published is dense; only tools/strata_extract_experts_bin.py leaves holes (Linux only), so this says
+    the file's expert ranges read as zeros and must not be compared with the pack's blobs."""
+    try:
+        st = os.stat(p)
+    except OSError:
+        return False
+    return os.name == "posix" and st.st_blocks * 512 < st.st_size
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True, help="the model's shard 1")
@@ -670,7 +681,13 @@ def main() -> int:
         assert chunk.shape == (n_expert, blob)
         return chunk
 
-    if reuse:
+    if reuse and any(gguf_is_punched(p) for p in model.paths):
+        # the experts were hole-punched out of the GGUFs (tools/strata_extract_experts_bin.py): they read as
+        # zeros, so the blob comparison below cannot run.  The sidecar (the shard names and sizes and the
+        # native_experts.txt hash) is the check the engine itself goes by; trust it.
+        print("the GGUFs' expert ranges were hole-punched (strata_extract_experts_bin.py): %s is trusted by its "
+              "%s, its blobs cannot be compared with the punched-out source" % (path.name, sidecar.name))
+    elif reuse:
         # the sidecar names the shards by name and size, which a re-quantized or fine-tuned checkpoint of the same
         # geometry packed into the same folder can share: compare the first and last blobs of the first, middle and
         # last layers with the GGUF too (six blobs, so an unchanged pack is still reused at once)

@@ -291,7 +291,11 @@ writes `experts.bin` exactly as before.
 On a Linux disk that is too small even for the GGUFs plus the pack, `tools/strata_extract_experts_bin.py` builds
 `experts.bin` by extracting each shard's experts into an intermediate file and hole-punching the ranges they came
 from, so the disk use stays at about 70 GB instead of growing to about 105 GB (90 GB free with the 70 GB of GGUFs
-already downloaded is the case it was written for). **The saving is real on Linux only**: hole-punch is
+already downloaded is the case it was written for). A single-file GGUF (Gyro-S, Gyro-M) is passed to `--gguf` as
+it is - no `-NNNNN-of-NNNNN` name - and phase 2 is then a no-op. On a prism.hadamard model (Gyro) the phase-4
+sidecar hashes the v5 `native_experts.txt`, exactly as iq_pack.py does, and iq_pack's reuse check does not
+compare blobs with a hole-punched GGUF (they read as zeros), so the extracted `experts.bin` is reused as is.
+**The saving is real on Linux only**: hole-punch is
 `fallocate(FALLOC_FL_PUNCH_HOLE)`, which Windows and macOS do not have, so there the tool rebuilds `experts.bin`
 without freeing anything from the GGUFs and says so. On those systems use `STRATA_NO_EXPERTS_BIN=1` instead (no
 `experts.bin` at all, the GGUFs untouched). Phases: `--phase 1` (shard 1), `--phase 2` (shard 2), `--phase 3`

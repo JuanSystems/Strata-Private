@@ -56,6 +56,10 @@ BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
     "TQ2_T": (128, 34), "TQK6": (128, 26), "TQK7": (128, 30), "PTQ1_0": (128, 28),
     # TQP5/6/7: fp16 scale + 8*K bytes of a 64-step x K-bit circular stream (K = 5/6/7)
     "TQP5": (128, 42), "TQP6": (128, 50), "TQP7": (128, 58),
+    # llama.cpp's ternary blocks (third_party/ggml/ggml-common.h), 256 values each: TQ1_0 = 48 B of base-3
+    # digits + 4 B of high trits + fp16 scale; TQ2_0 = 64 B of 2-bit values + fp16 scale.  The "TQ2_0" in
+    # Gyro-M's FILE name is the product name; its expert tensors are TQ2_T above.
+    "TQ1_0": (256, 54), "TQ2_0": (256, 66),
 }
 
 

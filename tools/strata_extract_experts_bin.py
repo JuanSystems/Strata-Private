@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """strata_extract_experts_bin.py
 
-Build `experts.bin` from the GGUF shards of Qwen3.8-Flash-Next by extracting the
+Build `experts.bin` from the GGUFs of Qwen3.8-Flash-Next - a `-NNNNN-of-NNNNN.gguf`
+shard family or a single-file GGUF such as Gyro-S / Gyro-M - by extracting the
 experts layer by layer and hole-punching the ranges they came from.  This keeps
 the disk use CONSTANT at about 70 GB during the whole operation, instead of
 growing to about 105 GB as the standard setup does (it writes experts.bin
@@ -28,10 +29,14 @@ the 70 GB of GGUFs untouched).
 Phases (`--phase`):
   1  extract the experts of shard 1 -> expert-01.bin (intermediate), punch shard 1
   2  extract the experts of shard 2 -> expert-02.bin (intermediate), punch shard 2
+     (a single-file GGUF has no shard 2: the phase reports so and does nothing)
   3  concatenate expert-01.bin + expert-02.bin -> experts.bin (streaming; the
-     first intermediate is deleted as it is consumed)
-  4  cleanup: delete the second intermediate, write the sidecar
-     experts.bin.src.json, update the .done marks
+     first intermediate is deleted as it is consumed; one intermediate is a
+     plain rename)
+  4  cleanup: delete the leftover intermediates, write the sidecar
+     experts.bin.src.json (for a prism.hadamard model - Gyro - it hashes the v5
+     table, exactly as iq_pack.py does, or iq_pack would refuse this experts.bin
+     and rewrite its ~32 GB), update the .done marks
 
 `--phase all` runs 1+2+3+4.  A run can also be done step by step, which is the
 recommended way on a very tight disk.
@@ -42,10 +47,16 @@ Requirements:
   - Python 3.10+, numpy
   - the model's GGUFs already downloaded
 
-Typical use (from inside the Strata repo):
+Typical use (from inside the Strata repo), a shard family:
   python3 tools/strata_extract_experts_bin.py \\
       --gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-00001-of-00002.gguf \\
       --out /path/to/data/packs/iq2xs \\
+      --phase all
+
+A single-file GGUF (Gyro-S, Gyro-M and their variants) is passed as it is:
+  python3 tools/strata_extract_experts_bin.py \\
+      --gguf /path/to/Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf \\
+      --out /path/to/data/packs/gyro-m \\
       --phase all
 
 Resuming: if interrupted, phases 1 and 2 skip the tensors already extracted
@@ -87,7 +98,7 @@ if IQ_PACK_PATH is None:
 sys.path.insert(0, str(IQ_PACK_PATH.parent))
 import numpy as np
 import iq_pack
-from iq_pack import Model, expert_layout, experts_source
+from iq_pack import Model, expert_layout, experts_source, hadamard_spec, native_experts_v5
 
 
 # ---- fallocate constants (Linux)
@@ -270,8 +281,8 @@ def extract_from_shard(
         if len(names_here) == 3:
             my_layers.append(entry)
         elif names_here:
-            print(f"  [X] layer {l}: its tensors are split across shards, which is not expected "
-                  "for a two-shard IQ2_XS")
+            print(f"  [X] layer {l}: its tensors are split across shards, which this extractor cannot "
+                  "lay out in one intermediate (pass the shard family's -00001-of-0000N name)")
             print(f"      in this shard:  {names_here}")
             print(f"      in another one: {[t.name for t in ts if model.where[t.name][3].name != gguf_path.name]}")
             return 1
@@ -451,6 +462,21 @@ def finalize(gguf_path: Path, out_dir: Path) -> int:
         return 1
     layout, text, n_expert, total = got
 
+    # prism.hadamard (Gyro's trellis experts are Hadamard-rotated): iq_pack marks the table v5 and hashes THAT
+    # text into the sidecar.  Without the same marking here the sidecar would carry a v3 hash, iq_pack would
+    # refuse the experts.bin this tool just built ("cut from another source") and rewrite its ~32 GB.
+    t0 = layout[0][5]
+    had = hadamard_spec(model.files[0].metadata, layout, int(t0[0].shape[0]), int(t0[2].shape[0]))
+    if isinstance(had, str) and not had.startswith("# strata hadamard"):
+        print(f"  [X] prism.hadamard: {had}")
+        return 1
+    if had is not None:
+        text = native_experts_v5(text)
+        if not text.startswith("# strata native experts v5:"):
+            print(f"  [X] prism.hadamard: {text}")
+            return 1
+        print("  prism.hadamard: the sidecar hashes the v5 table, exactly as iq_pack.py writes it")
+
     # Exactly the sidecar iq_pack writes: the engine compares it (names, sizes
     # and the native_experts.txt hash) to decide whether an experts.bin belongs
     # to this model.  Anything else is "not the pack this geometry came from".
@@ -467,6 +493,10 @@ def finalize(gguf_path: Path, out_dir: Path) -> int:
     if setup_path.exists():
         try:
             import importlib.util
+            # setup.py imports strata_control from beside itself; run as a script our sys.path only has
+            # tools/, so without the repo root the import fails and every shard loses its pinned SHA
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
             spec = importlib.util.spec_from_file_location("strata_setup", setup_path)
             setup_mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(setup_mod)
@@ -512,15 +542,34 @@ def finalize(gguf_path: Path, out_dir: Path) -> int:
 # CLI
 # ----------------------------------------------------------------------------
 
+def resolve_shards(gguf: Path) -> tuple[list[Path], str]:
+    """--gguf -> the model's shard paths, and a one-line description for the log.
+
+    A `-NNNNN-of-NNNNN.gguf` name gives its whole family (any shard of it may be
+    passed, not only the first).  Any other name is a single-file GGUF (Gyro-S and
+    Gyro-M are published as one file): the model is that file alone.  Model's
+    check_split still refuses a file whose own metadata says it is shard 1 of a
+    split download that was renamed to a plain name."""
+    m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", gguf.name)
+    if not m:
+        return [gguf], f"single GGUF: {gguf.name}"
+    total_shards = int(m.group(2))
+    shards = [gguf.with_name(gguf.name[:m.start()] + f"-{i:05d}-of-{total_shards:05d}.gguf")
+              for i in range(1, total_shards + 1)]
+    return shards, f"{total_shards} shards"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Build experts.bin by extracting the experts from the GGUF and punching the source",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--gguf", required=True, help="path to shard 1 of the model's GGUF")
+    ap.add_argument("--gguf", required=True,
+                    help="path to the model's GGUF: shard 1 of a -NNNNN-of-NNNNN family, or the single file (Gyro)")
     ap.add_argument("--out", required=True, help="pack directory (where experts.bin is written)")
     ap.add_argument("--phase", default="all", choices=["1", "2", "3", "4", "all"],
-                    help="phase to run (1: shard 1, 2: shard 2, 3: concat, 4: finalize, all: 1+2+3+4)")
+                    help="phase to run (1: shard 1, 2: shard 2 (a no-op for a single file), 3: concat, "
+                         "4: finalize, all: 1+2+3+4)")
     ap.add_argument("--no-punch", action="store_true",
                     help="do not punch the GGUF (extract only, as plain iq_pack.py does)")
     args = ap.parse_args()
@@ -533,20 +582,22 @@ def main() -> int:
         print(f"[X] does not exist: {gguf}")
         return 1
 
-    m = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", gguf.name)
-    if not m:
-        print(f"[X] {gguf.name} does not follow the -NNNNN-of-NNNNN.gguf pattern")
-        return 1
-    total_shards = int(m.group(2))
-    shards = [gguf.with_name(gguf.name[:m.start()] + f"-{i:05d}-of-{total_shards:05d}.gguf")
-              for i in range(1, total_shards + 1)]
+    shards, what = resolve_shards(gguf)
     missing = [s for s in shards if not s.exists()]
     if missing:
         print(f"[X] missing shards: {[s.name for s in missing]}")
         return 1
-    print(f"Model: {total_shards} shards")
+    print(f"Model: {what}")
     for s in shards:
         print(f"  {s.name}: {human_bytes(s.stat().st_size)}")
+
+    # The shard set is validated up front (a renamed shard 1 of a split model would otherwise die with a
+    # traceback inside a phase, after the pre-flight below has already probed the file).
+    try:
+        Model(gguf)
+    except (OSError, ValueError) as e:
+        print(f"[X] {e}")
+        return 1
 
     # The pre-flight runs once, before anything is written: without hole-punch
     # the extract frees nothing and the user would believe 35 GB were saved.

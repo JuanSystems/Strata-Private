@@ -79,6 +79,16 @@ python3 tools/strata_extract_experts_bin.py \
     --phase all
 ```
 
+Los GGUFs de **un solo archivo** (Gyro-S, Gyro-M y sus variantes) se pasan tal cual, sin patrón
+`-NNNNN-of-NNNNN`; la fase 2 no tiene entonces segundo shard y no hace nada:
+
+```sh
+python3 tools/strata_extract_experts_bin.py \
+    --gguf /ruta/al/Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf \
+    --out  /ruta/al/data/packs/gyro-m \
+    --phase all
+```
+
 Fases, por si prefieres ir paso a paso y verificar entre medias:
 
 | Fase | Qué hace |

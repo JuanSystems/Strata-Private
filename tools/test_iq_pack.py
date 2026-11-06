@@ -242,6 +242,39 @@ class CompatibilityTests(unittest.TestCase):
                 iq_pack.Model(first)
 
 
+class PunchedGgufTests(unittest.TestCase):
+    """gguf_is_punched: a sparse GGUF (tools/strata_extract_experts_bin.py hole-punched it) must not take
+    part in the blob comparison of the reuse check - its expert ranges read as zeros there.  No gguf-py
+    needed: the fixtures are plain files."""
+
+    def test_a_dense_file_is_not_punched(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "dense.gguf"
+            p.write_bytes(b"\x01" * 100000)
+            self.assertFalse(iq_pack.gguf_is_punched(p))
+
+    def test_a_sparse_file_is_punched(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "sparse.gguf"
+            with open(p, "wb") as f:
+                f.write(b"\x01" * 4096)
+                f.seek(1 << 20)                    # a hole: the extract tool's punch, as the filesystem sees it
+                f.write(b"\x01")
+            self.assertLess(p.stat().st_blocks * 512, p.stat().st_size)
+            self.assertTrue(iq_pack.gguf_is_punched(p))
+
+    def test_a_missing_file_is_not_punched(self):
+        self.assertFalse(iq_pack.gguf_is_punched(Path("no-such.gguf")))
+
+    def test_ternary_blocks_are_sized(self):
+        """TQ1_0 / TQ2_0 (llama.cpp's ternary types, third_party/ggml/ggml-common.h) get their block
+        geometry, so a tensor of those types is not 'unsupported or truncated' to Model."""
+        self.assertEqual(iq_pack.G.BLOCK_GEOMETRY["TQ1_0"], (256, 54))
+        self.assertEqual(iq_pack.G.BLOCK_GEOMETRY["TQ2_0"], (256, 66))
+        t = iq_pack.G.TensorInfo("blk.0.ffn_gate_exps.weight", [256, 2, 4], 35, "TQ2_0", 0)
+        self.assertEqual(t.elements, 2048)
+        self.assertEqual(t.expected_bytes(), 2048 // 256 * 66)
+
 
 def bits(u32):
     return np.array(u32, dtype=np.uint32).view(np.float32)
