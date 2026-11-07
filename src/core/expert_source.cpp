@@ -1570,6 +1570,7 @@ void FileExpertSource::close() {
     prefetch_end();
     ram_stop();
     io_stop();
+    extra_stop();   // CS-K: the worker reads the files; it stops before any mapping or handle below goes
     inputs_.clear();
     if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
@@ -1606,6 +1607,15 @@ void FileExpertSource::close() {
     complement_ready_ = false;
     complement_locked_ = 0;
     complement_lent_slots_ = 0;
+    complement_leftover_.clear();   // CS-K: the extra tier's candidate list
+    complement_headroom_ = 0;
+    if (extra_arena_ != nullptr) std::free(extra_arena_);   // the extra tier's arena, as the complement's own
+    extra_arena_ = nullptr;
+    extra_at_.reset();
+    extra_capacity_ = 0;
+    extra_resident_bytes_.store(0, std::memory_order_relaxed);
+    extra_resident_experts_.store(0, std::memory_order_relaxed);
+    extra_done_.store(false, std::memory_order_relaxed);
     if (!maps_.empty()) {
         for (Map& m : maps_) {
 #if defined(_WIN32)
@@ -3511,6 +3521,8 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
     err.clear();
     const auto pin_t0 = std::chrono::steady_clock::now();
+    complement_leftover_.clear();   // CS-K: a retry (the soft mode's second try) re-records it below
+    complement_headroom_ = headroom_bytes;
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
     if (!cache.valid()) { err = "FileExpertSource: the GPU expert cache is not open"; return false; }
@@ -3643,6 +3655,35 @@ bool FileExpertSource::pin_cache_complement(
                          (long long) budget_lent, (long long) budget_lendable, (double) (at - at0) / 1073741824.0,
                          (double) (budget_bytes - at0) / 1073741824.0);
         }
+        // CS-K (--resident-extra-gib): the plan's members the budget left on the files, in the order the extra tier
+        // should take them - the profile's rank first (the hottest, the same order the budget filled its own bytes
+        // in), then the lend region's tail (the order the borrowing reads it; a pair never appears twice).  The plan
+        // is `offsets` until the swap below; `ranked` holds what the budget took.
+        std::vector<std::pair<int32_t, int32_t>> lend_tail;
+        std::vector<char> in_tail(offsets.size(), 0);
+        if (budget_lendable > 0) {   // the lend region above: its unkept pairs, highest slot first
+            std::vector<size_t> tail;
+            for (size_t i = 0; i < primary_gpu_pairs.size(); ++i)
+                if (pair_slot[i] >= lend_from_slot && pair_slot[i] < n_slots) tail.push_back(i);
+            std::sort(tail.begin(), tail.end(), [&](size_t a, size_t b) { return pair_slot[a] > pair_slot[b]; });
+            for (size_t i : tail) {
+                const auto& pr = primary_gpu_pairs[i];
+                const size_t idx = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
+                if (idx < offsets.size() && offsets[idx] != kNoComplement && ranked[idx] == kNoComplement) {
+                    in_tail[idx] = 1;
+                    lend_tail.push_back(pr);
+                }
+            }
+        }
+        if (rank != nullptr)
+            for (const auto& pr : *rank) {
+                if (pr.first < 0 || pr.second < 0 || pr.first >= n_layers_ || pr.second >= n_expert_) continue;
+                const size_t i = (size_t) pr.first * (size_t) n_expert_ + (size_t) pr.second;
+                if (i >= offsets.size() || in_tail[i] != 0 || offsets[i] == kNoComplement ||
+                    ranked[i] != kNoComplement) continue;
+                complement_leftover_.push_back(pr);
+            }
+        complement_leftover_.insert(complement_leftover_.end(), lend_tail.begin(), lend_tail.end());
         offsets.swap(ranked);
         bytes = at;
         lend_from_slot = -1;
@@ -4220,8 +4261,16 @@ bool FileExpertSource::pin_cache_complement(
 }
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
+    // the rotation's ownership table is authoritative when it is on (the plain offsets go stale as it moves experts)
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
-    return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+    const uint8_t* b = detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
+    if (b == nullptr && extra_at_ != nullptr && index < (size_t) blobs_) {
+        // CS-K: an extra-tier expert, published one at a time after READY (--resident-extra-gib).  The worker's
+        // release-store pairs with this acquire: the arena's bytes are visible before its offset is.
+        const uint64_t at = extra_at_[index].load(std::memory_order_acquire);
+        if (at != kNoComplement && at < extra_capacity_) b = extra_arena_ + (size_t) at;
+    }
+    return b;
 }
 
 bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
@@ -4312,6 +4361,13 @@ bool FileExpertSource::stage_exchange(int64_t layer, int64_t in, int64_t out, in
         exchange_buffer(q, layer) == nullptr) return false;
     const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
     const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    // CS-K: only the compact copy's places move in an exchange; the extra tier's arena is append-only, so an
+    // expert it holds cannot take an evicted one's place (the exchange filters ask exchange_resident first).
+    // The rotation's table is the authority when it is on, as in resident_blob.
+    const bool held = exchange_storage_.active()
+                          ? exchange_storage_.resident(i_in).host != nullptr
+                          : i_in < complement_offsets_.size() && complement_offsets_[i_in] != kNoComplement;
+    if (!held) return false;
     if (override_.empty()) override_.assign((size_t) blobs_, nullptr);
     if (override_[i_out] != nullptr) return false;
     for (const Exchange& x : staged_)
@@ -4389,6 +4445,7 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
     if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
         bytes > complement_bytes_ - at) return false;
+    if (extra_holds(i_in)) return false;   // CS-K: the extra tier holds `in` already; a swap would hold it twice
     (void) at;
     // read beside the copy first: a failed read leaves `out` where it was
     if (ram_adapt_buf_.size() < (size_t) bytes) ram_adapt_buf_.resize((size_t) bytes);
@@ -4411,6 +4468,7 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
     const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
     if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
         bytes > complement_bytes_ - at || bytes > stage_blob_) return false;
+    if (extra_holds(i_in)) return false;   // CS-K: the extra tier holds `in` already; a swap would hold it twice
     ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
     bool moved = false;
     {
@@ -4440,6 +4498,7 @@ bool FileExpertSource::install_resident(int64_t layer, int64_t in, int64_t out, 
     const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
     if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
         bytes > complement_bytes_ - at) return false;
+    if (extra_holds(i_in)) return false;   // CS-K: the extra tier holds `in` already; a swap would hold it twice
     // #2134: a Foresight slot may be copying out of `out`'s place right now; it is dropped (never served) before the place is rewritten
     ForesightSwap* fs = fs_swap_.load(std::memory_order_acquire);
     if (fs != nullptr) fs->hold(layer, (int32_t) out);
@@ -4550,6 +4609,226 @@ void FileExpertSource::ram_stop() {
     std::lock_guard<std::mutex> lk(ram_mu_);
     ram_jobs_.clear();
     ram_quit_ = false;
+}
+
+// ---- CS-K: the extra resident tier (--resident-extra-gib), grown slowly after READY
+//
+// The compact copy answers pinned()/device_alias() with the places the GPU may read over PCIe, and its bytes are
+// placed by budget at startup.  This tier is the other answer: a host whose session is killed when RAM climbs fast
+// (Kaggle's watchdog) sizes that budget so the STARTUP stays under the radar, and the rest of the ranked experts
+// are read from the files all run long.  After the engine says READY, one background thread copies them into a
+// second arena one step at a time - each expert's bytes land, are published (release-store), then a pause - so the
+// host sees RAM climb at a pace it accepts.  Nothing is evicted and nothing moves: the tier only grows, and the
+// exchange machinery (stage_exchange / install_resident) refuses its experts, so the adaptive tiers simply pick
+// other candidates.
+
+bool FileExpertSource::exchange_resident(int64_t layer, int64_t expert) const {
+    if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (index >= complement_offsets_.size()) return false;
+    if (exchange_storage_.active()) return exchange_storage_.resident(index).host != nullptr;
+    // soft_commit_exchanges: a staged `out` is judged by the place it will take (`in`'s), as pinned() does
+    const size_t at_index = !soft_in_.empty() && soft_in_[index] != SIZE_MAX ? soft_in_[index] : index;
+    return at_index < complement_offsets_.size() && complement_offsets_[at_index] != kNoComplement;
+}
+
+bool FileExpertSource::extra_holds(size_t index) const {
+    return extra_at_ != nullptr && index < (size_t) blobs_ &&
+           extra_at_[index].load(std::memory_order_acquire) != kNoComplement;
+}
+
+bool FileExpertSource::extra_sleep(int64_t ms) {
+    for (int64_t left = ms; left > 0;) {
+        if (extra_quit_.load(std::memory_order_relaxed)) return false;
+        const int64_t s = left < 100 ? left : 100;   // a stop lands within a tenth of a second
+        std::this_thread::sleep_for(std::chrono::milliseconds(s));
+        left -= s;
+    }
+    return !extra_quit_.load(std::memory_order_relaxed);
+}
+
+bool FileExpertSource::start_extra_resident(uint64_t extra_bytes, std::string& err) {
+    err.clear();
+    if (extra_bytes == 0) return true;
+    if (base_ == nullptr) { err = "no expert files open"; return false; }
+    if (!complement_ready_) {
+        err = "the resident RAM mode is not running: --resident-extra-gib needs --resident-budget-gib (or "
+              "--resident-experts) with an --expert-profile";
+        return false;
+    }
+    if (extra_thread_.joinable()) {
+        if (!extra_done_.load(std::memory_order_relaxed)) { err = "already running"; return false; }
+        extra_stop();   // a finished worker: joined, so this can start a new one
+        if (extra_arena_ != nullptr) std::free(extra_arena_);
+        extra_arena_ = nullptr;
+        extra_at_.reset();
+        extra_capacity_ = 0;
+    }
+    if (complement_leftover_.empty()) {
+        err = "nothing left to promote: every expert the GPU cache does not hold that the profile ranks is "
+              "already in RAM";
+        return false;
+    }
+    // The budget over the leftovers, whole experts only (a promoted expert is complete or not promoted at all)
+    uint64_t want = 0;
+    for (const auto& pr : complement_leftover_) {
+        const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+        if (want + b > extra_bytes) break;
+        want += b;
+    }
+    if (want == 0) { err = "the budget is smaller than one expert"; return false; }
+    // Clamped to the RAM the reserve leaves, as the startup budget is (clamp_resident_budget): the arena is a plain
+    // allocation whose pages arrive one step at a time, so this is a guard for commit-limited hosts, not the pace
+    uint64_t avail = 0, commit = std::numeric_limits<uint64_t>::max();
+    if (available_memory_bytes(avail, &commit)) {
+        const uint64_t keep = std::max<uint64_t>(2ull << 30, complement_headroom_);
+        const uint64_t clamped = detail::clamp_resident_budget(want, avail, commit, keep);
+        if (clamped < want)
+            std::fprintf(stderr, "FileExpertSource: --resident-extra-gib %.2f exceeds the room above the %.2f GiB "
+                                 "reserve (%.2f GiB available): %.2f GiB\n",
+                         (double) want / 1073741824.0, (double) keep / 1073741824.0,
+                         (double) std::min(avail, commit) / 1073741824.0, (double) clamped / 1073741824.0);
+        want = clamped;
+    }
+    if (want == 0) { err = "no RAM above the reserve right now"; return false; }
+    uint64_t fit = 0;
+    for (const auto& pr : complement_leftover_) {   // the clamp, at expert boundaries too
+        const uint64_t b = layer_blob_bytes_[(size_t) pr.first];
+        if (fit + b > want) break;
+        fit += b;
+    }
+    if (fit == 0) { err = "the room is smaller than one expert"; return false; }
+    void* arena = nullptr;
+#if !defined(_WIN32)
+    (void) posix_memalign(&arena, (size_t) 4096, (size_t) ((fit + 4095) / 4096 * 4096));
+#else
+    arena = std::malloc((size_t) fit);
+#endif
+    if (arena == nullptr) { err = "cannot allocate the extra tier's arena"; return false; }
+    extra_arena_ = (uint8_t*) arena;
+    extra_capacity_ = fit;
+    extra_at_.reset(new std::atomic<uint64_t>[(size_t) blobs_]);
+    for (size_t i = 0; i < (size_t) blobs_; ++i) extra_at_[i].store(kNoComplement, std::memory_order_relaxed);
+    extra_resident_bytes_.store(0, std::memory_order_relaxed);
+    extra_resident_experts_.store(0, std::memory_order_relaxed);
+    extra_done_.store(false, std::memory_order_relaxed);
+    extra_quit_.store(false, std::memory_order_relaxed);
+    std::fprintf(stderr, "FileExpertSource: the extra tier starts: up to %.2f GiB of the ranked experts the RAM "
+                         "budget left on the files, one step at a time after READY (--resident-extra-gib)\n",
+                 (double) fit / 1073741824.0);
+    std::fflush(stderr);
+    extra_thread_ = std::thread([this] { extra_worker(); });
+    return true;
+}
+
+void FileExpertSource::extra_worker() {
+    strata::platform::name_this_thread("strata-extra");
+    // The pace, read once: a step of this many MiB, then a pause this long - about 1 GiB a minute at the defaults,
+    // far under the speed a fast-climbing session is killed for.  STRATA_EXTRA_DELAY_S waits out the first request
+    // (the server takes one the moment READY is printed); STRATA_EXTRA_RESERVE_GIB is the RAM that must stay
+    // available for a step to run (default: at least the resident mode's headroom); STRATA_EXTRA_GIVEUP_S is how
+    // long a starved tier waits for room before it stops for good.
+    const uint64_t step = [] {
+        const char* v = std::getenv("STRATA_EXTRA_STEP_MIB");
+        return v != nullptr && std::atof(v) > 0.0 ? (uint64_t) (std::atof(v) * 1048576.0) : 64ull << 20;
+    }();
+    const int64_t pause_ms = [] {
+        const char* v = std::getenv("STRATA_EXTRA_PAUSE_MS");
+        return v != nullptr && std::atoll(v) > 0 ? std::atoll(v) : 4000;
+    }();
+    const int64_t delay_s = [] {
+        const char* v = std::getenv("STRATA_EXTRA_DELAY_S");
+        return v != nullptr && std::atoll(v) >= 0 ? std::atoll(v) : 5;
+    }();
+    const uint64_t keep = std::max<uint64_t>([] {
+        const char* v = std::getenv("STRATA_EXTRA_RESERVE_GIB");
+        return v != nullptr && std::atof(v) > 0.0 ? (uint64_t) (std::atof(v) * 1073741824.0) : 2ull << 30;
+    }(), complement_headroom_);
+    const int64_t giveup_ms = [] {
+        const char* v = std::getenv("STRATA_EXTRA_GIVEUP_S");
+        return v != nullptr && std::atoll(v) > 0 ? std::atoll(v) * 1000 : 180000;
+    }();
+    if (delay_s > 0 && !extra_sleep(delay_s * 1000)) return;
+    uint64_t at = 0, step_bytes = 0, starved_ms = 0;
+    int64_t n = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (const auto& pr : complement_leftover_) {
+        const int64_t layer = pr.first, expert = pr.second;
+        const uint64_t blob = layer_blob_bytes_[(size_t) layer];
+        if (blob == 0 || at + blob > extra_capacity_) break;   // the budget (or the clamp) is spent
+        // RAM room: a prompt may be streaming or the OS may not have reclaimed yet; wait, and stop for good only
+        // after the give-up window.  This is the tier's real guard: whatever the budget said, the reserve holds.
+        for (;;) {
+            uint64_t avail = 0;
+            if (available_memory_bytes(avail) && avail >= keep + blob) { starved_ms = 0; break; }
+            if (starved_ms >= giveup_ms) {
+                std::fprintf(stderr, "FileExpertSource: the extra tier stops at %.2f GiB (%lld experts): the RAM "
+                                     "available has stayed under the %.2f GiB reserve for %.0f s (--resident-extra-gib; "
+                                     "STRATA_EXTRA_RESERVE_GIB lowers the reserve, STRATA_EXTRA_GIVEUP_S waits longer)\n",
+                             (double) at / 1073741824.0, (long long) n, (double) keep / 1073741824.0,
+                             (double) giveup_ms / 1000.0);
+                extra_done_.store(true, std::memory_order_relaxed);
+                return;
+            }
+            if (!extra_sleep(pause_ms)) return;
+            starved_ms += pause_ms;
+        }
+        // One expert: read beside the copy through the file tier's own path (unbuffered where the budget opened it,
+        // the mapping otherwise), then publish - the release-store makes the bytes visible before the offset is
+        const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+        if (!copy_from_files(layer, expert, extra_arena_ + (size_t) at)) {
+            std::fprintf(stderr, "FileExpertSource: the extra tier stops at %.2f GiB: layer %lld expert %lld could "
+                                 "not be read\n",
+                         (double) at / 1073741824.0, (long long) layer, (long long) expert);
+            extra_done_.store(true, std::memory_order_relaxed);
+            return;
+        }
+        extra_at_[index].store(at, std::memory_order_release);
+        at += blob;
+        ++n;
+        extra_resident_bytes_.store(at, std::memory_order_relaxed);
+        extra_resident_experts_.store(n, std::memory_order_relaxed);
+#if !defined(_WIN32) && !defined(__APPLE__)
+        // The mapping's pages of this expert go back, as the complement's own build does per layer (experts.bin
+        // read through the file cache only: the unbuffered tier never caches them, the GGUF in place leaves its
+        // pages to the OS) - the copy in the arena is the reader now
+        if (role_ptr_.empty() && maps_.empty() && direct_.empty() && !unmapped_ && base_ != nullptr &&
+            (size_t) layer < layer_offsets_.size()) {
+            const long page = sysconf(_SC_PAGESIZE);
+            if (page > 0) {
+                const uint64_t pg = (uint64_t) page;
+                const uint64_t start = layer_offsets_[(size_t) layer] + (uint64_t) expert * blob;
+                const uint64_t end = std::min<uint64_t>(start + blob, mapped_bytes_);
+                const uint64_t a = start - start % pg, e = (end + pg - 1) / pg * pg;
+                if (e > a && start < mapped_bytes_) {
+                    (void) madvise((void*) (base_ + (size_t) a), (size_t) (e - a), MADV_DONTNEED);
+                    if (fd_ >= 0) (void) posix_fadvise(fd_, (off_t) a, (off_t) (e - a), POSIX_FADV_DONTNEED);
+                }
+            }
+        }
+#endif
+        if (at / (1ull << 30) != (at - blob) / (1ull << 30))   // one line per GiB, as the complement's copy does
+            std::fprintf(stderr, "FileExpertSource: the extra tier holds %.2f GiB (%lld experts, %.0f s)\n",
+                         (double) at / 1073741824.0, (long long) n,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        // The pause: the step's bytes are in, RAM climbs no further until it passes
+        step_bytes += blob;
+        if (step_bytes >= step && at < extra_capacity_ && !extra_sleep(pause_ms)) return;
+        if (step_bytes >= step) step_bytes = 0;
+    }
+    extra_done_.store(true, std::memory_order_relaxed);
+    std::fprintf(stderr, "FileExpertSource: the extra tier is done: %.2f GiB more of the ranked experts in RAM "
+                         "(%lld experts, %.0f s); nothing left to promote under --resident-extra-gib\n",
+                 (double) at / 1073741824.0, (long long) n,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
+void FileExpertSource::extra_stop() {
+    if (extra_thread_.joinable()) {
+        extra_quit_.store(true, std::memory_order_relaxed);
+        extra_thread_.join();
+    }
+    extra_quit_.store(false, std::memory_order_relaxed);
 }
 
 int FileExpertSource::tier_of(int64_t layer, int64_t expert) const {

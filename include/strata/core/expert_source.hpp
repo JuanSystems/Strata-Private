@@ -898,6 +898,24 @@ public:
     /// False when the view could not be mapped again: then the file tier stays unbuffered, `why` says so.
     bool end_startup_unbuffered(std::string& why);
     bool startup_unbuffered() const { return startup_ub_; }
+    /// CS-K `--resident-extra-gib N` (start_extra_resident): once the engine is READY for inference, a background
+    /// thread copies more of the profile-ranked experts the RAM budget left on the files into a second, pageable
+    /// arena - one small step at a time with a pause between steps, and only while the RAM available stays above a
+    /// reserve - so a host that kills a session whose RAM climbs fast (Kaggle's watchdog) lets it climb slowly
+    /// instead.  The promoted experts answer through resident_blob()/copy_blob() like the complement's own: the CPU
+    /// computes them from RAM, the GPU PCIe tier keeps to the page-locked complement.  Nothing is evicted (the tier
+    /// only grows), and the adaptive tiers leave its experts alone (exchange_resident).  False (and `err`) when the
+    /// resident RAM mode with a budget is not running or there is nothing left to promote.
+    bool start_extra_resident(uint64_t extra_bytes, std::string& err);
+    /// What the extra tier holds so far (0 before it starts).  The bytes are the promoted experts' own.
+    uint64_t extra_resident_bytes() const { return extra_resident_bytes_.load(std::memory_order_relaxed); }
+    int64_t extra_resident_experts() const { return extra_resident_experts_.load(std::memory_order_relaxed); }
+    /// True once the worker finished (the budget reached, nothing left to promote, or it gave up waiting for RAM).
+    bool extra_resident_finished() const { return extra_done_.load(std::memory_order_relaxed); }
+    /// The COMPACT COPY holds this expert, so an exchange can move it (resident_stage_swaps / the async adaptive
+    /// tier's `x` flag).  The extra tier's copies cannot be exchanged - only the complement's places move - so
+    /// those experts answer false here (and true through has_resident, which is the point of the tier).
+    bool exchange_resident(int64_t layer, int64_t expert) const;
     /// Every expert's bytes (n_layers x n_expert blobs).
     uint64_t expert_bytes() const;
     /// #286, unbuffered: assembles the blobs of these pairs ahead of the `blob` calls that will ask for them (the
@@ -1217,6 +1235,21 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
+    // ---- CS-K: the extra resident tier (--resident-extra-gib), grown slowly after READY
+    std::vector<std::pair<int32_t, int32_t>> complement_leftover_;  ///< the budget left these on the files, in the order the extra tier takes them (the profile's rank, then the lend region's tail)
+    uint64_t complement_headroom_ = 0;             ///< the headroom pin_cache_complement was asked to keep (the extra tier's reserve floor)
+    uint8_t* extra_arena_ = nullptr;               ///< the extra tier's pageable arena; its pages arrive one step at a time
+    uint64_t extra_capacity_ = 0;                  ///< the arena's bytes: the budget the clamp allowed
+    std::unique_ptr<std::atomic<uint64_t>[]> extra_at_;  ///< per (layer, expert): offset in extra_arena_, kNoComplement until the worker publishes it (release-store, so the bytes are visible before the offset is)
+    std::thread extra_thread_;
+    std::atomic<bool> extra_quit_{false};
+    std::atomic<bool> extra_done_{false};
+    std::atomic<uint64_t> extra_resident_bytes_{0};
+    std::atomic<int64_t> extra_resident_experts_{0};
+    bool extra_holds(size_t index) const;          ///< the extra tier holds this (layer, expert) already
+    bool extra_sleep(int64_t ms);                  ///< a pause the stop request cuts short; false when asked to stop
+    void extra_worker();
+    void extra_stop();
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;

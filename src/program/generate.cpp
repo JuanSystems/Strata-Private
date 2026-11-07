@@ -558,7 +558,9 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     std::vector<Swap> kept;
     kept.reserve(swaps.size());
     for (const Swap& s : swaps) {
-        if (!src.has_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
+        // CS-K: only the compact copy's places move in an exchange; an extra-tier expert (--resident-extra-gib)
+        // answers has_resident but not exchange_resident, so it takes the plain path (its bytes are read from RAM)
+        if (!src.exchange_resident(s.layer, s.in) || src.has_resident(s.layer, s.out)) { kept.push_back(s); continue; }
         const int64_t q = (int64_t) staged.size();
         if (q >= src.exchange_capacity()) continue;
         const int32_t slot = host_res[(size_t) s.layer * (size_t) n_expert + (size_t) s.out];
@@ -734,6 +736,12 @@ struct Options {
     /// not hold that the expert profile ranks hottest are copied into RAM, the rest are read from the files in place
     /// (the GGUF shards when the pack has no experts.bin).  0 = the whole complement (--resident-experts).
     uint64_t resident_budget = 0;
+    /// CS-K `--resident-extra-gib N`: once the engine is READY for inference, up to N GiB more of the ranked experts
+    /// the RAM budget left on the files are copied into RAM by a background thread - one small step at a time with a
+    /// pause between steps, and only while the RAM available stays above a reserve - so a host that kills a session
+    /// whose RAM climbs fast (Kaggle) lets it climb slowly instead.  Needs the budget mode and an --expert-profile;
+    /// nothing is evicted.  0 = off.
+    uint64_t resident_extra = 0;
     /// R4: slots of VRAM-resident experts.  **0 = off, and off is the default.**
     /// **THE COMMENT THAT USED TO BE HERE WAS FALSE AND ROUND 328 MEASURED IT.**  It said "the cache has no
     /// consumer yet - `moe_hit_grouped_s2` does not exist - so switching it on costs the fill traffic and
@@ -1316,6 +1324,13 @@ void usage() {
                  "  --resident-experts   the low-RAM PC's resident mode (setup): --mmap-experts --resident-cpu-experts\n"
                  "                       with the copy page-locked when possible, 4 GiB headroom, plain mmap if it\n"
                  "                       does not fit.  Same answers as --mmap-experts for the same placement.\n"
+                 "  --resident-extra-gib N  once the engine is READY, move up to N GiB more of the ranked experts the\n"
+                 "                       RAM budget left on the files into RAM, SLOWLY: a step (default 64 MiB), a pause\n"
+                 "                       (default 4 s; ~1 GiB/min), and only while the RAM available stays above the\n"
+                 "                       reserve - for hosts that kill a session whose RAM climbs fast (Kaggle).\n"
+                 "                       Needs --resident-budget-gib and an --expert-profile; nothing is evicted.\n"
+                 "                       STRATA_EXTRA_STEP_MIB / STRATA_EXTRA_PAUSE_MS / STRATA_EXTRA_DELAY_S /\n"
+                 "                       STRATA_EXTRA_RESERVE_GIB / STRATA_EXTRA_GIVEUP_S tune the pace and the guard.\n"
                  "  --ram-keep-gib W     RAM to leave free for your own work, in GiB (default 0; STRATA_RAM_KEEP_GIB is the\n"
                  "                       same).  The expert arena is used only if W GiB stay available after it; otherwise\n"
                  "                       the hottest experts are kept in a RAM copy that leaves max(W, 8 GiB on Windows /\n"
@@ -3775,6 +3790,11 @@ int main(int argc, char** argv) {
                 o.resident_pin = false;
             if (const char* v = std::getenv("STRATA_RESIDENT_HEADROOM_GIB"); v != nullptr && std::atof(v) >= 0.0)
                 o.resident_headroom = (uint64_t) (std::atof(v) * 1073741824.0);
+        }
+        else if (a == "--resident-extra-gib") {
+            const double gib = std::atof(next("--resident-extra-gib"));
+            if (!(gib > 0.0)) { std::fprintf(stderr, "strata generate: --resident-extra-gib needs N > 0\n"); return 2; }
+            o.resident_extra = (uint64_t) (gib * 1073741824.0);
         }
         else if (a == "--stats") o.stats = true;
         else if (a == "--shared-late") o.shared_late = true;
@@ -13557,8 +13577,9 @@ int main(int argc, char** argv) {
                 const int32_t slot = a_res[(size_t) c.layer * g.n_expert + c.out];
                 if (slot < 0) continue;
                 // an exchange (as resident_stage_swaps): `in` from the RAM copy, `out` held by its slot alone takes its
-                // place there; otherwise `out` is in the copy already (the lend region) or `in` is not (a RAM budget)
-                const bool x = !a_arena && src.has_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out);
+                // place there; otherwise `out` is in the copy already (the lend region) or `in` is not (a RAM budget,
+                // or the extra tier's arena: exchange_resident, which reads from RAM but never moves)
+                const bool x = !a_arena && src.exchange_resident(c.layer, c.in) && !src.has_resident(c.layer, c.out);
                 aswaps.push_back({c.layer, c.in, c.out, slot, multi_gpu ? stage_of(c.layer) : 0, (int64_t) aswaps.size(), x,
                                   nullptr});
             }
@@ -14173,6 +14194,14 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+        // CS-K --resident-extra-gib: the engine is READY; the extra tier starts climbing now, one paced step at a
+        // time (its own delay waits out the first request), promoting the ranked experts the budget left on the files
+        if (o.resident_extra > 0 && srcp == &src) {
+            std::string extra_err;
+            if (!src.start_extra_resident(o.resident_extra, extra_err))
+                std::fprintf(stderr, "strata generate: WARNING: --resident-extra-gib is not running (%s)\n",
+                             extra_err.c_str());
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -20336,6 +20365,13 @@ int main(int argc, char** argv) {
 
     // ---- plan v0.3 P5: the prompt's conditioning positions [0, n_prompt - 1) in batched chunks.  The token loop
     // then starts at the last prompt position, whose prediction is the first generated token.
+    // CS-K --resident-extra-gib (no --serve): the engine is loaded; the extra tier climbs while the prompt reads
+    if (o.resident_extra > 0 && srcp == &src) {
+        std::string extra_err;
+        if (!src.start_extra_resident(o.resident_extra, extra_err))
+            std::fprintf(stderr, "strata generate: WARNING: --resident-extra-gib is not running (%s)\n",
+                         extra_err.c_str());
+    }
     int64_t pos_start = 0;
     int64_t spec_pos = strata::spec::kSpecNotStarted;   // plan v0.3 P6: where the speculative loop starts (0 is a real position: a 1-token prompt on a native pack)
     strata::prefill::Prefill prefill;
