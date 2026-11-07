@@ -1122,6 +1122,10 @@ class StrataEngine:
     DRAIN_TIMEOUT_S = 300.0              # how long an interrupted request waits, with no line from its engine, for DONE / BADM
     QUARANTINE_S = 600.0                 # ... and how long a slot or the control lines stay held after that with no line
     multi = 0                            # DeepSeek --parallel (READY ... multi=N): conversations the engine holds at once (batch = N too)
+    # supersede_previous under --batch: Service wires a callable here; generate_batched calls it (with the request's
+    # cancel Event) when a request finds every slot busy and can only wait behind the ones that hold them.  The
+    # default None (a plain engine, or the feature off) waits for a slot, as before.
+    on_slot_stall = None
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -2268,6 +2272,7 @@ class StrataEngine:
         stop_sent = False
         yields, solo_again, refused = 0, 0, 0
         admit_wait, admit_since, admit_said = False, 0.0, False   # #1603: waiting for a slot, since when, said
+        stalled_now = False       # the slot-wait loop's one supersede_previous call (see on_slot_stall below)
         try:
             while True:   # a request in a slot that is left alone goes back to the solo path
                 if not holding:
@@ -2369,9 +2374,22 @@ class StrataEngine:
                                 if not admit_wait:          # #1603: counted while it waits for a slot (it holds no
                                     admit_wait, admit_since = True, time.monotonic()   # control lines then)
                                     self.admitting += 1
+                                    stalled_now = True
                             if holding:
                                 self.ctl.release()
                                 holding = False
+                            if stalled_now:
+                                # supersede_previous under --batch (Service wires on_slot_stall): every slot is busy,
+                                # so this request can only wait behind the ones that hold them (and any queued before
+                                # it).  They are its predecessors - their client stopped asking or sent this one after
+                                # an error - so they are cancelled now and the slots come back to it.  Called here,
+                                # with no lock held and the control lines given back: the cancelled requests' threads
+                                # stop their slots (BSTOP) or leave the queue on their own.  With the feature off the
+                                # callable is None and this waits for a slot, as before.
+                                stalled_now = False
+                                stall = self.on_slot_stall
+                                if stall is not None:
+                                    stall(cancel)
                             with self.slot_cv:
                                 if self.pick_slot(prompt) is None:
                                     if (ENGINE_STALL_S or 0) > 0 and time.monotonic() - admit_since >= ENGINE_STALL_S:
@@ -4872,9 +4890,17 @@ class Service:
         # see: a retry's proxy or the client itself can leave the old socket open) or sent it again after an error
         # (the old connection is dead the same way).  The new request cancels every other in-flight generation, so
         # the engine is STOPped at once instead of finishing a request nobody reads while the new one waits behind
-        # it.  Never with --batch, whose slots run requests concurrently.
+        # it.  Under --batch the engine really runs several requests at once, so an arrival with a free slot
+        # supersedes nobody; one slot (or one held conversation) is one request at a time behind a fancier protocol
+        # and supersedes on arrival all the same, and with every slot busy only the request that must wait behind
+        # the holders supersedes them (StrataEngine.on_slot_stall, wired below).
         self.gen_requests: set[threading.Event] = set()
         self.supersede_previous = os.getenv("STRATA_SUPERSEDE_PREVIOUS", "1") != "0"
+        # supersede_previous under --batch: the stall hook (see StrataEngine.on_slot_stall).  hasattr on the TYPE:
+        # a mock engine (the tests) has none and is left alone, and neither has replicas.py's pool (its router can
+        # make a request wait for a busy replica while another is free - a wait that is NOT being replaced).
+        if hasattr(type(self.engine), "on_slot_stall"):
+            self.engine.on_slot_stall = self._supersede_on_slot_stall
         self.admission_changed = threading.Condition(self.status_lock)
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.offline = False                             # no image URL fetch or MCP subprocess in strict local mode
@@ -4985,6 +5011,20 @@ class Service:
                 cancel.set()
                 if active:
                     self.client_disconnect_cancels += 1
+
+    def _supersede_on_slot_stall(self, cancel: threading.Event) -> None:
+        """supersede_previous under --batch: this request has found every slot busy and can only wait behind the
+        requests that hold them (and any queued before it).  They are its predecessors - the client stopped the
+        old one (a stop the server may never see, the socket left open) or sent this one after their error - so
+        they are cancelled: the holders BSTOP and free their slots, the queued ones end without a turn, and the
+        engine is this request's at once instead of finishing answers nobody reads.  With the queue
+        (supersede_previous false) nothing changes: it waits for a slot, as before."""
+        if not self.supersede_previous:
+            return
+        with self.status_lock:
+            others = [c for c in self.gen_requests if c is not cancel and not c.is_set()]
+        for c in others:
+            c.set()
 
     @contextlib.contextmanager
     def _inference_fifo(self, deadline: float | None, cancel: threading.Event | None = None):
@@ -6399,10 +6439,13 @@ class Service:
             self._terminal_event_locked(request_id, "queued")
         queued_counted = True
         # supersede_previous (see __init__): the newest request wins the engine.  With the engine one request at
-        # a time, cancel every OTHER in-flight generation now: the one in the engine gets its STOP (honoured at
+        # a time - no batch slots, or one slot (or one held conversation), which is the same thing behind a fancier
+        # protocol - cancel every OTHER in-flight generation now: the one in the engine gets its STOP (honoured at
         # its next verify window, prompt layer or chunk), and a queued one ends as "cancel" without taking the
         # turn.  The old request's client has gone or stopped asking - this one is what the client wants now.
-        if self.supersede_previous and not par:
+        # With 2 or more slots nobody is cancelled here (the engine really runs them together): only a request
+        # that cannot get a slot supersedes, from StrataEngine.on_slot_stall (wired in __init__).
+        if self.supersede_previous and (not par or getattr(self.engine, "batch", 0) <= 1):
             with self.status_lock:
                 others = [c for c in self.gen_requests if c is not cancel and not c.is_set()]
             for c in others:
@@ -10455,13 +10498,25 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.repeat_stop_tokens = rs
     # supersede_previous: a request that arrives while another generation runs cancels it (the engine is one
     # request at a time, and the old one's client has stopped asking - a stop the proxy may never deliver).
+    # Under --batch it depends on the slots: one slot is one request at a time and cancels on arrival the same
+    # way, and with every slot busy only the request that must wait behind the holders supersedes them (an
+    # arrival with a free slot supersedes nobody: the engine really runs them together).
     # false restores the old queue; the env disables it regardless of the config.
     sup = cfg.get("supersede_previous", True)
     if not isinstance(sup, bool):
         raise SystemExit(f"[strata] config \"supersede_previous\" must be true or false, not {sup!r}")
     svc.supersede_previous = sup and os.getenv("STRATA_SUPERSEDE_PREVIOUS", "1") != "0"
-    if svc.supersede_previous and not getattr(engine, "batch", 0):
+    slots = getattr(engine, "batch", 0)
+    if svc.supersede_previous and not slots:
         print("[strata] supersede_previous: a new request cancels the generation request it replaces "
+              "(\"supersede_previous\": false, or STRATA_SUPERSEDE_PREVIOUS=0, restores the queue)", flush=True)
+    elif svc.supersede_previous and slots <= 1:
+        print("[strata] supersede_previous: a new request cancels the generation request it replaces (one slot: "
+              "the engine runs one request at a time) (\"supersede_previous\": false, or "
+              "STRATA_SUPERSEDE_PREVIOUS=0, restores the queue)", flush=True)
+    elif svc.supersede_previous:
+        print(f"[strata] supersede_previous: a request that cannot get one of the engine's {slots} slots cancels "
+              "the generation requests it replaces (an arrival with a free slot supersedes nobody) "
               "(\"supersede_previous\": false, or STRATA_SUPERSEDE_PREVIOUS=0, restores the queue)", flush=True)
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request

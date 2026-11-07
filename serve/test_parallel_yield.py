@@ -51,6 +51,10 @@ class ParallelServiceYield(tp.FakeEngineCase):
         and wants one of them (the yield path).  The reviewer's repro: long, long, short at 0.25 s steps.  Every
         request must be answered; none may wait on the control lock that the yielding read holds."""
         self.start(2)
+        # supersede_previous off: the queue's own behaviour (the short request waits for a slot and all three are
+        # answered).  With it on the short one would cancel the two it replaces - that is
+        # serve/test_supersede_previous.py's ground, not this deadlock check.
+        self.svc.supersede_previous = False
         texts = ["long " * 600, "lung " * 600, "short"]
         res, errors = {}, []
 

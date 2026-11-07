@@ -939,6 +939,10 @@ class ParallelService(FakeEngineCase):
 
     def test_concurrent_requests_share_the_slots(self):
         self.start(2)
+        # supersede_previous off: this is the queue's own behaviour (a third request waits for a slot while the
+        # first two decode, and every request completes).  With it on (the fork's default) the request that cannot
+        # get a slot cancels the ones it replaces - serve/test_supersede_previous.py holds those tests.
+        self.svc.supersede_previous = False
         # the first one decodes long enough for the others to arrive while it runs (also on a busy PC)
         texts = ["first question LONGREPLY", "second question, longer", "a third one waits for a slot"]
         reply = {t: "ok, " + "la " * 15 + "done." if "LONGREPLY" in t else "ok, done." for t in texts}

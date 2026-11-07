@@ -33,6 +33,10 @@ class RestartWaiters(unittest.TestCase):
         import serve.server as server
         real = REAL_POPEN
         self._start(slots, fit=fit)
+        # supersede_previous off: these are the queue's own mechanics (waiters wait for the control lines and for
+        # slots across a restart, and every request is served or 503s).  A waiter cancelling the requests it
+        # replaces is serve/test_supersede_previous.py's ground.
+        self.svc.supersede_previous = False
         script = Path(self.tmp.name) / "fake_strata.py"
         patch = mock.patch.object(server.subprocess, "Popen",
                                   lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw))

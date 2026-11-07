@@ -71,6 +71,10 @@ class LogprobsWithBatchSlots(unittest.TestCase):
 
     def test_two_at_once_each_get_their_own(self):
         self.start_lp()
+        # supersede_previous off: four requests share the two slots here (the queue's own behaviour - the ones
+        # that cannot get a slot wait).  With it on they would cancel the requests they replace; that ground is
+        # serve/test_supersede_previous.py's.
+        self.svc.supersede_previous = False
         short, long_ = "A or B?", "A or B? " + "x" * 300
         alone = {t: self.entries(self.chat(t))[0]["logprob"] for t in (short, long_)}
         self.assertNotEqual(alone[short], alone[long_])
