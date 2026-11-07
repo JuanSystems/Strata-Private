@@ -16495,18 +16495,27 @@ int main(int argc, char** argv) {
             // start of this prompt wins as before)
             bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
-            if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
-                incoming.emplace(conversations.take(parked.index));
-            // ── Restore-path fallback (fork): when the RAM cache has no usable prefix, consult the disk store.
-            if (!incoming && !borrow && disk_store_ptr != nullptr) {
+            // ── Restore-path fallback (fork): consult the disk store BEFORE the RAM cache's own
+            // match is taken. The floor inside restore_from_disk_or_ram is max(resume,
+            // slot_tokens, parked.tokens): the disk wins only when it beats every RAM source.
+            // The order matters for the stale-fork shape the stop/resend loop exposes: the RAM
+            // cache can hold a conversation's own abandoned branch (parked.tokens > resume, so
+            // the old code took it here and never looked at the disk) while the disk holds the
+            // same conversation's newer, deeper state — that state must win, and when it does
+            // not the store's diagnostic says what beat it (the old silence made a low resume
+            // after a stop+comment inexplicable from the log alone).
+            if (!borrow && disk_store_ptr != nullptr) {
                 if (auto from_disk = strata::core::restore_from_disk_or_ram(
                         parked, disk_store_ptr, ids, req_imgs, want_cvec, resume, slot_tokens, spill_identity)) {
                     incoming.emplace(std::move(*from_disk));
                     incoming_from_disk = true;
                     std::fprintf(stderr, "strata serve: conversation spill: restored %zu tokens from disk "
-                                         "(RAM cache had no match)\n", incoming->live.ids.size());
+                                         "(deeper than the RAM cache's %lld-token match and the live resume's %lld)\n",
+                                 incoming->live.ids.size(), (long long) parked.tokens, (long long) resume);
                 }
             }
+            if (!incoming && parked.tokens > std::max(resume, slot_tokens) && !borrow)
+                incoming.emplace(conversations.take(parked.index));
             // DIAGNOSTIC (fork): log what happens to the restored image after the restore.
             if (incoming) {
                 std::fprintf(stderr, "[strata diag] restored image: stage_images=%zu stages=%zu live_ids=%zu "
@@ -16604,6 +16613,18 @@ int main(int argc, char** argv) {
                     borrow = false;
                     err.clear();
                 }
+            }
+            // The disk-restored image did not survive the engine's own validation (a stage count
+            // from an older spill layout, a snapshot/geometry mismatch, #2409's first-use VRAM
+            // gate): fall back to the RAM cache's match, which beat the live resume when the disk
+            // was consulted and is still parked — the disk win above skipped its take, and
+            // without this fallback a discarded disk image dropped the request all the way to
+            // the live resume (the old code had taken the RAM entry before any validation).
+            if (!incoming && incoming_from_disk && !borrow &&
+                parked.tokens > std::max(resume, slot_tokens)) {
+                if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX)
+                    incoming.emplace(conversations.take(at));
+                incoming_from_disk = false;   // the RAM cache's image now — the mount below resumes at parked.tokens
             }
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.

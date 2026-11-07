@@ -270,7 +270,9 @@ int main() {
         // Easier path: spill it directly with put().
         check(store->put(std::move(disk_entry), 999, id), "spill the 800-token conversation directly");
 
-        // Case A: RAM has a match → restore_from_disk_or_ram returns nullopt (engine takes from RAM).
+        // Case A: the RAM cache has a match AND the disk has none for this prompt → nullopt (the
+        // engine takes from RAM). Since the stale-fork fix the RAM match is part of the floor the
+        // disk must beat, so the disk is consulted even here — it simply has nothing deeper.
         std::vector<int32_t> prompt_ram;
         for (int i = 0; i < 500; ++i) prompt_ram.push_back(int32_t(1000 + i));
         prompt_ram.push_back(9999);
@@ -279,6 +281,23 @@ int main() {
         auto from_disk_a = restore_from_disk_or_ram(parked_ram, store.get(), prompt_ram, imgs, false,
                                                      /*resume*/ 0, /*slot_tokens*/ 0, id);
         check(!from_disk_a.has_value(), "RAM wins; restore_from_disk_or_ram defers to the caller's RAM take");
+
+        // Case A2 (the stale-fork shadow): the disk holds the SAME lineage's newer state —
+        // deeper than the RAM cache's parked branch. The parked match beats the live resume
+        // (resume=0, slot=0), the exact shape the old early-return "RAM wins" guarded, but the
+        // disk's 900-token conversation is deeper than the parked 500: it must be restored.
+        SavedConversation lineage = sample(900);
+        check(store->put(std::move(lineage), 1000, id), "spill the same lineage's 900-token state");
+        std::vector<int32_t> prompt_deep;
+        for (int i = 0; i < 900; ++i) prompt_deep.push_back(int32_t(1000 + i));
+        prompt_deep.push_back(9999);
+        const auto parked_deep = cache.best(prompt_deep, imgs, false);
+        check(parked_deep.tokens == 500, "the RAM cache still offers only the 500-token branch");
+        auto from_disk_a2 = restore_from_disk_or_ram(parked_deep, store.get(), prompt_deep, imgs, false,
+                                                      /*resume*/ 0, /*slot_tokens*/ 0, id);
+        check(from_disk_a2.has_value(), "the disk's deeper state beats the RAM-parked stale branch");
+        check(from_disk_a2.has_value() && from_disk_a2->live.ids.size() == 900,
+              "the restored image is the 900-token conversation, not the 500-token branch");
 
         // Case B: RAM has no match for the disk-only conversation → disk fallback restores it.
         std::vector<int32_t> prompt_disk;
@@ -290,7 +309,8 @@ int main() {
                                                      /*resume*/ 0, /*slot_tokens*/ 0, id);
         check(from_disk_b.has_value(), "disk fallback restored the conversation");
         check(from_disk_b->live.ids.size() == 800, "restored image has 800 tokens");
-        check(store->size() == 1, "disk entry KEPT after restore (take-keep: the delta base)");
+        check(store->size() == 2, "disk entries KEPT after restore (take-keep: the delta base; "
+                                  "999 plus the 1000-lineage Case A2 spilled)");
     }
 
     // ── 3. restore_from_disk_or_ram: resume/slot_tokens floor honors the live session ────

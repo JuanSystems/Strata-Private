@@ -475,8 +475,10 @@ std::unique_ptr<ConversationDiskStore> make_disk_store(const SpillConfig& cfg,
 void attach_spill(ConversationCache& cache, ConversationDiskStore* store,
                   const SessionFileIdentity* identity);
 
-/// Restore-path fallback (puntas 3+4): when the RAM cache has no usable prefix (parked.tokens
-/// <= max(resume, slot_tokens)), consult the disk store. If the disk has a better match, take
+/// Restore-path fallback (puntas 3+4): consult the disk store for a match deeper than every
+/// RAM source — the live session's resume, a batch slot's tokens, and the RAM cache's own parked
+/// match (parked.tokens; the stale-fork fix: an abandoned branch sitting in the cache must not
+/// shadow the same conversation's newer state on disk). If the disk has a deeper match, take
 /// it. Returns the restored image (or nullopt on miss / I/O error / RAM refusal). The caller
 /// (engine) then runs the existing conversation_snapshot_validate / restore path on the image,
 /// unchanged. The image's K/V is fully materialized in host RAM by this call.
@@ -588,26 +590,37 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
     const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
     int64_t resume, int64_t slot_tokens, const SessionFileIdentity& identity,
     const SessionReadLimits& limits) {
-    const int64_t ram_floor = std::max<int64_t>(resume, slot_tokens);
-    if (parked.tokens > ram_floor) return std::nullopt;   // RAM wins; engine takes from cache
+    const int64_t ram_floor = std::max<int64_t>({resume, slot_tokens, parked.tokens});
     if (disk == nullptr || !disk->enabled()) return std::nullopt;
     // Convert prompt to int32_t for the disk store's best() (which iterates the manifest in RAM).
     std::vector<int32_t> prompt32;
     prompt32.reserve(prompt.size());
     for (const auto& t : prompt) prompt32.push_back(static_cast<int32_t>(t));
     auto disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);
-    // ── DIAGNOSTIC: when the disk cannot beat the RAM floor, say WHICH of the two cases it is:
+    // ── DIAGNOSTIC: when the disk cannot beat the RAM floor, say WHICH of the three cases it is:
     // (a) "no usable disk match" — no entry matches the prompt at all (best() == 0: the manifest
     //     ids do not line up with the prompt anywhere), or
     // (b) "disk not better than live resume" — the disk HAS a match but the live session is at
-    //     least as deep (disk_best <= ram_floor): the NORMAL case for an in-process request that
-    //     already holds the conversation; nothing is wrong and no alarm is needed.
+    //     least as deep (disk_best <= max(resume, slot_tokens)): the NORMAL case for an in-process
+    //     request that already holds the conversation; nothing is wrong and no alarm is needed, or
+    // (c) "disk not better than the RAM-parked match" — the cache's parked entry is the winner.
+    //     The stale-fork case: the cache holds a conversation's own abandoned branch while the
+    //     disk holds its newer state, and the prompt's divergence sits below the branch's deepest
+    //     checkpoint. The ranked dump below then shows exactly WHERE the prompt diverges from the
+    //     disk's entries — the line the 2026-11-07 stop+comment log lacked (the old code returned
+    //     before this diagnostic whenever the RAM cache had ANY match, so a low resume after a
+    //     stop was inexplicable from the log alone).
     if (disk_match.tokens <= ram_floor) {
-        const char* why = disk_match.tokens > 0 ? "disk not better than live resume"
-                                                : "no usable disk match";
+        const bool parked_wins = parked.tokens > std::max<int64_t>(resume, slot_tokens);
+        const char* why = disk_match.tokens > 0
+                              ? (parked_wins ? "disk not better than the RAM-parked match"
+                                             : "disk not better than live resume")
+                              : "no usable disk match";
         std::fprintf(stderr, "[strata diag] restore_from_disk_or_ram: %s "
-                              "(disk_size=%zu, disk_best=%lld, ram_floor=%lld, prompt=%zu, cvec=%d, prompt_imgs=%zu)\n",
+                              "(disk_size=%zu, disk_best=%lld, ram_floor=%lld, parked=%lld, resume=%lld, "
+                              "slot=%lld, prompt=%zu, cvec=%d, prompt_imgs=%zu)\n",
                      why, disk->size(), (long long) disk_match.tokens, (long long) ram_floor,
+                     (long long) parked.tokens, (long long) resume, (long long) slot_tokens,
                      prompt.size(), (int) cvec, images.size());
         // Show the prompt's first/last few ids, then the manifest entries RANKED by their common
         // prefix with the prompt (the old first-4 hid the conversation's own entry whenever the

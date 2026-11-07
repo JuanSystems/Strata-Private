@@ -226,6 +226,57 @@ int main() {
         check(store->size() == 5, "disk store keeps all 5 after take (take-keep: the delta base)");
     }
 
+    // ── 5. The stale-fork shadow: a RAM-parked match that beats the live resume must not stop
+    // the disk from being consulted. The disk holds the SAME conversation's newer state (deeper
+    // than the parked branch); the deeper disk match wins and restore_from_disk_or_ram returns
+    // it — the old code returned nullopt as soon as the RAM cache had ANY match, so the engine
+    // took the stale branch and the disk tier was silently shadowed (the 2026-11-07 stop+comment
+    // log: a 22 329-token fork parked in RAM beat a 0-token resume, and the 41 037-token
+    // conversation on disk was never even looked at — nor was a single diagnostic printed).
+    {
+        SpillConfig cfg;
+        cfg.path = (dir / "ramfull5").string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        check(store != nullptr && store->enabled(), "disk store enabled");
+
+        // The ACTIVE conversation on disk: 800 tokens, checkpoints at 10 and 500.
+        SavedConversation active = sample(800);
+        const std::vector<int32_t> active_ids = active.live.ids;
+        const std::vector<ConversationImageKey> active_imgs = active.live.imgs;
+        check(store->put(std::move(active), 77, id), "spill the active conversation");
+
+        // The request's prompt: the active conversation plus one more token, so the disk's best
+        // match is the whole 800-token entry (a strict prefix of the prompt).
+        std::vector<int32_t> prompt = active_ids;
+        prompt.push_back(9999);
+
+        // The stale fork the RAM cache holds: it matches the prompt only up to 300 tokens (the
+        // client re-rendered the history after a stop, and the divergence sits below the fork's
+        // deepest checkpoint). Its Match beats the live resume (0) — the exact shape the old
+        // early-return "RAM wins; engine takes from cache" guarded.
+        ConversationCache::Match stale;
+        stale.tokens = 300;
+        stale.serial = 55;
+        stale.index = 0;
+        stale.live = true;
+
+        auto restored = restore_from_disk_or_ram(stale, store.get(), prompt, active_imgs, false,
+                                                 /*resume*/ 0, /*slot_tokens*/ 0, id);
+        check(restored.has_value(), "the disk's deeper conversation beat the RAM-parked stale fork");
+        check(restored.has_value() && restored->live.ids == active_ids,
+              "the restored image is the ACTIVE conversation, not the fork");
+        check(store->size() == 1, "the entry stayed for the next park's delta (take-keep)");
+
+        // A RAM match EQUAL to the disk's best still wins (the image is already in host RAM; a
+        // disk read adds nothing): restore_from_disk_or_ram returns nullopt and the engine takes
+        // from the cache, exactly as before the fix.
+        ConversationCache::Match equal;
+        equal.tokens = 800;
+        auto kept = restore_from_disk_or_ram(equal, store.get(), prompt, active_imgs, false, 0, 0, id);
+        check(!kept.has_value(), "an equal RAM match still wins (no disk read is worth it)");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_spill_ram_full_test: %d checks passed\n", checks);
     return 0;
