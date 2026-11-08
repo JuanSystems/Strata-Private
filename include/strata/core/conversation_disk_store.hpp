@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -167,6 +168,25 @@ public:
     // Drains the writer first, like every reader.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs, bool cvec) const;
 
+    // --conversation-spill-gain: the deepest resume point the disk can deliver for the LIVE
+    // conversation `ids` — the longest promised length (the entry's ids, its deepest checkpoint,
+    // every ckpt_lens cut) that is a strict prefix of `ids` with the images below it aligned,
+    // over every entry with the same cvec (best_match_tokens with the live ids as the "prompt").
+    // 0 when the disk holds nothing of it. Drains the writer first, like every reader.
+    int64_t disk_resume_for(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
+                            bool cvec) const;
+
+    // ---- Bytes written (the measuring instrument for disk writes between turns) ----
+    // Every byte this store wrote since it was built, by file kind. A conversation's .bin and its
+    // stage files count as bin/stage; a shared-prefix snapshot's (.bin + stages) as prefix; the
+    // .dlt record, the .rst sidecar (each whole rewrite) and the .idx metadata on their own.
+    // Atomic: the writer thread adds, any thread reads.
+    struct WriteCounters {
+        uint64_t bin = 0, stage = 0, dlt = 0, rst = 0, idx = 0, prefix = 0;
+        uint64_t total() const { return bin + stage + dlt + rst + idx + prefix; }
+    };
+    WriteCounters bytes_written() const;
+
     // ---- Shared-prefix snapshots ----
     // The token lengths of every prefix-kind entry in the manifest (drains the writer first,
     // like every reader). The engine asks once after reload_from_disk() and keeps the answer
@@ -313,6 +333,10 @@ private:
     bool writer_busy_ = false;                    // writer moved an image out and is writing it
     std::deque<PendingWrite> pending_;
     size_t async_dropped_ = 0;                    // queue-overflowed images (logged)
+    // bytes_written()'s counters (write_idx is const, hence mutable)
+    mutable std::atomic<uint64_t> w_bin_{0}, w_stage_{0}, w_dlt_{0}, w_rst_{0}, w_idx_{0}, w_prefix_{0};
+    // One line after each background write: what it wrote, by kind, and the run's total.
+    void log_written(const WriteCounters& before) const;
     // ── Delta journal (read once in the constructor): DEFAULT ON since the v2 multi-image
     // record — a park that finds a delta base appends a conv-<serial>.dlt record instead of
     // rewriting the .bin and its stage files. STRATA_SPILL_JOURNAL=0 opts out (the A/B escape

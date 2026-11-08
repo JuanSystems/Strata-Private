@@ -178,4 +178,28 @@ inline size_t spread_victim(const int64_t* lens, const uint64_t* stamps, size_t 
     return eviction_victim(stamps, n, cap, tail, pinned);
 }
 
+/// --conversation-spill-gain N: the live point a disk backup would add, measured on the chain the
+/// session holds.  The deepest `turn` checkpoint (the boundary a re-rendering client's next prompt
+/// still contains); without one, the deepest checkpoint that is not `end_of_prompt` (that one carries
+/// the effort tail the next prompt never re-sends); without any, the live length.  `lens[i]` is
+/// checkpoint i's token count, `is_turn[i]` / `is_eop[i]` its kind.
+inline int64_t spill_gain_live_point(const int64_t* lens, const bool* is_turn, const bool* is_eop, size_t n,
+                                     int64_t live_len) {
+    int64_t turn = 0, other = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (is_turn[i] && lens[i] > turn) turn = lens[i];
+        if (!is_eop[i] && lens[i] > other) other = lens[i];
+    }
+    return turn > 0 ? turn : other > 0 ? other : live_len;
+}
+
+/// --conversation-spill-gain N: skip the disk backup of a conversation the session keeps while the disk
+/// already delivers a resume point (`t_disk` > 0) less than N tokens behind the live point `t_live`
+/// (spill_gain_live_point).  What a crash then costs is at most that gap, read again.  N <= 0 (the
+/// default) never skips: every backup writes, as before.  A disk point at or past the live one skips too
+/// (nothing would be added).
+inline bool spill_gain_skips(int64_t t_live, int64_t t_disk, int64_t gain) {
+    return gain > 0 && t_disk > 0 && t_live - t_disk < gain;
+}
+
 }  // namespace strata::program::conv_cache

@@ -154,6 +154,43 @@ std::vector<int64_t> ConversationDiskStore::prefix_pin_lengths() const {
     return out;
 }
 
+int64_t ConversationDiskStore::disk_resume_for(const std::vector<int32_t>& ids,
+                                               const std::vector<ConversationImageKey>& imgs,
+                                               bool cvec) const {
+    if (!enabled() || ids.empty()) return 0;
+    flush_pending();
+    int64_t best = 0;
+    for (const auto& e : entries_) {
+        if (e.cvec != cvec) continue;
+        best = std::max(best, detail::best_match_tokens(e.ids, e.imgs, e.ckpt_lens, e.ckpt_ids, e.ckpt_imgs,
+                                                        ids, imgs));
+    }
+    return best;
+}
+
+ConversationDiskStore::WriteCounters ConversationDiskStore::bytes_written() const {
+    WriteCounters c;
+    c.bin = w_bin_.load();
+    c.stage = w_stage_.load();
+    c.dlt = w_dlt_.load();
+    c.rst = w_rst_.load();
+    c.idx = w_idx_.load();
+    c.prefix = w_prefix_.load();
+    return c;
+}
+
+void ConversationDiskStore::log_written(const WriteCounters& before) const {
+    const WriteCounters now = bytes_written();
+    if (now.total() == before.total()) return;   // a no-op put (a prefix already held) wrote nothing
+    constexpr double mib = 1024.0 * 1024.0;
+    std::fprintf(stderr, "strata serve: conversation spill: wrote %.1f MiB to disk (bin %.1f, stage %.1f, "
+                         "dlt %.1f, rst %.1f, idx %.2f, pfx %.1f); %.2f GiB since start\n",
+                 (now.total() - before.total()) / mib, (now.bin - before.bin) / mib,
+                 (now.stage - before.stage) / mib, (now.dlt - before.dlt) / mib, (now.rst - before.rst) / mib,
+                 (now.idx - before.idx) / mib, (now.prefix - before.prefix) / mib,
+                 now.total() / (mib * 1024.0));
+}
+
 void ConversationDiskStore::flush_pending() const {
     std::unique_lock<std::mutex> lk(writer_mu_);
     writer_cv_.wait(lk, [&] { return pending_.empty() && !writer_busy_; });
@@ -210,6 +247,7 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
         // protected cleanup); the thread-start failure that landed here must not change the
         // on-disk shape between the two modes.
         bool ok = false;
+        const WriteCounters before = bytes_written();
         const size_t superseded = [&] {
             if (!p.prefix && journal_) {
                 if (auto base = find_delta_base(p.image)) {
@@ -233,6 +271,7 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
             ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
             return n;
         }();
+        log_written(before);
         if (ok && superseded > 0)
             std::fprintf(stderr, "strata serve: conversation spill: write landed (serial %llu) "
                                  "and dropped %zu superseded spill file%s\n",
@@ -264,6 +303,7 @@ void ConversationDiskStore::writer_loop() {
         // Any anomaly falls through to today's full write, whose cleanup replaces the entry.
         bool ok = false;
         size_t superseded = 0;
+        const WriteCounters before = bytes_written();
         if (p.prefix) {
             // a prefix snapshot is a shared asset, never a delta candidate
         } else if (!journal_) {
@@ -301,6 +341,7 @@ void ConversationDiskStore::writer_loop() {
         // whole history, exactly the write amplification this store exists to eliminate.
         // The journal simply grows for the conversation's whole life; the disk budget's
         // LRU (evict_oldest, whole entries only) bounds the total footprint instead.
+        log_written(before);
         lk.lock();
         writer_busy_ = false;
         if (!ok)
@@ -692,6 +733,7 @@ bool ConversationDiskStore::write_idx(const DiskEntry& e, const std::string& bin
             fs::remove(tmp_path, ec2);
             return false;
         }
+        w_idx_ += payload.size();
         return true;
     } catch (const std::exception&) {
         std::error_code ec2;
@@ -1117,6 +1159,12 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
     // The entry's disk footprint is the main .bin plus its stage files — the budget and the LRU
     // must see the true cost of the spill (a layer split doubles it).
     e.file_bytes = written + stage_bytes;
+    if (prefix) {
+        w_prefix_ += written + stage_bytes;
+    } else {
+        w_bin_ += written;
+        w_stage_ += stage_bytes;
+    }
     e.used = next_used_++;
     bytes_ += e.file_bytes;   // main + stage files: erase()/evict_oldest() subtract the same total
     entries_.push_back(std::move(e));
@@ -2009,6 +2057,8 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
     // Accounting: a v3 append's record adds and its sidecar REPLACES (subtract the old .rst,
     // add the new one's); a v2 append touches the record alone — an existing .rst (from v3
     // records already in the journal) stays counted, exactly as it stays on disk.
+    w_dlt_ += rec;
+    w_rst_ += rst_bytes;
     base->journal_bytes += rec;
     ++base->journal_records;
     if (v3) {

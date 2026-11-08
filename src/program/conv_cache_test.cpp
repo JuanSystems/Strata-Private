@@ -266,6 +266,36 @@ int main() {
         check(reuse_after_rerender(true, true, 17128, 1000, 16384, end, 6, 1000) == end - 1000,
               "a rewrite inside the last turn still mounts the turn boundary, as before");
     }
+    // --conversation-spill-gain: the live point and the skip rule
+    {
+        using strata::program::conv_cache::spill_gain_live_point;
+        using strata::program::conv_cache::spill_gain_skips;
+        const int64_t lens[] = {17128, 35153, 35975, 36005};
+        const bool turn[] = {false, true, true, false};
+        const bool eop[] = {false, false, false, true};
+        check(spill_gain_live_point(lens, turn, eop, 4, 36096) == 35975, "live point: the deepest turn checkpoint");
+        const bool no_turn[] = {false, false, false, false};
+        check(spill_gain_live_point(lens, no_turn, eop, 4, 36096) == 35975,
+              "live point without turns: the deepest that is not end_of_prompt");
+        const bool all_eop[] = {true, true, true, true};
+        check(spill_gain_live_point(lens, no_turn, all_eop, 4, 36096) == 36096, "live point without any: the live length");
+        check(spill_gain_live_point(nullptr, nullptr, nullptr, 0, 500) == 500, "live point of an empty chain");
+        check(!spill_gain_skips(36000, 35000, 0), "gain 0 (the default) never skips");
+        check(!spill_gain_skips(36000, 0, 2048), "nothing on disk: always write");
+        check(spill_gain_skips(36000, 35000, 2048), "1000 behind with gain 2048: skip");
+        check(!spill_gain_skips(37048, 35000, 2048), "2048 behind with gain 2048: write");
+        check(spill_gain_skips(35000, 36000, 2048), "the disk is ahead of the live point: skip");
+        // The 2026-11-08 log (records 6 to 22 of conv-821): the live turn point of every backup, the
+        // disk holding 30592 after record 5. Every backup wrote (17); with gain 2048 two do.
+        const int64_t turns[] = {31419, 31419, 32043, 32440, 32440, 33648, 34691, 35153, 35975,
+                                 35975, 35975, 35975, 35975, 35975, 36664, 36664, 37400};
+        int64_t disk = 30592;
+        int writes = 0;
+        for (int64_t t : turns)
+            if (!spill_gain_skips(t, disk, 2048)) { disk = t; ++writes; }
+        std::printf("  the 2026-11-08 log: %d of 17 backups write with --conversation-spill-gain 2048\n", writes);
+        check(writes == 2, "the log's 17 backups shrink to 2 with gain 2048");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

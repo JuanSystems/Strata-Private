@@ -2766,6 +2766,49 @@ int main() {
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
+    // ── 57. bytes_written(): the counter matches the files a base park and two v3 appends left,
+    // counts every .rst rewrite (not just the survivor), and disk_resume_for() reports the
+    // deepest resume point the disk holds for the live conversation ──────────────────────────
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "write_counter";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        check(store.bytes_written().total() == 0, "57: a fresh store wrote nothing");
+        SavedConversation a0 = conv_image(1000, 1);
+        SavedConversation a1 = conv_grow(a0, 24, 2);
+        SavedConversation a2 = conv_grow(a1, 24, 3);
+        const std::vector<int32_t> a2_ids = a2.live.ids;
+        const std::vector<ConversationImageKey> a2_imgs = a2.live.imgs;
+        check(store.put(std::move(a0), 900, id), "57: the base park");
+        const auto c0 = store.bytes_written();
+        check(c0.bin == (uint64_t) fs::file_size(rdir / "conv-900.bin") && c0.idx > 0 &&
+                  c0.dlt == 0 && c0.rst == 0 && c0.stage == 0 && c0.prefix == 0,
+              "57: the base counts its .bin and .idx, nothing else");
+        check(store.put_async(std::move(a1), 901, id), "57: append 1 queued");
+        store.flush_pending();
+        const auto c1 = store.bytes_written();
+        const uint64_t rst1 = (uint64_t) fs::file_size(rdir / "conv-900.rst");
+        check(c1.bin == c0.bin && c1.dlt == (uint64_t) fs::file_size(rdir / "conv-900.dlt") && c1.rst == rst1,
+              "57: append 1 counts its record and its sidecar, not another .bin");
+        check(store.put_async(std::move(a2), 902, id), "57: append 2 queued");
+        store.flush_pending();
+        const auto c2 = store.bytes_written();
+        check(c2.dlt == (uint64_t) fs::file_size(rdir / "conv-900.dlt"), "57: the journal counter is the journal");
+        check(c2.rst == rst1 + (uint64_t) fs::file_size(rdir / "conv-900.rst"),
+              "57: every whole .rst rewrite counts, not only the file that survives");
+        check(c2.total() == c2.bin + c2.stage + c2.dlt + c2.rst + c2.idx + c2.prefix, "57: total() is the sum");
+        // the live conversation goes on past a2: the disk delivers at most a2's own end
+        std::vector<int32_t> longer = a2_ids;
+        for (int k = 0; k < 40; ++k) longer.push_back(7000 + k);
+        const int64_t t_disk = store.disk_resume_for(longer, a2_imgs, false);
+        check(t_disk == (int64_t) a2_ids.size(), "57: disk_resume_for: the entry's live end is the deepest point");
+        std::vector<int32_t> other = a2_ids;
+        other[10] = other[10] + 1;   // diverges at 10: nothing of that conversation is a resume point
+        check(store.disk_resume_for(other, a2_imgs, false) == 0, "57: disk_resume_for: an early divergence holds nothing");
+        check(store.disk_resume_for(longer, a2_imgs, true) == 0, "57: disk_resume_for: another cvec holds nothing");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_store_test: %d checks passed\n", checks);
     return 0;

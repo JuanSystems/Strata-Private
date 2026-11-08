@@ -4,6 +4,7 @@
 // spill_clear, spill_purge_on_startup, make_disk_store) that generate.cpp invokes — so a test run
 // validates the engine's wiring without needing a model or GPU.
 #include "strata/core/conversation_disk_store.hpp"
+#include "strata/program/conv_cache.hpp"
 
 #include <algorithm>
 #include <array>
@@ -925,6 +926,47 @@ int main() {
         check(restored.has_value(), "16: the folded conversation restored");
         check(restored->live.ids.size() == 1024, "16: the restored image is the NEWEST state");
         check(store->size() == 1, "16: the entry stayed in the manifest (the next delta's base)");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 17. --conversation-spill-gain: the engine's rule (conv_cache::spill_gain_skips over
+    // disk_resume_for) skips the backups of small turns; the one that writes carries every
+    // skipped token's K/V in ONE record, and restore_from_disk_or_ram delivers it.
+    {
+        using strata::program::conv_cache::spill_gain_skips;
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "spill_gain";
+        SpillConfig cfg;
+        cfg.path = rdir.string();
+        cfg.budget_gib = 1;
+        auto store = make_disk_store(cfg, &id);
+        SavedConversation base = conv_image(1000, 1);
+        const std::vector<ConversationImageKey> imgs = base.live.imgs;
+        check(store->put(SavedConversation(base), 3000, id), "17: the first park");
+        const int64_t gain = 64;
+        SavedConversation turn = base;
+        int written = 0, skipped = 0;
+        for (int t = 0; t < 4; ++t) {   // four turns of 24 tokens: 1024, 1048, 1072, 1096
+            turn = conv_grow(turn, 24, uint8_t(10 + t));
+            const int64_t t_live = (int64_t) turn.live.ids.size();
+            std::vector<int32_t> longer = turn.live.ids;
+            longer.push_back(8888);
+            const int64_t t_disk = store->disk_resume_for(longer, imgs, false);
+            if (spill_gain_skips(t_live, t_disk, gain)) { ++skipped; continue; }
+            check(store->put_async(SavedConversation(turn), 3001 + (uint64_t) t, id), "17: the backup queued");
+            store->flush_pending();
+            ++written;
+        }
+        check(written == 1 && skipped == 3, "17: gain 64 writes only the turn 72 tokens past the disk (1072)");
+        const auto c = store->bytes_written();
+        check(c.dlt == (uint64_t) fs::file_size(rdir / "conv-3000.dlt") && c.dlt > 0,
+              "17: one record in the journal, nothing else appended");
+        std::vector<int32_t> prompt = turn.live.ids;   // the client comes back at 1096 (+1)
+        prompt.push_back(9999);
+        const ConversationCache::Match no_park{};
+        auto restored = restore_from_disk_or_ram(no_park, store.get(), prompt, imgs, false, 0, 0, id);
+        check(restored.has_value() && restored->live.ids.size() == 1072,
+              "17: the restore delivers the written turn (1072): the skipped 24 are read again");
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 

@@ -3871,6 +3871,12 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         if isinstance(spill.get("idle_seconds"), int) and not isinstance(spill["idle_seconds"], bool) \
                 and "--conversation-idle-spill-seconds" not in args:
             args += ["--conversation-idle-spill-seconds", str(spill["idle_seconds"])]
+        # Opt-in: skip the disk backup of a conversation the engine keeps while the disk copy is fewer
+        # than this many tokens behind (each journaled backup rewrites the whole state sidecar). A
+        # crash then reads at most that many tokens again. Engine default: 0 (every backup writes).
+        if isinstance(spill.get("gain_tokens"), int) and not isinstance(spill["gain_tokens"], bool) \
+                and spill["gain_tokens"] > 0 and "--conversation-spill-gain" not in args:
+            args += ["--conversation-spill-gain", str(spill["gain_tokens"])]
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)

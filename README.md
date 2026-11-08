@@ -126,6 +126,7 @@ Se activa con un argumento del motor, apagado por defecto:
 | `--conversation-spill-path PATH` | Carpeta de los archivos de conversación | `<data_dir>/strata-spill/` |
 | `--conversation-spill-min-tokens N` | Solo se guardan conversaciones de al menos N tokens | hereda `--conversation-cache-min-tokens` |
 | `--conversation-idle-spill-seconds N` | Tras el `DONE`, espera N s a otro turno; si no llega, respalda la conversación viva al disco. `0` respalda al instante; negativo lo apaga | `5` |
+| `--conversation-spill-gain N` | No respalda una conversación que sigue en la sesión mientras la copia del disco esté a menos de N tokens del último límite de turno. Cada respaldo de una conversación con journal reescribe entero su `.rst` (452 MiB por turno en un log de Gyro-M). Tras un crash se releen como mucho esos N tokens. Un cambio de conversación y el cierre del servidor siempre escriben. En el servidor: `"conversation_spill": {"gain_tokens": N}` | `0` (cada respaldo escribe) |
 
 Lo que conviene saber antes de activarlo:
 

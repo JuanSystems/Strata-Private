@@ -951,6 +951,16 @@ struct Options {
     /// the re-capture. A request ended by the client's STOP backs up at once (grace 0).
     /// Negative: off — the backup waits for the next request's park, as before.
     int64_t conversation_idle_spill_s = 5;
+    /// --conversation-spill-gain N (default 0: every backup writes, as before): a disk backup of a
+    /// conversation the session KEEPS (the idle backup, and the park of a request that goes on with
+    /// the same conversation from one of its checkpoints) is skipped while the disk already delivers a
+    /// resume point fewer than N tokens behind the live chain's deepest turn checkpoint
+    /// (conv_cache::spill_gain_skips).  Each write of a journaled conversation rewrites its whole .rst
+    /// state sidecar (452 MiB per turn in the 2026-11-08 Gyro-M log), so most turns of a fast agent
+    /// loop then write nothing; the skipped K/V rides in the next append.  A crash costs at most those
+    /// N tokens read again.  A real switch (another conversation comes in, a borrow, a batch slot) and
+    /// the shutdown spill always write.
+    int64_t conversation_spill_gain = 0;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
@@ -3657,6 +3667,8 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-spill-path") o.conversation_spill_path = next("--conversation-spill-path");
         else if (a == "--conversation-idle-spill-seconds")
             o.conversation_idle_spill_s = std::atoll(next("--conversation-idle-spill-seconds"));
+        else if (a == "--conversation-spill-gain")
+            o.conversation_spill_gain = std::max(0LL, std::atoll(next("--conversation-spill-gain")));
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -12044,10 +12056,46 @@ int main(int argc, char** argv) {
         // `view`/`cs`/`draft0` llegan preparados por el llamador (un layer split parte los
         // checkpoints por etapa: el park lo hace para su captura en RAM, el idle para sí mismo).
         // false solo si la captura falló: el park lo sube como su error, el idle solo lo loguea.
+        // --conversation-spill-gain: where the caller says this backup is one of a conversation the session KEEPS.
+        // -1 (the default): not such a backup - a real switch, the shutdown spill - the gain never skips it.  The
+        // idle backup sets INT64_MAX (the session keeps everything); the park of a request that goes on with the
+        // same conversation sets its resume point, and the skip then also needs resume >= the disk's point (the
+        // session keeps every token the disk copy has; a request that diverges below it is another branch and the
+        // outgoing one is written as before).
+        int64_t spill_gain_resume = -1;
+        struct SpillGainScope {
+            int64_t& v;
+            SpillGainScope(int64_t& r, int64_t at) : v(r) { v = at; }
+            ~SpillGainScope() { v = -1; }
+        };
         auto spill_live_to_disk = [&](const strata::core::ConversationView& view,
                                       const strata::core::ConversationCheckpointSplit& cs,
                                       const strata::core::QsaState* draft0, const char* what) -> bool {
             if (disk_store_ptr == nullptr || !spill_attached || !live_ok || live.empty()) return true;
+            // ── --conversation-spill-gain: skip while the disk is fewer than N tokens behind. Before holds() and
+            // before any capture: a skipped backup copies nothing off the GPU either.
+            if (o.conversation_spill_gain > 0 && spill_gain_resume >= 0) {
+                const size_t nck = view.checkpoints.size();
+                std::vector<int64_t> lens(nck);
+                std::unique_ptr<bool[]> is_turn(new bool[nck + 1]), is_eop(new bool[nck + 1]);
+                for (size_t i = 0; i < nck; ++i) {
+                    lens[i] = (int64_t) view.checkpoints[i].ids.size();
+                    is_turn[i] = view.checkpoints[i].kind == strata::core::CheckpointKind::turn;
+                    is_eop[i] = view.checkpoints[i].kind == strata::core::CheckpointKind::end_of_prompt;
+                }
+                const int64_t t_live = strata::program::conv_cache::spill_gain_live_point(
+                    lens.data(), is_turn.get(), is_eop.get(), nck, (int64_t) live.size());
+                const int64_t t_disk = disk_store_ptr->disk_resume_for(live, live_imgs, cvec_cached);
+                if (spill_gain_resume >= t_disk &&
+                    strata::program::conv_cache::spill_gain_skips(t_live, t_disk, o.conversation_spill_gain)) {
+                    std::fprintf(stderr, "strata serve: conversation spill [%s]: skip (gain: the disk resumes this "
+                                         "conversation at %lld, %lld behind the live turn %lld; "
+                                         "--conversation-spill-gain %lld)\n",
+                                 what, (long long) t_disk, (long long) std::max<int64_t>(0, t_live - t_disk),
+                                 (long long) t_live, (long long) o.conversation_spill_gain);
+                    return true;
+                }
+            }
             // ── Skip cuando el disco ya la tiene: en el loop de stop/retry el mismo park vuelve
             // a entrar con la MISMA conversación; re-capturar y re-escribir ~800 MiB otra vez no
             // agrega nada (el entry en disco restaura igual o mejor). holds(): igual o más
@@ -12524,6 +12572,8 @@ int main(int argc, char** argv) {
                     break;
                 }
             if (!conversations.wants((int64_t) live.size())) return;   // el mismo mínimo que el park
+            // --conversation-spill-gain: la sesión sigue con esta conversación entera (nada se sobrescribe aún)
+            SpillGainScope gain_scope{spill_gain_resume, INT64_MAX};
             // RAM cache apagada (Kaggle, poca RAM): park_current(0) ES el spill directo — deja
             // live intacta y entrega la imagen al writer; reusa el camino probado y sus gates.
             if (!conversations.enabled()) {
@@ -16748,10 +16798,15 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
-                       !park_current(incoming ? incoming->bytes() : 0)) {
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth) {
+                // --conversation-spill-gain: nothing comes in (no parked conversation, no batch slot; a borrow took
+                // the branch above), so this request goes on in the session from `resume` - the park's disk
+                // backup may be skipped when the disk copy is close enough (spill_live_to_disk checks resume)
+                SpillGainScope gain_scope{spill_gain_resume, !incoming && slot_source < 0 ? resume : -1};
+                if (!park_current(incoming ? incoming->bytes() : 0)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
             }
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
