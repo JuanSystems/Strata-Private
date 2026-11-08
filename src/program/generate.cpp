@@ -16544,18 +16544,28 @@ int main(int argc, char** argv) {
             // same conversation's newer, deeper state — that state must win, and when it does
             // not the store's diagnostic says what beat it (the old silence made a low resume
             // after a stop+comment inexplicable from the log alone).
-            if (!borrow && disk_store_ptr != nullptr) {
+            // A planned borrow is consulted against the disk too: the borrow's depth is parked.tokens, already the
+            // floor inside restore_from_disk_or_ram, so the disk wins only with a strictly deeper match - this
+            // conversation's own newer state, spilled while a sibling sharing its system prompt sat parked in RAM.
+            // Skipping the disk here let that sibling's checkpoint shadow it (the stale-fork shape on the borrow
+            // path). When the disk wins, the borrow is off and the sibling stays parked untouched; when the disk
+            // image is discarded below, the borrow comes back (borrow_planned) instead of a take.
+            const bool borrow_planned = borrow;
+            if (disk_store_ptr != nullptr) {
                 if (auto from_disk = strata::core::restore_from_disk_or_ram(
                         parked, disk_store_ptr, ids, req_imgs, want_cvec, resume, slot_tokens, spill_identity)) {
                     incoming.emplace(std::move(*from_disk));
                     incoming_from_disk = true;
+                    borrow = false;
                     std::fprintf(stderr, "strata serve: conversation spill: restored %zu tokens from disk "
-                                         "(deeper than the RAM cache's %lld-token match and the live resume's %lld)\n",
-                                 incoming->live.ids.size(), (long long) parked.tokens, (long long) resume);
+                                         "(deeper than the RAM cache's %lld-token match%s and the live resume's %lld)\n",
+                                 incoming->live.ids.size(), (long long) parked.tokens,
+                                 borrow_planned ? ", which would have been borrowed" : "", (long long) resume);
                 }
             }
             if (!incoming && parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
+            const bool restore_attempted = incoming.has_value();   // an image was in hand (the DISCARDED log below)
             // DIAGNOSTIC (fork): log what happens to the restored image after the restore.
             if (incoming) {
                 std::fprintf(stderr, "[strata diag] restored image: stage_images=%zu stages=%zu live_ids=%zu "
@@ -16599,8 +16609,13 @@ int main(int argc, char** argv) {
             if (incoming) {
                 std::fprintf(stderr, "[strata diag] restored image SURVIVED validation, will be used "
                                      "(live_ids=%zu)\n", incoming->live.ids.size());
-            } else if (disk_store_ptr != nullptr) {
-                std::fprintf(stderr, "[strata diag] restored image was DISCARDED, engine will recompute\n");
+            } else if (restore_attempted) {
+                // only when an image was actually in hand: with none (the live session or a borrow was the best
+                // source) nothing was discarded and nothing is recomputed because of it
+                std::fprintf(stderr, "[strata diag] restored image was DISCARDED; falling back to %s\n",
+                             incoming_from_disk && borrow_planned ? "the planned borrow"
+                             : incoming_from_disk && parked.tokens > std::max(resume, slot_tokens)
+                                 ? "the RAM cache's match" : "the live resume");
             }
             // #2409: a restore writes into buffers that exist already. The one thing it can still allocate on a card is
             // this thread's private copy stream for it (a pooled one is reused), and an out-of-memory there is fatal
@@ -16642,6 +16657,13 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
                     err.clear();
                 }
+            }
+            // The disk image that replaced a planned borrow did not survive (validation, or #2409's gate, which put it
+            // back into the RAM cache): borrow as planned. The donor is validated right below; the take fallback
+            // further down skips (!borrow), so the sibling conversation is never taken whole.
+            if (!incoming && incoming_from_disk && borrow_planned) {
+                borrow = true;
+                incoming_from_disk = false;
             }
             if (borrow) {
                 const strata::core::SavedConversation* donor = conversations.find(parked.serial);
