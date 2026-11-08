@@ -888,7 +888,16 @@ void ConversationDiskStore::remove_spill_files(const std::string& bin_path) {
     // matches conv-8081.bin). A directory scan is fine: spill dirs hold a few dozen files and
     // removals are rare. Both kinds can carry stage files: a layer split's conversation AND its
     // shared-prefix snapshot.
+    // Windows: the paths reload_from_disk builds from a directory scan end in "\conv-<serial>.bin"
+    // (the native separator), while dir_ + "/conv-..." paths use '/'. With '/' alone the cut fell
+    // inside the directory part, the name no longer started with "conv-", and the sweep below was
+    // skipped: an evicted journaled conversation left its .dlt, .rst and stage files on disk while
+    // bytes_ had already let them go. POSIX keeps '/' only ('\' is a legal file-name byte there).
+#if defined(_WIN32)
+    const size_t slash = bin_path.find_last_of("/\\");
+#else
     const size_t slash = bin_path.find_last_of('/');
+#endif
     const std::string dir = slash == std::string::npos ? std::string() : bin_path.substr(0, slash);
     const std::string fname = slash == std::string::npos ? bin_path : bin_path.substr(slash + 1);
     const bool kind_ok = !dir.empty() && fname.size() > 4 &&

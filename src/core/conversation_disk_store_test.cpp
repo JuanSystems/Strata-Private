@@ -2031,8 +2031,8 @@ int main() {
         store.flush_pending();
         junsetenv("STRATA_SPILL_JOURNAL");
         check(fs::exists(rdir / "conv-830.rst"), "47: the sidecar exists");
-        { std::FILE* f = std::fopen((rdir / "conv-830.rst.tmp").c_str(), "wb"); std::fputs("x", f); std::fclose(f); }
-        { std::FILE* f = std::fopen((rdir / "keep-rst.txt").c_str(), "wb"); std::fputs("keep", f); std::fclose(f); }
+        { std::FILE* f = std::fopen((rdir / "conv-830.rst.tmp").string().c_str(), "wb"); std::fputs("x", f); std::fclose(f); }
+        { std::FILE* f = std::fopen((rdir / "keep-rst.txt").string().c_str(), "wb"); std::fputs("keep", f); std::fclose(f); }
         store.purge_on_startup();
         check(!fs::exists(rdir / "conv-830.bin") && !fs::exists(rdir / "conv-830.dlt") &&
               !fs::exists(rdir / "conv-830.rst") && !fs::exists(rdir / "conv-830.rst.tmp"),
@@ -2100,7 +2100,7 @@ int main() {
             // corrupt the LAST record's payload (80 bytes before the trailer, inside it)
             {
                 const uint64_t size = fs::file_size(rdir / "conv-850.dlt");
-                std::FILE* f = std::fopen((rdir / "conv-850.dlt").c_str(), "r+b");
+                std::FILE* f = std::fopen((rdir / "conv-850.dlt").string().c_str(), "r+b");
                 std::fseek(f, (long) (size - 100), SEEK_SET);
                 const int c = std::fgetc(f);
                 std::fseek(f, (long) (size - 100), SEEK_SET);
@@ -2134,8 +2134,8 @@ int main() {
     {
         const auto rdir = dir / "orphan_rst";
         fs::create_directories(rdir);
-        { std::FILE* f = std::fopen((rdir / "conv-860.rst").c_str(), "wb"); std::fputs("SRST", f); std::fclose(f); }
-        { std::FILE* f = std::fopen((rdir / "conv-860.rst.tmp").c_str(), "wb"); std::fputs("x", f); std::fclose(f); }
+        { std::FILE* f = std::fopen((rdir / "conv-860.rst").string().c_str(), "wb"); std::fputs("SRST", f); std::fclose(f); }
+        { std::FILE* f = std::fopen((rdir / "conv-860.rst.tmp").string().c_str(), "wb"); std::fputs("x", f); std::fclose(f); }
         ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
         store.reload_from_disk(id);
         check(!fs::exists(rdir / "conv-860.rst") && !fs::exists(rdir / "conv-860.rst.tmp"),
