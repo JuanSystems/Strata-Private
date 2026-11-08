@@ -476,7 +476,8 @@ bool state_file_probe(const std::string& path, StateFileInfo& info) {
             // Accept BOTH generations: v1 (one checkpoint per image, no kind byte — every sidecar
             // a pre-set build wrote) and v2 (spill_resume_checkpoints' SET with a kind byte per
             // checkpoint). Anything else is a different generation's file: a torn tail.
-            if (version != 1 && version != kStateVersion) break;
+            // (v3: the split index of write-once state files — DeltaStateOptions::split)
+            if (version != 1 && version != kStateVersion && version != kStateVersionSplit) break;
             info.version = version;
             if (!get_u64(head, sizeof(head), at, info.seq) ||
                 !get_u64(head, sizeof(head), at, info.record_hash) ||
@@ -556,6 +557,315 @@ bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c, bo
     return true;
 }
 
+// ── Split state files (DeltaStateOptions::split; see the header) ────────────────────────────
+constexpr char kBlobMagic[4] = {'S', 'S', 'T', 'B'};
+constexpr char kBlobEndMagic[4] = {'E', 'S', 'T', 'B'};
+constexpr uint32_t kBlobVersion = 1;
+constexpr size_t kBlobHeaderBytes = 4 + 4 + 8;   // magic + version + geometry hash
+constexpr uint32_t kMaxSplitCheckpoints = 8;
+
+// "<dir>/conv-<serial>.rst" -> "<dir>/conv-<serial>." (empty for a path that is not a .rst)
+std::string blob_prefix_of(const std::string& rst_path) {
+    if (rst_path.size() > 4 && rst_path.compare(rst_path.size() - 4, 4, ".rst") == 0)
+        return rst_path.substr(0, rst_path.size() - 3);
+    return std::string();
+}
+
+// A state's identity: its ids and image list, little-endian (the name a later index finds it by).
+uint64_t ids_identity(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs) {
+    uint64_t h = fnv_begin();
+    for (int32_t v : ids) {
+        const uint32_t u = uint32_t(v);
+        const uint8_t t[4] = {uint8_t(u), uint8_t(u >> 8), uint8_t(u >> 16), uint8_t(u >> 24)};
+        h = fnv_update(h, t, 4);
+    }
+    for (const auto& k : imgs) {
+        uint8_t t[16];
+        const uint64_t s = uint64_t(k.start);
+        for (int i = 0; i < 8; ++i) {
+            t[i] = uint8_t(s >> (8 * i));
+            t[8 + i] = uint8_t(k.hash >> (8 * i));
+        }
+        h = fnv_update(h, t, 16);
+    }
+    return h;
+}
+
+std::string blob_name(size_t image, size_t n_ids, uint64_t idh) {
+    char buf[80];
+    std::snprintf(buf, sizeof(buf), "s%zu-%zu-%016llx.st", image, n_ids, (unsigned long long) idh);
+    return buf;
+}
+
+void fsync_dir_of(const std::string& path) {
+#if !defined(_WIN32)
+    const size_t slash = path.find_last_of('/');
+    const std::string dir = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd >= 0) {
+        ::fsync(dfd);
+        ::close(dfd);
+    }
+#else
+    (void) path;
+#endif
+}
+
+// Write one state file (c's ids, image list and five running-state arrays) atomically: temp,
+// flush, fsync, rename, directory fsync. `bytes` / `hash`: its size and trailer hash.
+bool blob_write(const std::string& path, uint64_t geometry, const ConversationCheckpoint& c,
+                uint64_t& bytes, uint64_t& hash) {
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    uint64_t h = fnv_begin(), total = 0;
+    auto emit = [&](const void* p, size_t n) {
+        if (n == 0) return true;
+        h = fnv_update(h, p, n);
+        total += n;
+        return std::fwrite(p, 1, n, f) == n;
+    };
+    bool ok = true;
+    do {
+        std::vector<uint8_t> head;
+        for (int i = 0; i < 4; ++i) head.push_back(uint8_t(kBlobMagic[i]));
+        put_u32(head, kBlobVersion);
+        put_u64(head, geometry);
+        put_checkpoint_head(head, c);
+        if (!(ok = emit(head.data(), head.size()))) break;
+        for (size_t i = 0; ok && i < 5; ++i) {
+            const auto& s = *state_of(c, i);
+            std::vector<uint8_t> t;
+            put_u64(t, s.size());
+            ok = emit(t.data(), t.size()) && emit(s.data(), s.size());
+        }
+        if (!ok) break;
+        std::vector<uint8_t> tail;
+        put_u64(tail, h);
+        put_u64(tail, total + kTrailerBytes);
+        for (int i = 0; i < 4; ++i) tail.push_back(uint8_t(kBlobEndMagic[i]));
+        if (std::fwrite(tail.data(), 1, tail.size(), f) != tail.size()) { ok = false; break; }
+        total += tail.size();
+        if (std::fflush(f) != 0) { ok = false; break; }
+#if !defined(_WIN32)
+        (void) ::fsync(::fileno(f));
+#endif
+    } while (false);
+    if (std::fclose(f) != 0) ok = false;
+    if (ok) {
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return false;
+    }
+    fsync_dir_of(path);
+    bytes = total;
+    hash = h;
+    return true;
+}
+
+// An existing state file's size and trailer hash, without reading its body: the file was
+// published by a rename (never partial under its final name) and the load verifies it whole.
+bool blob_peek(const std::string& path, uint64_t& bytes, uint64_t& hash) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = false;
+    do {
+        if (std::fseek(f, 0, SEEK_END) != 0) break;
+        const long long size = std::ftell(f);
+        if (size < (long long) (kBlobHeaderBytes + kTrailerBytes)) break;
+        uint8_t head[4];
+        if (std::fseek(f, 0, SEEK_SET) != 0 || std::fread(head, 1, 4, f) != 4) break;
+        if (std::memcmp(head, kBlobMagic, 4) != 0) break;
+        uint8_t trailer[kTrailerBytes];
+        if (std::fseek(f, size - (long long) kTrailerBytes, SEEK_SET) != 0 ||
+            std::fread(trailer, 1, sizeof(trailer), f) != sizeof(trailer))
+            break;
+        size_t at = 0;
+        uint64_t stored_hash = 0, stored_total = 0;
+        if (!get_u64(trailer, sizeof(trailer), at, stored_hash) ||
+            !get_u64(trailer, sizeof(trailer), at, stored_total))
+            break;
+        if (std::memcmp(trailer + kTrailerBytes - 4, kBlobEndMagic, 4) != 0 || stored_total != uint64_t(size))
+            break;
+        bytes = uint64_t(size);
+        hash = stored_hash;
+        ok = true;
+    } while (false);
+    std::fclose(f);
+    return ok;
+}
+
+// Load a state file whole, hashing as it reads: it must be exactly `want_bytes` long, hash to
+// `want_hash`, and carry `geometry`. Fills c's ids, image list and the five arrays.
+bool blob_load(const std::string& path, uint64_t geometry, uint64_t want_bytes, uint64_t want_hash,
+               ConversationCheckpoint& c) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = false;
+    do {
+        if (std::fseek(f, 0, SEEK_END) != 0) break;
+        const long long size = std::ftell(f);
+        if (size < 0 || uint64_t(size) != want_bytes || want_bytes < kBlobHeaderBytes + kTrailerBytes ||
+            std::fseek(f, 0, SEEK_SET) != 0)
+            break;
+        uint64_t left = want_bytes - kTrailerBytes;
+        uint64_t h = fnv_begin();
+        auto take = [&](void* dst, size_t n) {
+            if (n > left) return false;
+            if (n && std::fread(dst, 1, n, f) != n) return false;
+            h = fnv_update(h, dst, n);
+            left -= n;
+            return true;
+        };
+        auto take_u64 = [&](uint64_t& v) {
+            uint8_t t[8];
+            size_t at = 0;
+            return take(t, 8) && get_u64(t, 8, at, v);
+        };
+        uint8_t head[kBlobHeaderBytes];
+        if (!take(head, sizeof(head)) || std::memcmp(head, kBlobMagic, 4) != 0) break;
+        {
+            size_t at = 4;
+            uint32_t version = 0;
+            uint64_t geom = 0;
+            if (!get_u32(head, sizeof(head), at, version) || version != kBlobVersion ||
+                !get_u64(head, sizeof(head), at, geom) || geom != geometry)
+                break;
+        }
+        uint64_t n_ids = 0, n_imgs = 0;
+        if (!take_u64(n_ids) || n_ids > left / 4) break;
+        c.ids.resize(size_t(n_ids));
+        bool body = true;
+        for (uint64_t i = 0; body && i < n_ids; ++i) {
+            uint8_t t[4];
+            size_t at = 0;
+            uint32_t v = 0;
+            body = take(t, 4) && get_u32(t, 4, at, v);
+            c.ids[size_t(i)] = int32_t(v);
+        }
+        if (!body || !take_u64(n_imgs) || n_imgs > left / 16) break;
+        c.imgs.resize(size_t(n_imgs));
+        for (uint64_t i = 0; body && i < n_imgs; ++i) {
+            uint64_t start = 0, ih = 0;
+            body = take_u64(start) && take_u64(ih);
+            c.imgs[size_t(i)] = ConversationImageKey{int64_t(start), ih};
+        }
+        for (size_t i = 0; body && i < 5; ++i) {
+            uint64_t sz = 0;
+            body = take_u64(sz) && sz <= left;
+            if (!body) break;
+            auto& dst = *state_of(c, i);
+            dst.resize(size_t(sz));
+            body = take(dst.data(), dst.size());
+        }
+        if (!body || left != 0) break;
+        uint8_t trailer[kTrailerBytes];
+        if (std::fread(trailer, 1, sizeof(trailer), f) != sizeof(trailer)) break;
+        size_t at = 0;
+        uint64_t stored_hash = 0, stored_total = 0;
+        if (!get_u64(trailer, sizeof(trailer), at, stored_hash) ||
+            !get_u64(trailer, sizeof(trailer), at, stored_total))
+            break;
+        ok = std::memcmp(trailer + kTrailerBytes - 4, kBlobEndMagic, 4) == 0 && stored_total == want_bytes &&
+             stored_hash == h && h == want_hash;
+    } while (false);
+    std::fclose(f);
+    return ok;
+}
+
+// Every file of the sidecar's family on disk: (file name, full path) of each .st / .st.tmp
+// named after `prefix` ("<dir>/conv-<serial>.").
+std::vector<std::pair<std::string, fs::path>> blob_family(const std::string& prefix) {
+    std::vector<std::pair<std::string, fs::path>> out;
+    if (prefix.empty()) return out;
+    const fs::path pp(prefix);
+    const std::string base = pp.filename().string();   // "conv-<serial>."
+    fs::path dir = pp.parent_path();
+    if (dir.empty()) dir = ".";
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        const std::string name = entry.path().filename().string();
+        if (name.size() <= base.size() || name.compare(0, base.size(), base) != 0) continue;
+        const bool st = name.size() > 3 && name.compare(name.size() - 3, 3, ".st") == 0;
+        const bool st_tmp = name.size() > 7 && name.compare(name.size() - 7, 7, ".st.tmp") == 0;
+        if (st || st_tmp) out.emplace_back(name, entry.path());
+    }
+    return out;
+}
+
+// Delete the family's files the new index does not name (and every leftover temp).
+void blob_sweep(const std::string& prefix, const std::vector<std::string>& keep) {
+    for (const auto& [name, path] : blob_family(prefix)) {
+        if (std::find(keep.begin(), keep.end(), name) != keep.end()) continue;
+        std::error_code ec;
+        fs::remove(path, ec);
+    }
+}
+
+// The split sidecar's loader (version 3): the index names a state file per live state and
+// per checkpoint; each is loaded whole and verified. The live state's file must carry exactly
+// the ids/images the records left on the image (else the fold fails); a checkpoint whose file
+// is missing or corrupt is dropped (logged) and the rest restores.
+bool state_index_load(const std::string& path, const StateFileInfo& info,
+                      const std::vector<SavedConversation*>& images) {
+    const std::string prefix = blob_prefix_of(path);
+    if (prefix.empty()) return false;
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = std::fseek(f, (long long) kStateHeaderBytes, SEEK_SET) == 0;
+    uint64_t left = info.total - kStateHeaderBytes - kTrailerBytes;
+    auto take_n = [&](uint64_t n) { if (n > left) return false; left -= n; return true; };
+    for (size_t ii = 0; ok && ii < images.size(); ++ii) {
+        SavedConversation& img = *images[ii];
+        const uint64_t geometry = conversation_delta_geometry_hash(img.geometry, img.layer_lo, img.layer_hi);
+        uint64_t geom = 0, n_ids = 0, idh = 0, fbytes = 0, fhash = 0;
+        ok = take_n(8) && read_u64(f, geom) && geom == geometry && take_n(32) && read_u64(f, n_ids) &&
+             read_u64(f, idh) && read_u64(f, fbytes) && read_u64(f, fhash);
+        if (!ok) break;
+        {
+            ConversationCheckpoint live;
+            ok = n_ids == img.live.ids.size() &&
+                 blob_load(prefix + blob_name(ii, size_t(n_ids), idh), geometry, fbytes, fhash, live) &&
+                 live.ids == img.live.ids && live.imgs == img.live.imgs;
+            if (!ok) break;
+            img.live.gdn = std::move(live.gdn);
+            img.live.ple = std::move(live.ple);
+            img.live.tails = std::move(live.tails);
+            img.live.dead = std::move(live.dead);
+            img.live.block_pos = std::move(live.block_pos);
+        }
+        uint32_t n_ckpt = 0;
+        ok = take_n(4) && read_u32(f, n_ckpt) && n_ckpt <= kMaxSplitCheckpoints;
+        img.checkpoints.clear();
+        for (uint32_t k = 0; ok && k < n_ckpt; ++k) {
+            uint64_t c_ids = 0, c_idh = 0, c_bytes = 0, c_hash = 0, used = 0;
+            uint8_t kind = 0;
+            ok = take_n(8 * 5 + 1) && read_u64(f, c_ids) && read_u64(f, c_idh) && read_u64(f, c_bytes) &&
+                 read_u64(f, c_hash) && read_u64(f, used) && read_exact(f, &kind, 1);
+            if (!ok) break;
+            ConversationCheckpoint c;
+            const std::string name = blob_name(ii, size_t(c_ids), c_idh);
+            if (!blob_load(prefix + name, geometry, c_bytes, c_hash, c) || c.ids.size() != c_ids) {
+                std::fprintf(stderr, "[strata diag] spill fold: state file %s%s is missing or corrupt; "
+                                     "its %llu-token checkpoint is dropped, the rest restores\n",
+                             prefix.c_str(), name.c_str(), (unsigned long long) c_ids);
+                continue;
+            }
+            c.used = used;
+            c.kind = CheckpointKind(kind);
+            img.checkpoints.push_back(std::move(c));
+        }
+    }
+    std::fclose(f);
+    return ok && left == 0;
+}
+
 // Load a PROBED sidecar onto the images the reader holds (main + stages, in order): the live
 // running state and the checkpoint SET of every image, each guarded by its geometry echo. A
 // v2 sidecar carries spill_resume_checkpoints' selection (up to 4 per image, each with its
@@ -565,6 +875,7 @@ bool read_checkpoint(std::FILE* f, uint64_t& left, ConversationCheckpoint& c, bo
 // corrupt sidecar).
 bool state_file_load(const std::string& path, const StateFileInfo& info,
                      const std::vector<SavedConversation*>& images) {
+    if (info.version == kStateVersionSplit) return state_index_load(path, info, images);
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     bool ok = std::fseek(f, (long long) kStateHeaderBytes, SEEK_SET) == 0;
@@ -798,8 +1109,147 @@ uint64_t conversation_delta_state_bytes(const SavedConversation& image) {
     return n + kTrailerBytes;
 }
 
+namespace {
+bool state_write_inline(const std::string& path, const SavedConversation& image, uint64_t seq,
+                        uint64_t record_hash, uint64_t& bytes);
+bool state_write_split(const std::string& path, const SavedConversation& image, uint64_t seq,
+                       uint64_t record_hash, uint64_t& bytes, uint64_t& written);
+}  // namespace
+
 bool conversation_delta_state_write(const std::string& path, const SavedConversation& image, uint64_t seq,
                                     uint64_t record_hash, uint64_t& bytes) {
+    return state_write_inline(path, image, seq, record_hash, bytes);
+}
+
+bool conversation_delta_state_write(const std::string& path, const SavedConversation& image, uint64_t seq,
+                                    uint64_t record_hash, uint64_t& bytes, const DeltaStateOptions& options,
+                                    uint64_t* written) {
+    uint64_t w = 0;
+    bool ok = false;
+    if (options.split) {
+        ok = state_write_split(path, image, seq, record_hash, bytes, w);
+    } else {
+        ok = state_write_inline(path, image, seq, record_hash, bytes);
+        w = bytes;
+        // an inline sidecar names no state file: the ones a split write left (the option was
+        // switched off) describe nothing reachable now
+        if (ok) blob_sweep(blob_prefix_of(path), {});
+    }
+    if (written) *written = ok ? w : 0;
+    return ok;
+}
+
+uint64_t conversation_delta_state_footprint(const std::string& path) {
+    uint64_t n = 0;
+    std::error_code ec;
+    if (fs::exists(path, ec) && !ec) {
+        const uint64_t s = fs::file_size(path, ec);
+        if (!ec) n += s;
+    }
+    for (const auto& [name, p] : blob_family(blob_prefix_of(path))) {
+        if (name.size() > 7 && name.compare(name.size() - 7, 7, ".st.tmp") == 0) continue;
+        std::error_code ec2;
+        const uint64_t s = fs::file_size(p, ec2);
+        if (!ec2) n += s;
+    }
+    return n;
+}
+
+void conversation_delta_state_remove(const std::string& path) {
+    std::error_code ec;
+    fs::remove(path, ec);
+    fs::remove(path + ".tmp", ec);
+    blob_sweep(blob_prefix_of(path), {});
+}
+
+namespace {
+bool state_write_split(const std::string& path, const SavedConversation& image, uint64_t seq,
+                       uint64_t record_hash, uint64_t& bytes, uint64_t& written) {
+    bytes = 0;
+    written = 0;
+    const std::string prefix = blob_prefix_of(path);
+    if (prefix.empty()) return false;
+    const std::vector<const SavedConversation*> images = images_of(image);
+    const std::string base = fs::path(prefix).filename().string();   // "conv-<serial>."
+    std::vector<std::string> keep;      // the file names (base + blob name) the new index names
+    uint64_t referenced = 0;            // their bytes (each counted once)
+    // One reference: reuse the state file a previous index wrote for the same identity, else
+    // write it now.
+    auto reference = [&](std::vector<uint8_t>& idx, size_t ii, uint64_t geometry,
+                         const ConversationCheckpoint& c) -> bool {
+        const uint64_t idh = ids_identity(c.ids, c.imgs);
+        const std::string name = blob_name(ii, c.ids.size(), idh);
+        const std::string p = prefix + name;
+        uint64_t fb = 0, fh = 0;
+        if (!blob_peek(p, fb, fh)) {
+            if (!blob_write(p, geometry, c, fb, fh)) return false;
+            written += fb;
+        }
+        if (std::find(keep.begin(), keep.end(), base + name) == keep.end()) {
+            keep.push_back(base + name);
+            referenced += fb;
+        }
+        put_u64(idx, c.ids.size());
+        put_u64(idx, idh);
+        put_u64(idx, fb);
+        put_u64(idx, fh);
+        return true;
+    };
+    std::vector<uint8_t> idx;
+    for (int i = 0; i < 4; ++i) idx.push_back(uint8_t(kStateMagic[i]));
+    put_u32(idx, kStateVersionSplit);
+    put_u64(idx, seq);
+    put_u64(idx, record_hash);
+    put_u32(idx, uint32_t(images.size()));
+    put_u32(idx, 0);
+    for (size_t ii = 0; ii < images.size(); ++ii) {
+        const SavedConversation& img = *images[ii];
+        const uint64_t geometry = conversation_delta_geometry_hash(img.geometry, img.layer_lo, img.layer_hi);
+        put_u64(idx, geometry);
+        if (!reference(idx, ii, geometry, img.live)) return false;
+        std::vector<const ConversationCheckpoint*> sel;
+        record_checkpoint_set(img.checkpoints, sel);
+        if (sel.size() > kMaxSplitCheckpoints) sel.resize(kMaxSplitCheckpoints);
+        put_u32(idx, uint32_t(sel.size()));
+        for (const ConversationCheckpoint* c : sel) {
+            if (!reference(idx, ii, geometry, *c)) return false;
+            put_u64(idx, c->used);
+            put_u8(idx, uint8_t(c->kind));
+        }
+    }
+    uint64_t h = fnv_update(fnv_begin(), idx.data(), idx.size());
+    put_u64(idx, h);
+    put_u64(idx, idx.size() + 8 + 4);   // the total once the size word and the end magic are in
+    for (int i = 0; i < 4; ++i) idx.push_back(uint8_t(kStateEndMagic[i]));
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    bool ok = std::fwrite(idx.data(), 1, idx.size(), f) == idx.size() && std::fflush(f) == 0;
+#if !defined(_WIN32)
+    if (ok) (void) ::fsync(::fileno(f));
+#endif
+    if (std::fclose(f) != 0) ok = false;
+    if (ok) {
+        std::error_code ec;
+        fs::rename(tmp, path, ec);
+        ok = !ec;
+    }
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return false;
+    }
+    fsync_dir_of(path);
+    // the commit is done: the state files the new index does not name go (the previous
+    // index's, and any temp an interrupted write left)
+    blob_sweep(prefix, keep);
+    written += idx.size();
+    bytes = idx.size() + referenced;
+    return true;
+}
+
+bool state_write_inline(const std::string& path, const SavedConversation& image, uint64_t seq,
+                        uint64_t record_hash, uint64_t& bytes) {
     bytes = 0;
     const std::vector<const SavedConversation*> images = images_of(image);
     const std::string tmp = path + ".tmp";
@@ -899,6 +1349,34 @@ bool conversation_delta_state_write(const std::string& path, const SavedConversa
 #endif
     bytes = total;
     return true;
+}
+}  // namespace
+
+std::string conversation_delta_state_describe(const SavedConversation& image) {
+    static const char* kinds[] = {"periodic", "turn", "root", "pin", "end_of_prompt", "message"};
+    auto state_mib = [](const ConversationCheckpoint& c) {
+        uint64_t n = 0;
+        for (size_t i = 0; i < 5; ++i) n += state_of(c, i)->size();
+        return n / (1024.0 * 1024.0);
+    };
+    std::string out;
+    char buf[160];
+    const std::vector<const SavedConversation*> images = images_of(image);
+    for (size_t ii = 0; ii < images.size(); ++ii) {
+        const SavedConversation& img = *images[ii];
+        std::snprintf(buf, sizeof(buf), "%simage %zu: live %zu tokens %.1f MiB", ii ? "; " : "", ii,
+                      img.live.ids.size(), state_mib(img.live));
+        out += buf;
+        std::vector<const ConversationCheckpoint*> sel;
+        record_checkpoint_set(img.checkpoints, sel);
+        for (const ConversationCheckpoint* c : sel) {
+            const size_t k = size_t(c->kind);
+            std::snprintf(buf, sizeof(buf), " + %zu (%s) %.1f MiB", c->ids.size(),
+                          k < sizeof(kinds) / sizeof(kinds[0]) ? kinds[k] : "?", state_mib(*c));
+            out += buf;
+        }
+    }
+    return out;
 }
 
 std::string conversation_delta_describe(const SavedConversation& image, const DeltaPlan& plan) {

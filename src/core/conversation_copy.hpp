@@ -227,6 +227,7 @@ inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCh
     assign_beating(o.block_pos, c.block_pos);
     o.used = c.used;
     o.pinned = c.pinned;
+    o.kind = c.kind;   // as copy_checkpoint_beating: a pooled copy kept the RECYCLED checkpoint's kind
     o.stage_parts.clear();
     for (const auto& part : c.stage_parts) o.stage_parts.push_back(copy_checkpoint_beating(part));
 }

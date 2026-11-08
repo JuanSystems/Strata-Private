@@ -961,6 +961,30 @@ struct Options {
     /// N tokens read again.  A real switch (another conversation comes in, a borrow, a batch slot) and
     /// the shutdown spill always write.
     int64_t conversation_spill_gain = 0;
+    /// --conversation-spill-gain-max-seconds S (default 60; only with --conversation-spill-gain): when the idle
+    /// backup was skipped by the gain and no request arrives for S seconds after the DONE, the backup is written
+    /// anyway - a conversation left alone does not keep its last turns only in the GPU.  An agent loop's next
+    /// request arrives long before, so it adds no writes there.  0 or negative: never forced.
+    int64_t conversation_spill_gain_max_s = 60;
+    /// --conversation-spill-state-files (opt-in): the journal's state sidecar (.rst) becomes an index of write-once
+    /// state files (ConversationDiskStore::set_state_files) - the checkpoint a turn carries over from the last one is
+    /// not written again.  Off: the inline .rst of before, byte for byte.
+    bool conversation_spill_state_files = false;
+    /// --conversation-spill-states turns|all (default all): `turns` cuts every disk backup at the live chain's deepest
+    /// turn checkpoint (conversation_snapshot_save_from_ckpt, per stage on a layer split): the reply generated past
+    /// it and the end-of-prompt checkpoint are not written - a re-rendering client's next prompt never contains them
+    /// (the 2026-11-08 log: every restore resumed at a turn checkpoint).  Without a turn checkpoint the backup is
+    /// written whole, as with `all`.  Cost: after a restart, a client that re-sends the reply verbatim reads it again.
+    bool conversation_spill_turns_only = false;
+    /// --conversation-spill-tail-capture (opt-in): a disk backup that will extend a journal copies off the GPU only the
+    /// K/V past the journal's kept prefix (and the running states), not the whole conversation - the 2026-11-08 log
+    /// copied 1.1-1.3 GiB per backup for 3-23 MiB of new K/V.  The writer drops such an image when its base changed
+    /// meanwhile (it cannot be written whole); the next park then backs the conversation up whole.
+    bool conversation_spill_tail_capture = false;
+    /// --conversation-spill-nowait (opt-in): the disk store's readers (the request's restore check, the park's holds,
+    /// the gain's disk point) do not wait for the background writer; they match the queued / in-flight images too
+    /// (ConversationDiskStore::set_nowait).  A restore that needs the disk still drains first.
+    bool conversation_spill_nowait = false;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
     /// conversation_cache_slots whatever its length, so without it a client that interleaves short side requests
     /// with one long conversation evicts the long one (oldest first).  0 = park every conversation.
@@ -3553,6 +3577,37 @@ int main(int argc, char** argv) {
         else if (a == "--coupled-draft") o.coupled_draft = true;
         else if (a == "--no-coupled-draft") o.coupled_draft = false;
         else parsed = false;
+        // The disk-spill write options, a statement of their own (the second chain below is near MSVC's limit of 128
+        // nested blocks, C1061).
+        if (!parsed) {
+            parsed = true;
+            if (a == "--conversation-spill-gain")
+                o.conversation_spill_gain = std::max(0LL, std::atoll(next("--conversation-spill-gain")));
+            else if (a == "--conversation-spill-gain-max-seconds")
+                o.conversation_spill_gain_max_s = std::atoll(next("--conversation-spill-gain-max-seconds"));
+            else if (a == "--conversation-spill-state-files") o.conversation_spill_state_files = true;
+            else if (a == "--conversation-spill-tail-capture") o.conversation_spill_tail_capture = true;
+            else if (a == "--conversation-spill-nowait") o.conversation_spill_nowait = true;
+            else if (a == "--conversation-spill-lean") {
+                // the disk-write preset: every option that cuts what a turn writes, plus the readers that do not
+                // wait (not the tail capture: a GPU-side change, opt-in on its own)
+                if (o.conversation_spill_gain <= 0) o.conversation_spill_gain = 2048;
+                o.conversation_spill_turns_only = true;
+                o.conversation_spill_state_files = true;
+                o.conversation_spill_nowait = true;
+            }
+            else if (a == "--conversation-spill-states") {
+                const std::string v = next("--conversation-spill-states");
+                if (v == "turns") o.conversation_spill_turns_only = true;
+                else if (v == "all") o.conversation_spill_turns_only = false;
+                else {
+                    std::fprintf(stderr, "strata generate: unknown --conversation-spill-states value '%s' (expected "
+                                         "turns or all)\n", v.c_str());
+                    return 2;
+                }
+            }
+            else parsed = false;
+        }
         // The chain continues here in a second statement: one chain of 120+ `else if` passed MSVC's limit of 128
         // nested blocks (C1061).  The order of the tests and what each does are unchanged.
         if (!parsed) {
@@ -3667,8 +3722,6 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-spill-path") o.conversation_spill_path = next("--conversation-spill-path");
         else if (a == "--conversation-idle-spill-seconds")
             o.conversation_idle_spill_s = std::atoll(next("--conversation-idle-spill-seconds"));
-        else if (a == "--conversation-spill-gain")
-            o.conversation_spill_gain = std::max(0LL, std::atoll(next("--conversation-spill-gain")));
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -11917,6 +11970,24 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation spill: enabled with %lld GiB at %s "
                                      "(RAM cache stays auto-sized; the disk absorbs overflow)\n",
                              (long long) o.conversation_spill_gib, disk_store->dir().c_str());
+                if (o.conversation_spill_state_files) {
+                    disk_store->set_state_files(true);
+                    std::fprintf(stderr, "strata serve: conversation spill: state files on "
+                                         "(--conversation-spill-state-files): each running state is its own "
+                                         "write-once file; a state an earlier turn wrote is not written again\n");
+                }
+                if (o.conversation_spill_nowait) {
+                    disk_store->set_nowait(true);
+                    std::fprintf(stderr, "strata serve: conversation spill: nowait readers on "
+                                         "(--conversation-spill-nowait): a request does not wait for the last "
+                                         "turn's disk write unless it restores from disk\n");
+                }
+                if (o.conversation_spill_gain > 0 || o.conversation_spill_turns_only || o.conversation_spill_tail_capture)
+                    std::fprintf(stderr, "strata serve: conversation spill: gain %lld tokens (forced after %lld s idle), "
+                                         "states %s, tail capture %s\n",
+                                 (long long) o.conversation_spill_gain, (long long) o.conversation_spill_gain_max_s,
+                                 o.conversation_spill_turns_only ? "turns" : "all",
+                                 o.conversation_spill_tail_capture ? "on" : "off");
             } else if (disk_store) {
                 std::fprintf(stderr, "strata serve: conversation spill: disabled (budget_gib = 0 or "
                                      "directory creation failed); today's behavior (drop on evict)\n");
@@ -12063,6 +12134,7 @@ int main(int argc, char** argv) {
         // session keeps every token the disk copy has; a request that diverges below it is another branch and the
         // outgoing one is written as before).
         int64_t spill_gain_resume = -1;
+        bool spill_gain_skipped = false;   // the last spill_live_to_disk skipped by the gain (the idle timer reads it)
         struct SpillGainScope {
             int64_t& v;
             SpillGainScope(int64_t& r, int64_t at) : v(r) { v = at; }
@@ -12093,6 +12165,7 @@ int main(int argc, char** argv) {
                                          "--conversation-spill-gain %lld)\n",
                                  what, (long long) t_disk, (long long) std::max<int64_t>(0, t_live - t_disk),
                                  (long long) t_live, (long long) o.conversation_spill_gain);
+                    spill_gain_skipped = true;
                     return true;
                 }
             }
@@ -12101,23 +12174,67 @@ int main(int argc, char** argv) {
             // agrega nada (el entry en disco restaura igual o mejor). holds(): igual o más
             // largo, misma rama (best() no sirve aquí: es match de prefijo ESTRICTO, y el caso
             // igual — el del retry, o el park que sigue a un respaldo idle — nunca matchea).
-            if (disk_store_ptr->holds(live, live_imgs, cvec_cached)) {
+            const size_t n_st = stages.size();
+            // ── --conversation-spill-states turns: the backup ends at the chain's deepest TURN checkpoint (a
+            // re-rendering client's next prompt contains it; the reply generated past it and the end-of-prompt
+            // checkpoint it never re-sends). A layer split cuts every stage at the same index: the split keeps each
+            // stage's part list index-aligned with the first stage's (conversation_checkpoints_split).
+            size_t cut = SIZE_MAX;
+            if (o.conversation_spill_turns_only) {
+                for (size_t i = 0; i < view.checkpoints.size(); ++i)
+                    if (view.checkpoints[i].kind == strata::core::CheckpointKind::turn &&
+                        (cut == SIZE_MAX || view.checkpoints[i].ids.size() > view.checkpoints[cut].ids.size()))
+                        cut = i;
+                if (cut != SIZE_MAX && view.checkpoints[cut].ids.size() >= live.size()) cut = SIZE_MAX;   // nothing past it
+                for (size_t k = 0; cut != SIZE_MAX && k < n_st; ++k)
+                    if (cs.parts[k].size() != view.checkpoints.size() ||
+                        cs.parts[k][cut].ids.size() != view.checkpoints[cut].ids.size())
+                        cut = SIZE_MAX;   // a stage's parts do not line up: back up whole, as before
+            }
+            const std::vector<int32_t>& cap_ids = cut == SIZE_MAX ? live : view.checkpoints[cut].ids;
+            const std::vector<ImgKey>& cap_imgs = cut == SIZE_MAX ? live_imgs : view.checkpoints[cut].imgs;
+            if (disk_store_ptr->holds(cap_ids, cap_imgs, cvec_cached)) {
                 std::fprintf(stderr, "strata serve: conversation spill: skip capture (%zu tokens; "
                                      "the disk already holds this conversation equal or longer)\n",
-                             live.size());
+                             cap_ids.size());
                 return true;
             }
-            const size_t n_st = stages.size();
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* {
                 return use_mtp && !mtp_first && k + 1 == n_st ? &mtp.kv_state() : nullptr;
             };
             const auto t0 = Clock::now();
             try {
+                // ── --conversation-spill-tail-capture: when this backup will extend a journal, copy off the GPU
+                // only the K/V past the kept prefix (the store answers from an image without K/V: ids, images,
+                // cvec, geometry and every carve are all its base selection reads)
+                int64_t tail_from = 0;
+                if (o.conversation_spill_tail_capture) {
+                    strata::core::SavedConversation probe;
+                    probe.geometry = strata::core::conversation_geometry_key(g);
+                    probe.layer_lo = ss.layer_lo;
+                    probe.layer_hi = ss.layer_hi;
+                    probe.cvec = cvec_cached;
+                    probe.live.ids = cap_ids;
+                    probe.live.imgs = cap_imgs;
+                    for (size_t k = 0; k < n_st; ++k) {
+                        strata::core::SavedConversation sp;
+                        sp.layer_lo = stages[k]->ss.layer_lo;
+                        sp.layer_hi = stages[k]->ss.layer_hi;
+                        probe.stage_images.push_back(std::move(sp));
+                    }
+                    tail_from = (int64_t) disk_store_ptr->delta_keep_for(probe);
+                }
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                strata::core::ConversationKvReuse empty_reuse;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(empty_reuse), &reused_bytes)) return false;
+                const bool spill_capture = cut != SIZE_MAX || tail_from > 0;
+                if (spill_capture) {
+                    if (!strata::core::conversation_snapshot_save_spill(image, view, cut, ss, g, draft0, tail_from, err))
+                        return false;
+                } else {
+                    strata::core::ConversationKvReuse empty_reuse;
+                    if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                            std::move(empty_reuse), &reused_bytes)) return false;
+                }
                 // A layer split parks one image per stage: without the later stages' K/V the
                 // spill restores as 0 stage images and the engine discards it (the stage count
                 // check) — the conversation would recompute on every restart. Capture each
@@ -12129,7 +12246,11 @@ int main(int argc, char** argv) {
                     if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
                     const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                     strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                    if (spill_capture) {
+                        if (!strata::core::conversation_snapshot_save_spill(part, view_k, cut, st->ss, g, draft_of(k),
+                                                                            tail_from, err))
+                            return false;
+                    } else if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
                             strata::core::ConversationKvReuse{}, &reused_bytes))
                         return false;
                     image.stage_images.push_back(std::move(part));
@@ -12143,6 +12264,15 @@ int main(int argc, char** argv) {
                 if (disk_store_ptr->put_async(std::move(image), spill_serial, spill_identity)) {
                     const double spill_ms = std::chrono::duration<double, std::milli>(
                         Clock::now() - t0).count();
+                    if (spill_capture)
+                        std::fprintf(stderr, "strata serve: conversation spill [%s]: captured %zu of %zu tokens%s "
+                                             "(K/V %s; %zu stage image%s) in %.1f ms; serial %llu goes to the "
+                                             "background disk writer\n", what, spill_tokens, live.size(),
+                                     cut != SIZE_MAX ? " (cut at the turn checkpoint)" : "",
+                                     tail_from > 0 ? ("copied from token " + std::to_string(tail_from)).c_str()
+                                                   : "whole",
+                                     n_st, n_st == 1 ? "" : "s", spill_ms, (unsigned long long) spill_serial);
+                    else
                     std::fprintf(stderr, "strata serve: conversation spill [%s]: captured %zu tokens "
                                          "(%.1f MiB, %zu stage image%s) in %.1f ms; conv-%llu.bin goes to "
                                          "the background disk writer (no request is stalled; a restart "
@@ -12429,8 +12559,13 @@ int main(int argc, char** argv) {
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
             if (!conversations.make_room(estimate, held)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
-                             estimate >> 20);
+                // the three numbers that tell a too-small budget (snapshot > budget - held) from a pinned entry
+                // that cannot leave (make_room spares pinned shared prefixes) - the 2026-11-08 log said neither
+                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget"
+                                     "; budget %zu MiB, held %zu MiB, parked %zu entr%s %zu MiB, %zu pinned)\n",
+                             estimate >> 20, conversations.budget() >> 20, held >> 20, conversations.size(),
+                             conversations.size() == 1 ? "y" : "ies", conversations.bytes() >> 20,
+                             conversations.pinned_count());
                 return true;
             }
             const auto t0 = Clock::now();
@@ -12560,7 +12695,9 @@ int main(int argc, char** argv) {
         // pin que el server manda en cada request) y este run aún no lo escribió, su snapshot
         // pfx-*.bin sale AHORA también — el caché de zoocode no depende de que el pin se acabe
         // de crear en ESTE request para llegar al disco.
-        auto idle_backup_live = [&]() -> void {
+        // force: the --conversation-spill-gain-max-seconds timer - the backup writes whatever the gain says
+        auto idle_backup_live = [&](bool force = false) -> void {
+            spill_gain_skipped = false;
             if (o.conversation_idle_spill_s < 0) return;   // apagado: solo el park del request siguiente
             if (disk_store_ptr == nullptr || !spill_attached || !live_ok || live.empty()) return;
             // ── Prefix: el caché entre conversaciones. No gatea por wants(): el prefijo pineado
@@ -12572,8 +12709,9 @@ int main(int argc, char** argv) {
                     break;
                 }
             if (!conversations.wants((int64_t) live.size())) return;   // el mismo mínimo que el park
-            // --conversation-spill-gain: la sesión sigue con esta conversación entera (nada se sobrescribe aún)
-            SpillGainScope gain_scope{spill_gain_resume, INT64_MAX};
+            // --conversation-spill-gain: la sesión sigue con esta conversación entera (nada se sobrescribe aún);
+            // el respaldo forzado por tiempo (force) escribe sin mirar la ganancia
+            SpillGainScope gain_scope{spill_gain_resume, force ? int64_t(-1) : INT64_MAX};
             // RAM cache apagada (Kaggle, poca RAM): park_current(0) ES el spill directo — deja
             // live intacta y entrega la imagen al writer; reusa el camino probado y sus gates.
             if (!conversations.enabled()) {
@@ -14064,6 +14202,25 @@ int main(int argc, char** argv) {
                                 [&] { return !in_lines.empty() || in_eof; })) {
                 lk.unlock();
                 idle_backup_live();   // la ventana pasó sin request: respaldo, y el write en fondo
+                // --conversation-spill-gain-max-seconds: la ganancia saltó el respaldo; si la conversación sigue
+                // quieta hasta S s tras el DONE, se escribe igual (un loop de agente llega mucho antes)
+                if (spill_gain_skipped && o.conversation_spill_gain_max_s > 0) {
+                    const double more = std::max(0.0, (double) o.conversation_spill_gain_max_s - grace);
+                    std::unique_lock<std::mutex> lk2(in_mu);
+                    if (!in_cv.wait_for(lk2, std::chrono::duration<double>(more),
+                                        [&] { return !in_lines.empty() || in_eof; })) {
+                        lk2.unlock();
+                        std::fprintf(stderr, "strata serve: conversation spill: %lld s without a request; writing the "
+                                             "backup the gain skipped (--conversation-spill-gain-max-seconds)\n",
+                                     (long long) o.conversation_spill_gain_max_s);
+                        idle_backup_live(true);
+                        return next_line(out);
+                    }
+                    if (in_lines.empty()) return false;   // EOF: el spill del cierre escribe igual
+                    out = std::move(in_lines.front());
+                    in_lines.pop_front();
+                    return true;
+                }
                 return next_line(out);   // y el wait bloqueante de siempre
             }
             if (in_lines.empty()) return false;   // EOF dentro de la ventana: el spill del cierre corre igual
@@ -16602,15 +16759,19 @@ int main(int argc, char** argv) {
             // image is discarded below, the borrow comes back (borrow_planned) instead of a take.
             const bool borrow_planned = borrow;
             if (disk_store_ptr != nullptr) {
+                const auto t_disk0 = Clock::now();
                 if (auto from_disk = strata::core::restore_from_disk_or_ram(
                         parked, disk_store_ptr, ids, req_imgs, want_cvec, resume, slot_tokens, spill_identity)) {
                     incoming.emplace(std::move(*from_disk));
                     incoming_from_disk = true;
                     borrow = false;
+                    const double disk_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_disk0).count();
                     std::fprintf(stderr, "strata serve: conversation spill: restored %zu tokens from disk "
-                                         "(deeper than the RAM cache's %lld-token match%s and the live resume's %lld)\n",
+                                         "(deeper than the RAM cache's %lld-token match%s and the live resume's %lld); "
+                                         "read %.1f MiB in %.0f ms\n",
                                  incoming->live.ids.size(), (long long) parked.tokens,
-                                 borrow_planned ? ", which would have been borrowed" : "", (long long) resume);
+                                 borrow_planned ? ", which would have been borrowed" : "", (long long) resume,
+                                 disk_store_ptr->last_take_bytes() / (1024.0 * 1024.0), disk_ms);
                 }
             }
             if (!incoming && parked.tokens > std::max(resume, slot_tokens) && !borrow)

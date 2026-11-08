@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 
 #include <algorithm>
 #include <array>
@@ -647,6 +648,67 @@ bool conversation_snapshot_save_from_ckpt(SavedConversation& image, const Conver
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(session, j), g, upto, true, error, 0, nullptr)) return false;
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error, 0, nullptr)) return false;
+    image = std::move(captured);
+    return true;
+}
+
+std::array<int64_t, 18> conversation_geometry_key(const ModelGeometry& g) { return geometry_key(g); }
+
+bool conversation_snapshot_save_spill(SavedConversation& image, const ConversationView& view, size_t cut,
+                                      const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                      int64_t tail_from, std::string& error) {
+    conversation_checkpoint_join(nullptr);   // the last checkpoint's DMA (STRATA_CKPT_ASYNC)
+    conversation_park_join();                // a park's K/V DMA (STRATA_PARK_ASYNC)
+    const bool cutting = cut != SIZE_MAX;
+    if (cutting && cut >= view.checkpoints.size()) return fail(error, "the spill cut is not a checkpoint of the view");
+    const ConversationCheckpoint* at = cutting ? &view.checkpoints[cut] : nullptr;
+    const std::vector<int32_t>& ids = cutting ? at->ids : view.ids;
+    const std::vector<ConversationImageKey>& imgs = cutting ? at->imgs : view.images;
+    if (cutting && (!at->stage_parts.empty() || ids.empty() || ids.size() > view.ids.size() ||
+                    !std::equal(ids.begin(), ids.end(), view.ids.begin())))
+        return fail(error, "the spill cut is not a live token prefix without stage parts");
+    if (tail_from < 0 || tail_from > (int64_t) ids.size()) return fail(error, "invalid spill tail start");
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = session.layer_lo; captured.layer_hi = session.layer_hi;
+    captured.cvec = view.cvec;
+    captured.tail_from = tail_from;
+    // the checkpoints the image keeps: all of them, or those no longer than the cut (a chain: each a prefix of the
+    // next, so these are exactly the cut's own prefixes) - copied once, straight into the image
+    for (const auto& c : view.checkpoints) conversation_checkpoint_join(c.gdn.data());
+    captured.checkpoints.reserve(view.checkpoints.size());
+    for (const auto& c : view.checkpoints)
+        if (!cutting || c.ids.size() <= ids.size())
+            captured.checkpoints.push_back(conversation_detail::copy_checkpoint_beating(c));
+    const ConversationView cview{ids, imgs, captured.checkpoints, view.cvec};
+    if (!view_validate(cview, session, g, error) || !sync(error)) return false;
+    if (cutting) {
+        captured.live = conversation_detail::copy_checkpoint_beating(*at);   // ids, images AND the state at the cut
+    } else {
+        captured.live.ids = ids;
+        captured.live.imgs = imgs;
+        if (!conversation_checkpoint_save(captured.live, session, g, error)) return false;
+        conversation_checkpoint_join(captured.live.gdn.data());   // STRATA_CKPT_ASYNC: the bytes land first
+    }
+    captured.live.pinned = false;
+    const size_t layers = owned_qsa(session);
+    captured.kv.resize(layers + (draft ? 1 : 0));
+    const int64_t upto = (int64_t) ids.size();
+    for (size_t j = 0; j < layers; ++j) {
+        const bool ok = tail_from > 0
+            ? conversation_kv_save_tail(captured.kv[j], owned(session, j), g, upto, true, tail_from, error)
+            : conversation_kv_save(captured.kv[j], owned(session, j), g, upto, true, error, 0, nullptr);
+        if (!ok) return false;
+    }
+    if (draft) {
+        // the draft's last cell may not have been computed when the output cap was reached (conversation_snapshot_save
+        // refreshes that page): the tail starts one token earlier for it
+        const bool ok = tail_from > 0
+            ? conversation_kv_save_tail(captured.kv.back(), *draft, g, upto, false, std::max<int64_t>(0, tail_from - 1),
+                                        error)
+            : conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error, 0, nullptr);
+        if (!ok) return false;
+    }
     image = std::move(captured);
     return true;
 }

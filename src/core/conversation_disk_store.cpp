@@ -111,7 +111,6 @@ static const char* kind_name(bool prefix) { return prefix ? "pfx-" : "conv-"; }
 bool ConversationDiskStore::holds(const std::vector<int32_t>& ids,
                                   const std::vector<ConversationImageKey>& imgs, bool cvec) const {
     if (!enabled() || ids.empty()) return false;
-    flush_pending();
     auto ids_equal = [&](const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
         return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
     };
@@ -126,23 +125,58 @@ bool ConversationDiskStore::holds(const std::vector<int32_t>& ids,
             if (!(pre[i] == full[i])) return false;
         return true;
     };
-    for (const auto& e : entries_) {
-        if (e.cvec != cvec || e.ids.empty()) continue;
-        const bool equal = ids_equal(e.ids, ids);
-        const bool longer = ids_prefix(ids, e.ids);
-        if (!equal && !longer) continue;
+    // (visit_views drains the writer first, unless the nowait readers are on: then a queued or
+    // in-flight image counts too — it is the entry that write lands)
+    bool found = false;
+    visit_views([&](const std::vector<int32_t>& e_ids, const std::vector<ConversationImageKey>& e_imgs,
+                    const std::vector<uint32_t>&, const std::vector<int32_t>&,
+                    const std::vector<ConversationImageKey>&, bool e_cvec, bool, uint64_t, size_t) {
+        if (found || e_cvec != cvec || e_ids.empty()) return;
+        const bool equal = ids_equal(e_ids, ids);
+        const bool longer = ids_prefix(ids, e_ids);
+        if (!equal && !longer) return;
         // the conversation's own images must line up with the entry's, in order (the
         // conversation `ids` is the SHORTER or equal side of the branch)
-        if (imgs_prefix(imgs, e.imgs)) return true;
-    }
+        if (imgs_prefix(imgs, e_imgs)) found = true;
+    });
+    if (found) return true;
     // The client may re-render the history without the assistant's thinking tokens: the
     // entry's deepest checkpoint is then what the next park would write. Equal-length counts
     // (the checkpoint IS the conversation); longer does not apply through ckpt_ids.
-    for (const auto& e : entries_) {
-        if (e.cvec != cvec || e.ckpt_ids.empty()) continue;
-        if (ids_equal(e.ckpt_ids, ids) && imgs_prefix(imgs, e.ckpt_imgs)) return true;
+    visit_views([&](const std::vector<int32_t>&, const std::vector<ConversationImageKey>&,
+                    const std::vector<uint32_t>&, const std::vector<int32_t>& c_ids,
+                    const std::vector<ConversationImageKey>& c_imgs, bool e_cvec, bool, uint64_t, size_t) {
+        if (found || e_cvec != cvec || c_ids.empty()) return;
+        if (ids_equal(c_ids, ids) && imgs_prefix(imgs, c_imgs)) found = true;
+    });
+    return found;
+}
+
+size_t ConversationDiskStore::views_size() const {
+    if (!nowait_) return size();
+    std::lock_guard<std::mutex> lk(writer_mu_);
+    return (writer_busy_ ? busy_views_.size() : entries_.size()) + pending_.size();
+}
+
+ConversationDiskStore::EntryView ConversationDiskStore::view_of(const SavedConversation& image, bool prefix,
+                                                                uint64_t serial) {
+    // The entry this image lands as, for matching: a full write promises its whole chain, an
+    // append the resume set — the set (a subset) is what a reader may rely on either way.
+    EntryView v;
+    v.ids = image.live.ids;
+    v.imgs = image.live.imgs;
+    v.cvec = image.cvec;
+    v.prefix = prefix;
+    v.serial = serial;
+    if (const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints)) {
+        v.ckpt_ids = deepest->ids;
+        v.ckpt_imgs = deepest->imgs;
     }
-    return false;
+    std::vector<const ConversationCheckpoint*> sel;
+    spill_resume_checkpoints(image.checkpoints, sel);
+    for (const ConversationCheckpoint* c : sel)
+        if (!c->ids.empty()) v.ckpt_lens.push_back(uint32_t(c->ids.size()));
+    return v;
 }
 
 std::vector<int64_t> ConversationDiskStore::prefix_pin_lengths() const {
@@ -158,14 +192,36 @@ int64_t ConversationDiskStore::disk_resume_for(const std::vector<int32_t>& ids,
                                                const std::vector<ConversationImageKey>& imgs,
                                                bool cvec) const {
     if (!enabled() || ids.empty()) return 0;
-    flush_pending();
     int64_t best = 0;
-    for (const auto& e : entries_) {
-        if (e.cvec != cvec) continue;
-        best = std::max(best, detail::best_match_tokens(e.ids, e.imgs, e.ckpt_lens, e.ckpt_ids, e.ckpt_imgs,
-                                                        ids, imgs));
-    }
+    visit_views([&](const std::vector<int32_t>& e_ids, const std::vector<ConversationImageKey>& e_imgs,
+                    const std::vector<uint32_t>& lens, const std::vector<int32_t>& c_ids,
+                    const std::vector<ConversationImageKey>& c_imgs, bool e_cvec, bool, uint64_t, size_t) {
+        if (e_cvec != cvec) return;
+        best = std::max(best, detail::best_match_tokens(e_ids, e_imgs, lens, c_ids, c_imgs, ids, imgs));
+    });
     return best;
+}
+
+uint64_t ConversationDiskStore::delta_keep_for(const SavedConversation& probe) const {
+    if (!enabled() || probe.live.ids.empty()) return 0;
+    flush_pending();
+    const auto base = find_delta_base(probe);
+    return base ? base->keep_tokens : 0;
+}
+
+// A tail-only capture (SavedConversation::tail_from > 0, here or in a stage image): its K/V
+// below the tail was never copied, so it can only extend a journal, never be written whole.
+static bool is_tail_image(const SavedConversation& image) {
+    if (image.tail_from > 0) return true;
+    for (const auto& st : image.stage_images)
+        if (st.tail_from > 0) return true;
+    return false;
+}
+
+static int64_t tail_of(const SavedConversation& image) {
+    int64_t t = image.tail_from;
+    for (const auto& st : image.stage_images) t = std::max(t, st.tail_from);
+    return t;
 }
 
 ConversationDiskStore::WriteCounters ConversationDiskStore::bytes_written() const {
@@ -208,6 +264,7 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
     p.sup_ids = image.live.ids;        // cheap copies for the post-write superseded cleanup
     p.sup_imgs = image.live.imgs;
     p.sup_cvec = image.cvec;
+    if (nowait_) p.view = view_of(image, prefix, serial);
     p.image = std::move(image);
     bool inline_write = false;   // thread creation failed: write on the calling thread
     {
@@ -267,6 +324,12 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
             } else if (!p.prefix) {
                 std::fprintf(stderr, "strata serve: conversation spill [delta]: skip (journal disabled)\n");
             }
+            if (is_tail_image(p.image)) {   // the writer thread's rule: never written whole, never a cleanup
+                std::fprintf(stderr, "strata serve: conversation spill: tail capture (from %lld tokens) dropped: "
+                                     "no journal base reaches it any more; the next park writes it whole\n",
+                             (long long) tail_of(p.image));
+                return size_t(0);
+            }
             const size_t n = drop_superseded_light(p.sup_ids, p.sup_imgs, p.sup_cvec);
             ok = put_impl(std::move(p.image), p.serial, p.id, p.options, p.prefix);
             return n;
@@ -293,6 +356,25 @@ void ConversationDiskStore::writer_loop() {
         PendingWrite p = std::move(pending_.front());
         pending_.pop_front();
         writer_busy_ = true;
+        if (nowait_) {
+            // the nowait readers' view while this write runs: the manifest as it stands (stable —
+            // the engine thread only mutates it after draining) plus the entry this image lands as
+            busy_views_.clear();
+            busy_views_.reserve(entries_.size() + 1);
+            for (const DiskEntry& e : entries_) {
+                EntryView v;
+                v.ids = e.ids;
+                v.imgs = e.imgs;
+                v.ckpt_lens = e.ckpt_lens;
+                v.ckpt_ids = e.ckpt_ids;
+                v.ckpt_imgs = e.ckpt_imgs;
+                v.cvec = e.cvec;
+                v.prefix = e.prefix;
+                v.serial = e.serial;
+                busy_views_.push_back(std::move(v));
+            }
+            busy_views_.push_back(p.view);
+        }
         lk.unlock();
         // ── Delta path first (STRATA_SPILL_JOURNAL=1): a park whose conversation is already
         // on disk as (base + journal) appends ONE record instead of rewriting the .bin. The
@@ -328,7 +410,16 @@ void ConversationDiskStore::writer_loop() {
                          p.image.checkpoints.empty()
                              ? 0 : spill_resume_checkpoint(p.image.checkpoints)->ids.size());
         }
-        if (!ok) {
+        const bool tail_only = !ok && is_tail_image(p.image);
+        if (tail_only) {
+            // a tail-only capture cannot be written whole: its base changed between the capture's
+            // plan and this write (an eviction, another branch). Nothing is deleted; the next park
+            // finds holds() false and captures the conversation whole.
+            std::fprintf(stderr, "strata serve: conversation spill: tail capture (from %lld tokens) dropped: "
+                                 "no journal base reaches it any more; the next park writes it whole\n",
+                         (long long) tail_of(p.image));
+            { SavedConversation discard = std::move(p.image); (void) discard; }
+        } else if (!ok) {
             // drop the same-branch older spills FIRST (the RAM cache's order: drop_superseded
             // runs before put). AFTER the write the new entry's ids equal the cleanup's `ids`
             // and the exact-match branch would delete the file we just wrote.
@@ -344,7 +435,7 @@ void ConversationDiskStore::writer_loop() {
         log_written(before);
         lk.lock();
         writer_busy_ = false;
-        if (!ok)
+        if (!ok && !tail_only)
             std::fprintf(stderr, "strata serve: conversation spill: background write FAILED "
                                  "(serial %llu); the conversation stays in RAM only\n",
                          (unsigned long long) p.serial);
@@ -376,6 +467,10 @@ ConversationDiskStore::ConversationDiskStore(std::string dir, uint64_t budget_by
     // The per-record [delta/diag] breakdown: STRATA_SPILL_DIAG=1 (Phase 0's instrument).
     diag_ = false;
     if (const char* env = std::getenv("STRATA_SPILL_DIAG")) diag_ = std::strcmp(env, "0") != 0;
+    // Split state files (--conversation-spill-state-files): opt-in, the engine flag sets it too.
+    if (const char* env = std::getenv("STRATA_SPILL_STATE_FILES")) state_files_ = std::strcmp(env, "0") != 0;
+    // Readers that do not wait for the writer (--conversation-spill-nowait): opt-in.
+    if (const char* env = std::getenv("STRATA_SPILL_NOWAIT")) nowait_ = std::strcmp(env, "0") != 0;
     if (budget_ == 0 || dir_.empty()) { budget_ = 0; return; }
     // Create the spill dir (idempotent). 0700: only the engine user can read parked
     // conversations (they may carry prompt contents).
@@ -462,11 +557,8 @@ std::string ConversationDiskStore::path_for_rst(uint64_t serial) const {
 }
 
 uint64_t ConversationDiskStore::rst_file_bytes(uint64_t serial) const {
-    std::error_code ec;
-    const std::string p = path_for_rst(serial);
-    if (!fs::exists(p, ec) || ec) return 0;
-    const uint64_t n = fs::file_size(p, ec);
-    return ec ? 0 : n;
+    // the .rst and, with split state files, every conv-<serial>.*.st it names
+    return conversation_delta_state_footprint(path_for_rst(serial));
 }
 
 // ── Stage files (a layer split's spill) ─────────────────────────────────────────────────────
@@ -987,6 +1079,12 @@ bool ConversationDiskStore::put_impl(SavedConversation&& image, uint64_t serial,
                                 const SessionFileIdentity& id, const SessionWriteOptions& options,
                                 bool prefix) {
     if (!enabled()) return false;
+    // A tail-only capture holds no K/V below its tail: written whole it would publish garbage.
+    if (is_tail_image(image)) {
+        std::fprintf(stderr, "strata serve: conversation spill: refusing to write a tail-only capture (from %lld "
+                             "tokens) as a whole .bin\n", (long long) tail_of(image));
+        return false;
+    }
     // A prefix write whose exact prefix is already held is a SUCCESSFUL no-op: the engine spills
     // a pin once per run, but after a restart it does not know a previous run already wrote the
     // same file, and two identical pfx-<serial>.bin files (one per run) would waste the budget
@@ -1346,7 +1444,7 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
             }
             if (fold.dropped) {
                 fs::remove(dlt, ec);
-                fs::remove(rst, ec);   // the sidecar of a journal nothing chains onto is junk too
+                conversation_delta_state_remove(rst);   // the sidecar of a journal nothing chains onto is junk too
                 std::fprintf(stderr, "strata serve: conversation spill: journal conv-%llu.dlt does not "
                                      "chain onto its base — dropped (the base restores alone)\n",
                              (unsigned long long) m.serial);
@@ -1359,12 +1457,12 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
                                  fold.applied, fold.applied == 1 ? "" : "s");
                 }
                 if (fold.state_stale)
-                    fs::remove(rst, ec);   // no v3 record applied: the .rst describes a dead generation
+                    conversation_delta_state_remove(rst);   // no v3 record applied: the .rst describes a dead generation
             }
         } else {
             // No journal at all: a .rst beside a bare base (an old build destroyed the .dlt,
             // or a crash between the .dlt's creation and its first record) describes nothing.
-            fs::remove(rst, ec);
+            conversation_delta_state_remove(rst);
         }
     }
     // Correct the manifest entry to the state the disk actually restores now, and bump its LRU
@@ -1405,6 +1503,7 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
                         rst_file_bytes(m.serial);
         bytes_ += en.file_bytes - old_bytes;
         en.used = next_used_++;
+        last_take_bytes_ = en.file_bytes;
         break;
     }
     ++restores_;
@@ -1474,7 +1573,9 @@ void ConversationDiskStore::purge_on_startup() {
         const bool is_rst = (named_conv || named_pfx) && name.size() > 4 &&
                             name.compare(name.size() - 4, 4, ".rst") == 0;
         const bool is_tmp = name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0;
-        if (is_bin || is_idx || is_dlt || is_rst || is_tmp) {
+        // the split sidecar's state files (conv-<serial>.s<k>-<n>-<hash>.st)
+        const bool is_st = named_conv && name.size() > 3 && name.compare(name.size() - 3, 3, ".st") == 0;
+        if (is_bin || is_idx || is_dlt || is_rst || is_tmp || is_st) {
             fs::remove(entry.path(), ec);
         }
     }
@@ -1575,7 +1676,8 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
             stage_files.push_back({entry.path(), serial, is_pfx});
         } else if (tail == "dlt") {
             dlt_files.push_back({entry.path(), serial, is_pfx});
-        } else if (tail == "rst") {
+        } else if (tail == "rst" || (tail.size() > 3 && tail.compare(tail.size() - 3, 3, ".st") == 0)) {
+            // the sidecar, and a split sidecar's state files: the same orphan rule below
             rst_files.push_back({entry.path(), serial, is_pfx});
         }
         // ".idx" (and anything else) is read through path_for_idx, not scanned here
@@ -1714,7 +1816,7 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
                     }
                     if (fold.dropped) {
                         fs::remove(dlt, ec2);
-                        fs::remove(path_for_rst(serial), ec2);
+                        conversation_delta_state_remove(path_for_rst(serial));
                         std::fprintf(stderr, "strata serve: conversation spill: reload: journal "
                                              "conv-%llu.dlt does not chain onto its base — dropped\n",
                                      (unsigned long long) serial);
@@ -1727,7 +1829,7 @@ size_t ConversationDiskStore::reload_from_disk(const SessionFileIdentity& identi
                                          fold.applied, fold.applied == 1 ? "" : "s");
                         }
                         if (fold.state_stale) {
-                            fs::remove(path_for_rst(serial), ec2);   // a dead v3 generation's state
+                            conversation_delta_state_remove(path_for_rst(serial));   // a dead v3 generation's state
                         }
                     }
                     if (!fold.dropped && fold.applied > 0) {
@@ -1908,6 +2010,10 @@ std::optional<ConversationDiskStore::DeltaBase> ConversationDiskStore::find_delt
 bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens,
                                          const SavedConversation& image, const SessionFileIdentity& id) {
     if (base_index >= entries_.size()) return false;
+    // A tail-only capture carries real K/V only from its tail on: the record re-sends from the
+    // completed page of keep_tokens, so keep must reach the tail (the codec's boundary rule is
+    // the capture's: floor(tokens / page) * page).
+    if (tail_of(image) > (int64_t) keep_tokens) return false;
     // Copies up front: the make-room loop below may evict OTHER entries, and erasing from the
     // middle of a deque invalidates every reference into it.
     const uint64_t base_serial = entries_[base_index].serial;
@@ -2012,9 +2118,11 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
     // records still chain through it, and a later fold that ends on one of them needs it —
     // the fold itself decides the sidecar's fate (state_stale when no v3 record ever applies
     // again). Deleting it here would strand every v3 record as a torn tail on the next take().
-    uint64_t rst_bytes = 0;
+    uint64_t rst_bytes = 0, rst_written = 0;
     if (v3) {
-        if (!conversation_delta_state_write(rst, image, seq, rec_hash, rst_bytes)) {
+        DeltaStateOptions sopt;
+        sopt.split = state_files_;
+        if (!conversation_delta_state_write(rst, image, seq, rec_hash, rst_bytes, sopt, &rst_written)) {
             std::error_code rb;
             if (existed) fs::resize_file(dlt, base_journal, rb);
             else fs::remove(dlt, rb);
@@ -2058,7 +2166,12 @@ bool ConversationDiskStore::append_delta(size_t base_index, uint64_t keep_tokens
     // add the new one's); a v2 append touches the record alone — an existing .rst (from v3
     // records already in the journal) stays counted, exactly as it stays on disk.
     w_dlt_ += rec;
-    w_rst_ += rst_bytes;
+    w_rst_ += rst_written;   // what this append wrote (a reused state file costs nothing)
+    if (v3 && (diag_ || !said_state_sizes_)) {
+        said_state_sizes_ = true;
+        std::fprintf(stderr, "strata serve: conversation spill [delta]: state sidecar of conv-%llu holds %s\n",
+                     (unsigned long long) base_serial, conversation_delta_state_describe(image).c_str());
+    }
     base->journal_bytes += rec;
     ++base->journal_records;
     if (v3) {

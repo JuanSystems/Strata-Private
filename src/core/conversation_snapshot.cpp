@@ -381,6 +381,43 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     return true;
 }
 
+bool conversation_kv_save_tail(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                               int64_t upto, bool index, int64_t from_tokens, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    if (!valid(st, l, upto, error)) return false;
+    if (from_tokens < 0 || from_tokens > upto) {
+        error = "conversation snapshot: invalid tail start";
+        return false;
+    }
+    // conversation_kv_save's own boundary: the completed pages strictly below the tail's page
+    const int64_t whole_cells = (from_tokens / l.page_size) * l.page_size;
+    image.format = l.format;
+    image.cells = l.cells;
+    image.heads = g.n_head_kv;
+    image.head_dim = g.head_dim;
+    image.page_size = l.page_size;
+    image.pooled_rows = l.pooled_rows;
+    image.idx_dim = g.idx_key_dim;
+    image.dev_tag = 0;   // never in a STRATA_PARK_VRAM_MIB slot: the disk writer reads the host buffers
+    const auto src = pools(st);
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    for (size_t i = 0; i < dst.size(); ++i) {
+        // the pooled rows (i == 4) go whole: small, and the delta codec's pooled boundary is only an upper bound
+        const size_t keep = (i == 4 || !l.cells) ? 0 : (sizes[i] / size_t(l.cells)) * size_t(whole_cells);
+        if (keep > sizes[i]) {
+            error = "conversation snapshot: tail start past the K/V";
+            return false;
+        }
+        dst[i]->resize_for_overwrite(sizes[i]);   // [0, keep) allocated, never written (SavedConversation::tail_from)
+        if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+            })) return false;
+    }
+    return true;
+}
+
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                               int64_t upto, bool index, std::string& error) {
     Layout l{};

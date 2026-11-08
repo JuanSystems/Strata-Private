@@ -3877,6 +3877,22 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         if isinstance(spill.get("gain_tokens"), int) and not isinstance(spill["gain_tokens"], bool) \
                 and spill["gain_tokens"] > 0 and "--conversation-spill-gain" not in args:
             args += ["--conversation-spill-gain", str(spill["gain_tokens"])]
+        # With the gain on: after this many seconds without a request, write the backup the gain
+        # skipped (engine default 60; 0 or negative never forces).
+        if isinstance(spill.get("gain_max_seconds"), int) and not isinstance(spill["gain_max_seconds"], bool) \
+                and "--conversation-spill-gain-max-seconds" not in args:
+            args += ["--conversation-spill-gain-max-seconds", str(spill["gain_max_seconds"])]
+        # Opt-in write reducers (docs/PLAN_SPILL_ESCRITURAS.md): "lean": true is the preset (gain 2048,
+        # states turns, state files, nowait readers); each one can also be set alone.
+        if spill.get("lean") is True and "--conversation-spill-lean" not in args:
+            args.append("--conversation-spill-lean")
+        if spill.get("states") in ("turns", "all") and "--conversation-spill-states" not in args:
+            args += ["--conversation-spill-states", spill["states"]]
+        for key, flag in (("state_files", "--conversation-spill-state-files"),
+                          ("tail_capture", "--conversation-spill-tail-capture"),
+                          ("nowait", "--conversation-spill-nowait")):
+            if spill.get(key) is True and flag not in args:
+                args.append(flag)
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
     return learned_profile_args(cfg, args)

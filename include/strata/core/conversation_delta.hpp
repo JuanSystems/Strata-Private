@@ -206,6 +206,39 @@ uint64_t conversation_delta_state_bytes(const SavedConversation& image);
 bool conversation_delta_state_write(const std::string& path, const SavedConversation& image, uint64_t seq,
                                     uint64_t record_hash, uint64_t& bytes);
 
+/// --conversation-spill-state-files (opt-in): the sidecar becomes an INDEX (version 3) and every
+/// running state — each image's live state and each resume-set checkpoint — lives in its own
+/// write-once file next to it, <prefix>s<image>-<n_ids>-<ids hash>.st (prefix: the .rst path
+/// without "rst"). The file name is the state's identity (its ids and image list), so a state
+/// the previous index already named is NOT written again — the checkpoint a turn carries over
+/// from the last one costs nothing. After the index is published (the commit), the state
+/// files it no longer names are deleted. Layout of a .st file (little-endian):
+///   u8[4] "SSTB"  u32 version = 1  u64 geometry_hash
+///   u64 n_ids; i32 x n_ids; u64 n_imgs; (i64,u64) x n_imgs; u64 sz[5] + bytes each (interleaved)
+///   trailer: u64 fnv (everything above); u64 total_bytes; u8[4] "ESTB"
+/// Index layout: the 32 B header (version 3), then per image: u64 geometry_hash; the live
+/// state's reference (u64 n_ids, u64 ids_hash, u64 file_bytes, u64 file_hash); u32 n_ckpt and
+/// per checkpoint the same reference + u64 used + u8 kind; the usual 20 B trailer.
+/// On load a missing or corrupt checkpoint file drops THAT checkpoint (the rest restores); a
+/// missing live state file fails the fold, as a corrupt .rst does.
+struct DeltaStateOptions {
+    bool split = false;
+};
+/// `bytes`: the sidecar's whole footprint afterwards (index + every state file it names).
+/// `written` (optional): the bytes this call actually wrote (the reused state files excluded).
+bool conversation_delta_state_write(const std::string& path, const SavedConversation& image, uint64_t seq,
+                                    uint64_t record_hash, uint64_t& bytes, const DeltaStateOptions& options,
+                                    uint64_t* written = nullptr);
+/// The disk footprint of the sidecar at `path`: the .rst plus every .st state file named
+/// after it (0 when none exists; stat errors read as 0).
+uint64_t conversation_delta_state_footprint(const std::string& path);
+/// Remove the sidecar at `path` and every .st state file (and leftover temp) named after it.
+void conversation_delta_state_remove(const std::string& path);
+
+/// What the state sidecar of `image` holds, per image: the live running state and every
+/// resume-set checkpoint (length, kind, MiB) — the line that tells where the .rst's bytes go.
+std::string conversation_delta_state_describe(const SavedConversation& image);
+
 /// One line of the per-image record breakdown (MiB units) for STRATA_SPILL_DIAG: the live
 /// state, the selected checkpoint, the K/V the plan sends vs what the window expects, and
 /// the full K/V — the Phase 0 instrument that says where the record's bytes are. Empty when
@@ -262,5 +295,7 @@ inline constexpr char kStateEndMagic[4] = {'E', 'R', 'S', 'T'};
 /// byte after `used`. v1 (one checkpoint, no kind) is still accepted on read — every sidecar
 /// a pre-set build wrote restores exactly as before.
 inline constexpr uint32_t kStateVersion = 2;
+/// v3: the sidecar is an index of write-once state files (DeltaStateOptions::split).
+inline constexpr uint32_t kStateVersionSplit = 3;
 
 } // namespace strata::core

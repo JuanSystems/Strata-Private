@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -2773,6 +2774,7 @@ int main() {
         jsetenv("STRATA_SPILL_JOURNAL", "1");
         const auto rdir = dir / "write_counter";
         ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        store.set_state_files(false);   // this case counts the inline .rst (case 58 covers the split one)
         check(store.bytes_written().total() == 0, "57: a fresh store wrote nothing");
         SavedConversation a0 = conv_image(1000, 1);
         SavedConversation a1 = conv_grow(a0, 24, 2);
@@ -2806,6 +2808,274 @@ int main() {
         other[10] = other[10] + 1;   // diverges at 10: nothing of that conversation is a resume point
         check(store.disk_resume_for(other, a2_imgs, false) == 0, "57: disk_resume_for: an early divergence holds nothing");
         check(store.disk_resume_for(longer, a2_imgs, true) == 0, "57: disk_resume_for: another cvec holds nothing");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 58. Split state files (--conversation-spill-state-files): the .rst is an index, every
+    // state its own write-once .st; a checkpoint the previous append wrote is NOT written again,
+    // the folded image is byte-exact, a lost checkpoint file drops only that checkpoint, a lost
+    // live file fails the fold, eviction takes every .st, and switching the option off folds
+    // the files back into an inline .rst ─────────────────────────────────────────────────────
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "state_files";
+        auto disk_bytes = [](const fs::path& d) {
+            uint64_t n = 0;
+            std::error_code ec;
+            for (const auto& f : fs::directory_iterator(d, ec)) {
+                if (ec) break;
+                const std::string name = f.path().filename().string();
+                if (name.rfind("conv-", 0) != 0 && name.rfind("pfx-", 0) != 0) continue;
+                if (name.size() > 4 && name.compare(name.size() - 4, 4, ".idx") == 0) continue;
+                if (name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0) continue;
+                n += (uint64_t) fs::file_size(f, ec);
+            }
+            return n;
+        };
+        auto st_files = [](const fs::path& d) {
+            std::vector<std::string> out;
+            std::error_code ec;
+            for (const auto& f : fs::directory_iterator(d, ec)) {
+                const std::string name = f.path().filename().string();
+                if (name.size() > 3 && name.compare(name.size() - 3, 3, ".st") == 0) out.push_back(name);
+            }
+            std::sort(out.begin(), out.end());
+            return out;
+        };
+        // turn 1 carries its own turn checkpoint; turn 2 carries turn 1's (the same ids and bytes)
+        // and its own: the resume set keeps both (the two deepest turns)
+        SavedConversation a0 = conv_image(1000, 1);
+        SavedConversation a1 = conv_grow(a0, 24, 2);
+        a1.checkpoints.back().kind = CheckpointKind::turn;
+        SavedConversation a2 = conv_grow(a1, 24, 3);
+        a2.checkpoints.back().kind = CheckpointKind::turn;
+        a2.checkpoints.insert(a2.checkpoints.begin(), a1.checkpoints.back());
+        const SavedConversation want2 = a2;
+        const size_t ck1 = a1.checkpoints.back().ids.size(), ck2 = a2.checkpoints.back().ids.size();
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            store.set_state_files(true);
+            check(store.put(std::move(a0), 1100, id), "58: the base park");
+            check(store.put_async(std::move(a1), 1101, id), "58: append 1 queued");
+            store.flush_pending();
+            const auto c1 = store.bytes_written();
+            const auto files1 = st_files(rdir);
+            check(files1.size() == 2, "58: append 1 wrote two state files (its live state and its checkpoint)");
+            const uint64_t index1 = (uint64_t) fs::file_size(rdir / "conv-1100.rst");
+            check(index1 < 1024, "58: the .rst is a small index");
+            std::string ck1_file;
+            for (const auto& n : files1)
+                if (n.find("-" + std::to_string(ck1) + "-") != std::string::npos) ck1_file = n;
+            check(!ck1_file.empty(), "58: turn 1's checkpoint has its own file");
+            const auto ck1_time = fs::last_write_time(rdir / ck1_file);
+            const uint64_t ck1_bytes = (uint64_t) fs::file_size(rdir / ck1_file);
+            check(store.put_async(std::move(a2), 1102, id), "58: append 2 queued");
+            store.flush_pending();
+            const auto c2 = store.bytes_written();
+            const auto files2 = st_files(rdir);
+            check(files2.size() == 3, "58: append 2: its live state + both turn checkpoints, turn 1's live file swept");
+            check(fs::exists(rdir / ck1_file) && fs::last_write_time(rdir / ck1_file) == ck1_time,
+                  "58: turn 1's checkpoint file was NOT written again");
+            uint64_t all_st = 0;
+            for (const auto& n : files2) all_st += (uint64_t) fs::file_size(rdir / n);
+            const uint64_t index2 = (uint64_t) fs::file_size(rdir / "conv-1100.rst");
+            check(c2.rst - c1.rst == index2 + all_st - ck1_bytes,
+                  "58: append 2 counted exactly the new files and the index (the reused one costs nothing)");
+            check(store.bytes() == disk_bytes(rdir), "58: accounting == disk with state files");
+            ConversationCache::Match m;
+            m.serial = 1100; m.tokens = 1048; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && same_conv(*back, want2), "58: the fold through the index is byte-exact");
+            check(back.has_value() && back->checkpoints.size() == 2 &&
+                      back->checkpoints[0].ids.size() == ck1 && back->checkpoints[1].ids.size() == ck2 &&
+                      back->checkpoints[1].kind == CheckpointKind::turn,
+                  "58: both checkpoints come back, with their kinds");
+            check(store.bytes() == disk_bytes(rdir), "58: accounting == disk after take");
+        }
+        {
+            // a reloaded store (fast path) restores the same
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 1, "58: reload loads the entry");
+            check(store.bytes() == disk_bytes(rdir), "58: accounting == disk after reload");
+            ConversationCache::Match m;
+            m.serial = 1100; m.tokens = 1048; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && same_conv(*back, want2), "58: the reloaded fold is byte-exact");
+        }
+        {
+            // a lost checkpoint file: that checkpoint goes, the restore goes on
+            std::string ck1_file;
+            for (const auto& n : st_files(rdir))
+                if (n.find("-" + std::to_string(ck1) + "-") != std::string::npos) ck1_file = n;
+            fs::remove(rdir / ck1_file);
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            store.reload_from_disk(id);
+            ConversationCache::Match m;
+            m.serial = 1100; m.tokens = 1048; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && back->live.ids.size() == 1048 && back->checkpoints.size() == 1 &&
+                      back->checkpoints[0].ids.size() == ck2,
+                  "58: a lost checkpoint file drops that checkpoint only");
+        }
+        {
+            // a lost live-state file: the fold fails (the files stay, the entry leaves the manifest)
+            for (const auto& n : st_files(rdir))
+                if (n.find("-1048-") != std::string::npos) fs::remove(rdir / n);
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            store.reload_from_disk(id);
+            ConversationCache::Match m;
+            m.serial = 1100; m.tokens = 1048; m.live = true;
+            check(!store.take(m, id).has_value(), "58: a lost live-state file fails the fold");
+        }
+        {
+            // eviction takes every state file
+            ConversationDiskStore store(rdir.string(), 1, &id);
+            store.reload_from_disk(id);
+            check(st_files(rdir).empty() && !fs::exists(rdir / "conv-1100.rst"),
+                  "58: the eviction removed the index and every state file");
+        }
+        {
+            // on, then off: the off append writes an inline .rst and sweeps the state files
+            const auto odir = dir / "state_files_off";
+            ConversationDiskStore store(odir.string(), 1ull << 30, &id);
+            store.set_state_files(true);
+            SavedConversation b0 = conv_image(1000, 5);
+            SavedConversation b1 = conv_grow(b0, 24, 6);
+            SavedConversation b2 = conv_grow(b1, 24, 7);
+            const SavedConversation want_b2 = b2;
+            check(store.put(std::move(b0), 1200, id), "58: off: the base park");
+            check(store.put_async(std::move(b1), 1201, id), "58: off: a split append");
+            store.flush_pending();
+            check(!st_files(odir).empty(), "58: off: the split append wrote state files");
+            store.set_state_files(false);
+            check(store.put_async(std::move(b2), 1202, id), "58: off: an inline append");
+            store.flush_pending();
+            check(st_files(odir).empty(), "58: off: the inline append swept the state files");
+            check(store.bytes() == disk_bytes(odir), "58: off: accounting == disk");
+            ConversationCache::Match m;
+            m.serial = 1200; m.tokens = 1048; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && same_conv(*back, want_b2), "58: off: the inline fold is byte-exact");
+        }
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 59. Nowait readers (--conversation-spill-nowait): right after a put_async — the write
+    // queued, in flight or landed, whichever the timing gives — best(), holds() and
+    // disk_resume_for() answer exactly what a drained store answers, and restore_from_disk_or_ram
+    // drains and re-matches before it reads the files ───────────────────────────────────────
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "nowait";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        store.set_nowait(true);
+        check(store.nowait(), "59: nowait is on");
+        SavedConversation turn = conv_image(1000, 1);
+        check(store.put(SavedConversation(turn), 1300, id), "59: the base park");
+        bool all_ok = true;
+        for (int t = 0; t < 12 && all_ok; ++t) {
+            turn = conv_grow(turn, 24, uint8_t(20 + t));
+            const std::vector<int32_t> ids = turn.live.ids;
+            const std::vector<ConversationImageKey> imgs = turn.live.imgs;
+            std::vector<int32_t> prompt = ids;
+            prompt.push_back(4242);
+            check(store.put_async(SavedConversation(turn), 1301 + (uint64_t) t, id), "59: a backup queued");
+            // no flush: the readers must not wait, and must already see this turn
+            const bool held = store.holds(ids, imgs, false);
+            const int64_t resume = store.disk_resume_for(prompt, imgs, false);
+            const auto m = store.best(prompt, imgs, false);
+            all_ok = held && resume == (int64_t) ids.size() && m.tokens == (int64_t) ids.size();
+            if (!all_ok)
+                std::fprintf(stderr, "59: turn %d: held=%d resume=%lld best=%lld (want %zu)\n", t, (int) held,
+                             (long long) resume, (long long) m.tokens, ids.size());
+            store.flush_pending();
+            all_ok = all_ok && store.holds(ids, imgs, false) && store.best(prompt, imgs, false).tokens == m.tokens;
+        }
+        check(all_ok, "59: every turn: the undrained answers equal the drained ones");
+        {
+            // another conversation queued: the one already on disk stays visible to every reader,
+            // whether the writer has not taken the new image yet, is writing it, or is done
+            const std::vector<int32_t> a_ids = turn.live.ids;
+            const std::vector<ConversationImageKey> a_imgs = turn.live.imgs;
+            std::vector<int32_t> a_prompt = a_ids;
+            a_prompt.push_back(4444);
+            bool seen = true;
+            for (int r = 0; r < 6 && seen; ++r) {
+                check(store.put_async(shifted(400 + (size_t) r * 8, 90000 + r * 1000), 1500 + (uint64_t) r, id),
+                      "59: another conversation queued");
+                seen = store.holds(a_ids, a_imgs, false) &&
+                       store.best(a_prompt, a_imgs, false).tokens == (int64_t) a_ids.size() &&
+                       store.disk_resume_for(a_prompt, a_imgs, false) == (int64_t) a_ids.size();
+            }
+            store.flush_pending();
+            check(seen, "59: the conversation on disk stays visible while another one is queued or written");
+        }
+        // the restore path: queue one more turn and restore it at once
+        turn = conv_grow(turn, 24, 90);
+        const SavedConversation want = turn;
+        std::vector<int32_t> prompt = turn.live.ids;
+        prompt.push_back(4343);
+        check(store.put_async(SavedConversation(turn), 1400, id), "59: the last backup queued");
+        const ConversationCache::Match no_park{};
+        auto restored = restore_from_disk_or_ram(no_park, &store, prompt, turn.live.imgs, false, 0, 0, id);
+        check(restored.has_value() && same_conv(*restored, want),
+              "59: restore_from_disk_or_ram drains, re-matches and restores the newest turn byte-exactly");
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
+    // ── 60. Tail-only captures (--conversation-spill-tail-capture): delta_keep_for() plans the
+    // tail, an image whose K/V below it is garbage folds byte-exactly into the journal, a tail
+    // no base reaches is dropped (nothing changes on disk), and one is never written whole ────
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        const auto rdir = dir / "tail_capture";
+        ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+        SavedConversation a0 = conv_image(1000, 1);
+        check(store.put(SavedConversation(a0), 1600, id), "60: the base park");
+        SavedConversation a1 = conv_grow(a0, 24, 2);
+        // the probe: what the capture knows before it copies anything (no K/V, no states)
+        SavedConversation probe;
+        probe.geometry = a1.geometry;
+        probe.layer_lo = a1.layer_lo;
+        probe.layer_hi = a1.layer_hi;
+        probe.cvec = a1.cvec;
+        probe.live.ids = a1.live.ids;
+        probe.live.imgs = a1.live.imgs;
+        check(store.delta_keep_for(probe) == 1000, "60: the plan keeps the base's 1000 tokens");
+        // the tail capture: the K/V below the completed page at 1000 was never copied
+        auto tail_copy = [](const SavedConversation& full, int64_t from) {
+            SavedConversation t = full;
+            t.tail_from = from;
+            for (auto& kv : t.kv) {
+                const uint64_t whole = uint64_t(from / kv.page_size) * uint64_t(kv.page_size);
+                ConversationBuffer* parts[4] = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale};
+                for (ConversationBuffer* b : parts) {
+                    if (kv.cells <= 0 || b->empty()) continue;
+                    const size_t n = size_t(b->size() / uint64_t(kv.cells) * whole);
+                    b->visit(0, n, [](uint8_t* p, size_t c, size_t) { std::memset(p, 0xEE, c); return true; });
+                }
+            }
+            return t;
+        };
+        check(store.put_async(tail_copy(a1, 1000), 1601, id), "60: the tail capture queued");
+        store.flush_pending();
+        check(fs::exists(rdir / "conv-1600.dlt"), "60: it landed as a journal record");
+        {
+            ConversationCache::Match m;
+            m.serial = 1600; m.tokens = 1024; m.live = true;
+            auto back = store.take(m, id);
+            check(back.has_value() && same_conv(*back, a1), "60: the fold of a tail capture is byte-exact");
+        }
+        // a tail the base does not reach (the capture planned a deeper base than the one left)
+        SavedConversation a2 = conv_grow(a1, 24, 3);
+        const auto before = store.bytes_written();
+        check(store.put_async(tail_copy(a2, 1040), 1602, id), "60: an unreachable tail queued");
+        store.flush_pending();
+        check(store.bytes_written().total() == before.total(), "60: an unreachable tail writes nothing");
+        check(!store.holds(a2.live.ids, a2.live.imgs, false), "60: ...and is not held (the next park writes it whole)");
+        // never written whole
+        check(!store.put(tail_copy(a2, 1024), 1700, id), "60: a tail capture is refused as a whole .bin");
+        check(!fs::exists(rdir / "conv-1700.bin"), "60: no .bin was published for it");
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 

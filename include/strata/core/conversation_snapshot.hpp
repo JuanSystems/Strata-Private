@@ -186,6 +186,28 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_save_from_ckpt(SavedConversation& image, const ConversationView& view,
                                           const SessionState& session, const ModelGeometry& g,
                                           const QsaState* draft, std::string& error);
+// --conversation-spill-tail-capture: conversation_kv_save of `upto` tokens whose parts k/v/k_scale/v_scale get their
+// bytes only from the completed page at `from_tokens` on (the buffers are sized whole; below that page they are
+// allocated but never written - with the buffer's default-init segments those pages are not even touched).  The
+// pooled indexer rows are copied whole (the delta codec's pooled boundary is an upper-bound guess).  Synchronous.
+bool conversation_kv_save_tail(ConversationKv& image, const QsaState& state, const ModelGeometry& g, int64_t upto,
+                               bool include_index, int64_t from_tokens, std::string& error);
+// The disk spill's capture (--conversation-spill-states turns, --conversation-spill-tail-capture), synchronous (no
+// STRATA_PARK_ASYNC staging, no retained K/V):
+//   cut == SIZE_MAX: the image ends where the view does (the running state saved from the session now) and holds
+//                    every checkpoint of the view - conversation_snapshot_save's image;
+//   cut <  view.checkpoints.size(): the image ends at that checkpoint - its ids, images and running state, the
+//                    checkpoints no longer than it (the cut included), the K/V [0, its length): the session moved
+//                    past it, and the cells below never change (conversation_snapshot_save_from_ckpt's rule).
+//   tail_from > 0:   the K/V as conversation_kv_save_tail from there (the draft layer from one token earlier, as
+//                    conversation_snapshot_save refreshes the draft's last page); image.tail_from = tail_from.
+// The view's checkpoints must carry no stage parts (a layer split passes each stage its own part list).
+bool conversation_snapshot_save_spill(SavedConversation& image, const ConversationView& view, size_t cut,
+                                      const SessionState& session, const ModelGeometry& g, const QsaState* draft,
+                                      int64_t tail_from, std::string& error);
+// The geometry key a snapshot of this model carries (SavedConversation::geometry): what the disk store's
+// delta_keep_for probe needs to match its entries.
+std::array<int64_t, 18> conversation_geometry_key(const ModelGeometry& g);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

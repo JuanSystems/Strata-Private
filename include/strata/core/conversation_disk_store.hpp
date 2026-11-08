@@ -124,6 +124,34 @@ public:
 
     bool enabled() const { return budget_ != 0; }
     const std::string& dir() const { return dir_; }
+    // STRATA_SPILL_DIAG=1 (the per-record breakdown, and the ranked manifest dump on every request).
+    bool diag() const { return diag_; }
+
+    // ---- Readers that do not wait for the writer (--conversation-spill-nowait, opt-in) ----
+    // Off (the default): best(), holds() and disk_resume_for() drain the background writer first
+    // and read the manifest, as before. On: while a write is queued or in flight they read the
+    // manifest as it was when that write started PLUS every queued / in-flight image (each as the
+    // entry it will become), so the next request does not wait for the previous turn's write.
+    // take() and every mutator still drain first. STRATA_SPILL_NOWAIT=1 turns it on too.
+    void set_nowait(bool on) { nowait_ = on; }
+    bool nowait() const { return nowait_; }
+    // What a nowait reader matches against: one manifest entry, or one image a write will land.
+    struct EntryView {
+        std::vector<int32_t> ids;
+        std::vector<ConversationImageKey> imgs;
+        std::vector<uint32_t> ckpt_lens;
+        std::vector<int32_t> ckpt_ids;
+        std::vector<ConversationImageKey> ckpt_imgs;
+        bool cvec = true;
+        bool prefix = false;
+        uint64_t serial = 0;
+    };
+    // The entries a reader matches against right now (see set_nowait). The count of them, without
+    // waiting: the summary line of restore_from_disk_or_ram.
+    size_t views_size() const;
+    // f(ids, imgs, ckpt_lens, ckpt_ids, ckpt_imgs, cvec, prefix, serial, index) over those entries,
+    // oldest first; `index` is the manifest index when the writer is idle (else the view's position).
+    template<class F> void visit_views(F&& f) const;
 
     // ---- Park path (the new evict_oldest calls this) ----
     // Writes `image` (captured in RAM by ConversationCache::take) to <dir>/conv-<serial>.bin
@@ -181,6 +209,23 @@ public:
     // stage files count as bin/stage; a shared-prefix snapshot's (.bin + stages) as prefix; the
     // .dlt record, the .rst sidecar (each whole rewrite) and the .idx metadata on their own.
     // Atomic: the writer thread adds, any thread reads.
+    // --conversation-spill-state-files (opt-in): every v3 append writes its sidecar as an index
+    // of write-once state files (DeltaStateOptions::split) — a state the previous append already
+    // wrote is not written again. STRATA_SPILL_STATE_FILES=1 turns it on too (read once, in the
+    // constructor). Off: the inline .rst of today, byte for byte.
+    void set_state_files(bool on) { state_files_ = on; }
+    bool state_files() const { return state_files_; }
+    // --conversation-spill-tail-capture: the kept prefix (tokens) a delta append of `probe` would
+    // get right now — find_delta_base on an image without K/V (its ids, images, cvec, geometry,
+    // layer carve and its stage images' carves are all it reads). 0: no base (capture it whole).
+    // The capture then copies the K/V from there on only (SavedConversation::tail_from). Drains
+    // the writer first (the base must be the one the next write sees).
+    uint64_t delta_keep_for(const SavedConversation& probe) const;
+
+    // The files the last successful take() read: its .bin, stage files, journal and state sidecar
+    // (the entry's whole footprint) — the restore line's "MiB read".
+    uint64_t last_take_bytes() const { return last_take_bytes_; }
+
     struct WriteCounters {
         uint64_t bin = 0, stage = 0, dlt = 0, rst = 0, idx = 0, prefix = 0;
         uint64_t total() const { return bin + stage + dlt + rst + idx + prefix; }
@@ -325,7 +370,11 @@ private:
         std::vector<int32_t> sup_ids;
         std::vector<ConversationImageKey> sup_imgs;
         bool sup_cvec = true;
+        EntryView view;   // nowait readers: the entry this write will land as (filled when nowait_)
     };
+    bool nowait_ = false;                         // set_nowait()
+    std::vector<EntryView> busy_views_;           // nowait: the manifest + the in-flight image, at the pop
+    static EntryView view_of(const SavedConversation& image, bool prefix, uint64_t serial);
     mutable std::mutex writer_mu_;
     mutable std::condition_variable writer_cv_;   // writer waits for work; flush waits for idle
     std::thread writer_;
@@ -337,6 +386,11 @@ private:
     mutable std::atomic<uint64_t> w_bin_{0}, w_stage_{0}, w_dlt_{0}, w_rst_{0}, w_idx_{0}, w_prefix_{0};
     // One line after each background write: what it wrote, by kind, and the run's total.
     void log_written(const WriteCounters& before) const;
+    // The .rst breakdown (conversation_delta_state_describe) goes out once per run, and after
+    // every append under STRATA_SPILL_DIAG=1. Writer-thread only.
+    bool said_state_sizes_ = false;
+    bool state_files_ = false;   // set_state_files()
+    uint64_t last_take_bytes_ = 0;   // last_take_bytes()
     // ── Delta journal (read once in the constructor): DEFAULT ON since the v2 multi-image
     // record — a park that finds a delta base appends a conv-<serial>.dlt record instead of
     // rewriting the .bin and its stage files. STRATA_SPILL_JOURNAL=0 opts out (the A/B escape
@@ -580,32 +634,68 @@ ConversationCache::Match ConversationDiskStore::best(const std::vector<Token>& p
                                                      bool cvec) const {
     ConversationCache::Match best;
     if (!enabled() || prompt.empty()) return best;
-    flush_pending();   // a queued (not yet written) spill is invisible until it lands
     // Convert the prompt to int32_t once: the engine holds ids as `long` on Linux x86_64, but
     // tokens are always <= INT32_MAX (a 32-bit model vocab fits in int32_t). The conversion is
     // a single pass and avoids forcing the caller to copy.
     std::vector<int32_t> prompt32;
     prompt32.reserve(prompt.size());
     for (const auto& t : prompt) prompt32.push_back(static_cast<int32_t>(t));
-    for (size_t i = entries_.size(); i-- > 0;) {
-        const auto& e = entries_[i];
-        if (e.cvec != cvec) continue;
+    // visit_views drains the writer first (a queued spill is invisible until it lands) unless
+    // the nowait readers are on, then it also offers the queued / in-flight images. Oldest
+    // first with `>=`: among equal matches the newest wins, as the old newest-first `>` did.
+    visit_views([&](const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& imgs,
+                    const std::vector<uint32_t>& lens, const std::vector<int32_t>& cids,
+                    const std::vector<ConversationImageKey>& cimgs, bool e_cvec, bool /*prefix*/,
+                    uint64_t serial, size_t i) {
+        if (e_cvec != cvec) return;
         // best_match_tokens considers, in order: the live ids (a strict prefix — the plain
         // growth case), the deepest checkpoint's own ids, and EVERY checkpoint length in
         // ckpt_lens. The deepest alone is the end-of-prompt checkpoint under
         // --tail-role-token (it carries the effort-tail turn the next prompt does NOT
         // re-send — never a prefix); ckpt_lens lets best() see past it to the turn boundaries
         // the client's re-render still contains.
-        int64_t n = detail::best_match_tokens(e.ids, e.imgs, e.ckpt_lens, e.ckpt_ids, e.ckpt_imgs,
-                                              prompt32, images);
-        if (n > best.tokens) {
+        const int64_t n = detail::best_match_tokens(ids, imgs, lens, cids, cimgs, prompt32, images);
+        if (n > 0 && n >= best.tokens) {
             best.tokens = n;
-            best.serial = e.serial;
+            best.serial = serial;
             best.index = i;
             best.live = true;
         }
-    }
+    });
     return best;
+}
+
+template<class F>
+void ConversationDiskStore::visit_views(F&& f) const {
+    auto entries = [&] {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            const DiskEntry& e = entries_[i];
+            f(e.ids, e.imgs, e.ckpt_lens, e.ckpt_ids, e.ckpt_imgs, e.cvec, e.prefix, e.serial, i);
+        }
+    };
+    if (!nowait_) {
+        flush_pending();
+        entries();
+        return;
+    }
+    std::lock_guard<std::mutex> lk(writer_mu_);
+    if (!writer_busy_) {
+        // no write in flight: the manifest is stable (only the caller's own thread mutates it, after
+        // a drain) — read it, then the queued images the writer has not taken yet
+        entries();
+        size_t i = entries_.size();
+        for (const PendingWrite& p : pending_)
+            f(p.view.ids, p.view.imgs, p.view.ckpt_lens, p.view.ckpt_ids, p.view.ckpt_imgs, p.view.cvec,
+              p.view.prefix, p.view.serial, i++);
+        return;
+    }
+    // a write in flight mutates the manifest: its state when that write started, plus that image
+    size_t i = 0;
+    for (const EntryView& v : busy_views_)
+        f(v.ids, v.imgs, v.ckpt_lens, v.ckpt_ids, v.ckpt_imgs, v.cvec, v.prefix, v.serial, i++);
+    for (const PendingWrite& p : pending_)
+        f(p.view.ids, p.view.imgs, p.view.ckpt_lens, p.view.ckpt_ids, p.view.ckpt_imgs, p.view.cvec,
+          p.view.prefix, p.view.serial, i++);
 }
 
 template<class Token>
@@ -643,7 +733,7 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
         std::fprintf(stderr, "[strata diag] restore_from_disk_or_ram: %s "
                               "(disk_size=%zu, disk_best=%lld, ram_floor=%lld, parked=%lld, resume=%lld, "
                               "slot=%lld, prompt=%zu, cvec=%d, prompt_imgs=%zu)\n",
-                     why, disk->size(), (long long) disk_match.tokens, (long long) ram_floor,
+                     why, disk->views_size(), (long long) disk_match.tokens, (long long) ram_floor,
                      (long long) parked.tokens, (long long) resume, (long long) slot_tokens,
                      prompt.size(), (int) cvec, images.size());
         // Show the prompt's first/last few ids, then the manifest entries RANKED by their common
@@ -652,7 +742,13 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
         // entry also prints its ckpt_lens: the resume points best() could match past the ids'
         // own divergence (a turn boundary inside the common prefix IS a match even when the
         // live ids diverge above it).
-        if (disk->size() > 0) {
+        // The NORMAL case ("disk not better than live resume": the session already holds the
+        // conversation) prints the dump only under STRATA_SPILL_DIAG=1 — every request of a
+        // continuing conversation dumped ~20 lines (the 2026-11-08 log). The two cases worth a
+        // look keep it. The dump reads the manifest itself, so it drains the writer first.
+        const bool dump = disk->diag() || parked_wins || disk_match.tokens <= 0;
+        if (dump) const_cast<ConversationDiskStore*>(disk)->flush_pending();
+        if (dump && disk->size() > 0) {
             std::fprintf(stderr, "[strata diag]   prompt first 5 ids:");
             for (size_t i = 0; i < prompt.size() && i < 5; ++i)
                 std::fprintf(stderr, " %d", (int) prompt32[i]);
@@ -732,6 +828,13 @@ std::optional<SavedConversation> restore_from_disk_or_ram(
     // a smaller pinned-prefix snapshot usually still fits and covers the system prompt, which is
     // the part worth saving. Bounded: three attempts, each a manifest scan and (on failure) a
     // cheap refused read — never a long drain of a big manifest.
+    // The nowait readers may have matched a queued / in-flight image (its serial is not an entry
+    // yet, or the write extends another entry's journal): the disk wins, so drain the writer now
+    // and match again against what landed — take() reads files, never the queue.
+    if (disk->nowait()) {
+        const_cast<ConversationDiskStore*>(disk)->flush_pending();
+        disk_match = const_cast<ConversationDiskStore*>(disk)->best(prompt32, images, cvec);
+    }
     for (int attempt = 0; attempt < 3 && disk_match.tokens > ram_floor; ++attempt) {
         if (auto image = const_cast<ConversationDiskStore*>(disk)->take(disk_match, identity, limits)) {
             std::fprintf(stderr, "[strata diag] disk match: serial=%llu via=%s, tokens=%lld (prompt=%zu)\n",

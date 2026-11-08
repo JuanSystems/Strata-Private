@@ -223,6 +223,11 @@ struct SavedConversation {
     std::shared_ptr<void> pending;
     // STRATA_CKPT_ASYNC: the same for the background copy that fills `live.gdn` (the park's running state)
     std::shared_ptr<void> live_pending;
+    // --conversation-spill-tail-capture: > 0 when this image's K/V parts k/v/k_scale/v_scale hold real bytes only from
+    // the completed page at `tail_from` tokens on (below it the buffers are allocated, never written) - an image only
+    // a delta-journal append whose kept prefix reaches `tail_from` may consume.  0 (every other image): whole.  The
+    // stage images carry their own (the same value).
+    int64_t tail_from = 0;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -502,6 +507,14 @@ public:
 
     // The slot count, so a caller that evicts in a loop has a bound it did not invent.
     size_t slots() const { return slots_; }
+    // The byte budget and how many parked entries hold a pinned shared prefix (make_room never evicts
+    // those while an ordinary one is left) - what a "skip parking" line needs to say why.
+    size_t budget() const { return budget_; }
+    size_t pinned_count() const {
+        size_t n = 0;
+        for (const auto& e : entries_) n += e.pinned() ? 1 : 0;
+        return n;
+    }
 
     // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds

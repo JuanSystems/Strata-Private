@@ -5,6 +5,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -324,6 +325,68 @@ void full_session(int fmt, int mode, int experts) {
               "a layer split's image is refused by the whole-session form");
         ConversationKvReuse wrong{a.kv,65,65,{}};
         check(!conversation_snapshot_capture_bytes(wrong,view,ss,g,nullptr,peak,err),"a draft image's K/V is not a stage's reuse");
+    }
+    {
+        // the disk spill's capture (conversation_snapshot_save_spill): --conversation-spill-states turns cuts the image
+        // at a checkpoint, --conversation-spill-tail-capture copies the K/V only from a tail page on
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,
+              "restore A before the spill captures");
+        SavedConversation whole,tail,cut,from_ckpt,reread;
+        check(conversation_snapshot_save_spill(whole,view,SIZE_MAX,ss,g,&draft.state,0,err),"spill capture: whole");
+        bool same=whole.tail_from==0 && whole.live.ids==a.live.ids && whole.live.gdn==a.live.gdn &&
+                  whole.live.dead==a.live.dead && whole.live.tails==a.live.tails &&
+                  whole.checkpoints.size()==a.checkpoints.size() && whole.kv.size()==a.kv.size();
+        for (size_t j=0;same && j<whole.kv.size();++j) same=equal(whole.kv[j],a.kv[j]);
+        check(same,"a whole spill capture equals conversation_snapshot_save's image");
+        const int64_t from=40;
+        check(conversation_snapshot_save_spill(tail,view,SIZE_MAX,ss,g,&draft.state,from,err),"spill capture: tail");
+        check(tail.tail_from==from && tail.live.gdn==whole.live.gdn && tail.live.dead==whole.live.dead,
+              "a tail capture keeps the running state and marks its tail");
+        bool tail_ok=tail.kv.size()==whole.kv.size();
+        for (size_t j=0;tail_ok && j<tail.kv.size();++j) {
+            const ConversationKv& t=tail.kv[j];
+            const ConversationKv& w=whole.kv[j];
+            const int64_t f=j+1==tail.kv.size() ? from-1 : from;   // the draft layer starts one token earlier
+            const size_t whole_cells=size_t(f/t.page_size)*size_t(t.page_size);
+            const std::array<const ConversationBuffer*,5> tp={&t.k,&t.v,&t.k_scale,&t.v_scale,&t.pooled};
+            const std::array<const ConversationBuffer*,5> wp={&w.k,&w.v,&w.k_scale,&w.v_scale,&w.pooled};
+            tail_ok=t.cells==w.cells && t.pooled_rows==w.pooled_rows && t.page_size==w.page_size;
+            for (size_t i=0;tail_ok && i<5;++i) {
+                tail_ok=tp[i]->size()==wp[i]->size();
+                const size_t keep=(i==4 || !t.cells) ? 0 : wp[i]->size()/size_t(t.cells)*whole_cells;
+                std::vector<uint8_t> x(wp[i]->size()-keep),y(wp[i]->size()-keep);
+                tail_ok=tail_ok && tp[i]->read(x.data(),keep,x.size()) && wp[i]->read(y.data(),keep,y.size()) && x==y;
+            }
+        }
+        check(tail_ok,"a tail capture holds the whole capture's bytes from its tail page on (pooled rows whole)");
+        // the cut at the 3-token checkpoint: conversation_snapshot_save_from_ckpt's image
+        const std::vector<ConversationCheckpoint> cut_chain{checkpoints[0]};
+        const ConversationView cut_view{cut_chain[0].ids,images,cut_chain,true};
+        check(conversation_snapshot_save_spill(cut,view,0,ss,g,&draft.state,0,err),"spill capture: cut at the checkpoint");
+        check(conversation_snapshot_save_from_ckpt(from_ckpt,cut_view,ss,g,&draft.state,err),"the from_ckpt reference");
+        same=cut.live.ids==checkpoints[0].ids && cut.live.gdn==checkpoints[0].gdn && cut.live.dead==checkpoints[0].dead &&
+             cut.checkpoints.size()==1 && cut.checkpoints[0].ids==checkpoints[0].ids &&
+             cut.kv.size()==from_ckpt.kv.size();
+        for (size_t j=0;same && j<cut.kv.size();++j) same=equal(cut.kv[j],from_ckpt.kv[j]);
+        check(same,"the cut image ends at the checkpoint (the checkpoint kept) with from_ckpt's K/V");
+        check(conversation_snapshot_validate(cut,ss,g,&draft.state,err),"the cut image validates");
+        check(conversation_snapshot_restore(cut,ss,g,draft.state,err)==ConversationRestore::restored,"restore the cut image");
+        check(snap_save(reread,cut_view,ss,g,draft.state,err),"capture the restored cut");
+        check(reread.live.gdn==cut.live.gdn && reread.live.dead==cut.live.dead && reread.live.ids==cut.live.ids &&
+              reread.kv[0].k==cut.kv[0].k && reread.kv[0].v==cut.kv[0].v,
+              "a restored cut reads back exactly (running state, K and V)");
+        // the cut and the tail together: the tail of the cut image
+        SavedConversation cut_tail;
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A again");
+        check(conversation_snapshot_save_spill(cut_tail,view,0,ss,g,&draft.state,2,err) && cut_tail.tail_from==2 &&
+              cut_tail.live.ids==checkpoints[0].ids && cut_tail.kv[0].pooled==from_ckpt.kv[0].pooled,
+              "a cut image can be a tail capture too");
+        // what is refused, before any copy
+        check(!conversation_snapshot_save_spill(tail,view,5,ss,g,&draft.state,0,err),"a cut that is not a checkpoint is refused");
+        check(!conversation_snapshot_save_spill(tail,view,SIZE_MAX,ss,g,&draft.state,(int64_t)ids.size()+1,err),
+              "a tail past the end is refused");
+        check(!conversation_snapshot_save_spill(tail,view,0,ss,g,&draft.state,4,err),"a tail past the cut is refused");
+        check(conversation_geometry_key(g)==a.geometry,"conversation_geometry_key is the snapshots' geometry");
     }
     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after stage images");
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
