@@ -77,6 +77,66 @@ inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap, con
     return v;
 }
 
+/// The periodic grid: the next multiple of `every` strictly past `at`. The periodic checkpoints of
+/// a conversation sit at ABSOLUTE positions (every, 2*every, ...), not at `resume + k*every` per
+/// request: a chat that grows in turns far shorter than `every` never reads `every` tokens past
+/// any resume, so the resume-relative rule laid no mid-conversation rung at all - the deepest
+/// periodic stayed where the first long read left it (17,128 in the 2026-11-08 log) while the
+/// conversation grew to 82,191, a prompt that re-rendered history at 41,918 fell back to it, and
+/// the engine re-read 75,105 tokens. On the grid every read that crosses a multiple - the first
+/// long prompt, a big paste, a post-divergence re-read - lays a rung at its first chunk boundary
+/// past it (a read that fits in one chunk lands that boundary on the prompt's end, whose state the
+/// cut path saves anyway), so the ladder keeps refreshing as the conversation grows.
+/// Undefined for `every` <= 0; the callers gate on it.
+inline int64_t next_periodic_at(int64_t at, int64_t every) {
+    return (at / every + 1) * every;
+}
+
+/// The periodic ladder's slot budget: the spill's resume set (spill_resume_checkpoints,
+/// conversation_file.hpp) needs the chain to hold the root, the two deepest `turn` boundaries
+/// and the end-of-prompt checkpoint - four slots - so what is left of `cap` protects the
+/// mid-conversation periodic rungs, at least one from `cap` 5 and none below (the smallest
+/// chains keep today's plain rotation).
+inline int64_t periodic_budget(int64_t cap) { return cap >= 5 ? cap - 4 : 0; }
+
+/// The periodic ladder: `periodic[i]` marks the chain's periodic checkpoints (the caller passes
+/// the --prompt-cache-tail item as periodic=false - the tail rule still drops it first). Up to
+/// `budget` of them act as pinned: a stale turn or end-of-prompt leaf leaves before a rung does,
+/// so the mid-conversation fallback survives the rotation (a rung's stamp goes stale the turn
+/// after it is created - no request mounts through it again while the tail cluster rotates, so
+/// plain least-recent-use ate the ladder the 2026-11-08 log's chain lacked). Over the budget the
+/// ladder thins from the top: the rung directly below the newest periodic leaves - never the
+/// root at index 0, never the newest rung itself (the spill's resume set takes it) - so the kept
+/// rungs spread back from the end towards the root and a re-render d tokens deep re-reads about
+/// d plus the rung gap, instead of falling through to the root. No periodic flags or a budget of
+/// 0: the plain policy, unchanged.
+inline size_t eviction_victim(const uint64_t* stamps, size_t n, int64_t cap, const bool* tail,
+                              const bool* pinned, const bool* periodic, int64_t budget) {
+    if (periodic == nullptr || budget <= 0) return eviction_victim(stamps, n, cap, tail, pinned);
+    if (cap < 2 || n < 2) return 0;   // no room for root and leaf: the pin is off, the oldest leaves
+    auto pin = [&](size_t i) { return (pinned != nullptr && pinned[i]) || periodic[i]; };
+    size_t newest = 0;                // the newest stamp (the item just saved is never the victim)
+    for (size_t i = 1; i < n; ++i)
+        if (stamps[i] > stamps[newest]) newest = i;
+    if (tail != nullptr)              // --prompt-cache-tail: the branch-only item leaves first
+        for (size_t i = 1; i < n; ++i)
+            if (tail[i] && !pin(i) && i != newest) return i;
+    size_t rungs = 0, top = n;        // the periodic rungs, and the ladder's newest position
+    for (size_t i = 0; i < n; ++i)
+        if (periodic[i]) { ++rungs; top = i; }
+    if ((int64_t) rungs > budget)
+        for (size_t i = top; i-- > 1;)   // over budget: the rung directly below the newest leaves
+            if (periodic[i]) return i;
+    size_t v = n;                     // least recent use among the unprotected rest
+    for (size_t i = 1; i < n; ++i)
+        if (!pin(i) && (v == n || stamps[i] < stamps[v])) v = i;
+    if (v != n) return v;
+    v = 1;                            // everything protected: the oldest of them, never the root
+    for (size_t i = 2; i < n; ++i)
+        if (stamps[i] < stamps[v]) v = i;
+    return v;
+}
+
 /// #2409: what a conversation restore can allocate on a card. It writes into session buffers that already exist; the one
 /// thing it may create is the calling thread's private copy stream for that card (conversation_copy.hpp), which it takes
 /// from the pool of finished threads when there is one, and the first launch of the two small residency kernels loads

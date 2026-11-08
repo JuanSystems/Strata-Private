@@ -42,3 +42,27 @@ the system-prompt root (`--prompt-cache-root`), a message boundary (`STRATA_CACH
 
 What `--prompt-cache-every 0` does: it skips the periodic marks and the near-tail one (`--prompt-cache-tail` needs `--prompt-cache-every` above 0), so a client
 that rewrote a turn before the last one mounts a farther mark and reads more of it again. The root mark is controlled by `--prompt-cache-root`.
+
+## The periodic grid is absolute, and the rungs survive the rotation
+
+A periodic mark is laid when a read crosses the next multiple of `--prompt-cache-every`
+of the conversation's own length - not N tokens past the point the request resumed
+from. The resume-relative cadence never fired for a chat that grows in turns shorter
+than N (each request reads only its own tail), so the mid-conversation fallback the
+spill's resume set expects stayed wherever the first long read had left it: the
+2026-11-08 log's chain held 17,128..81,107 with nothing between, and a prompt that
+re-rendered history at 41,918 re-read 75,105 tokens. On the absolute grid every
+read long enough to have a chunk boundary past a multiple - the first long prompt,
+a big paste, a post-divergence re-read - lays a rung there, and the spill's resume
+set carries the deepest rung instead of a fossil.
+
+The retention protects them. What is left of `--prompt-cache` beyond the four slots
+the resume set needs (the pinned root, the two deepest turn boundaries and the
+end-of-prompt checkpoint) keeps periodic rungs alive against the least-recent-use
+rotation - a rung's stamp goes stale the turn after it is laid, so the plain
+rotation ate them. Over that budget the ladder thins from the top: the rung
+directly below the newest periodic leaves, never the newest rung and never the
+root. With the default `--prompt-cache 6` two rungs stay, so a rewrite d tokens
+deep reads about d plus the rung gap instead of falling through to the root;
+raising `--prompt-cache` densifies the ladder. A conversation whose middle never
+saw a long read still pays one deep re-read - the re-read itself lays the ladder.

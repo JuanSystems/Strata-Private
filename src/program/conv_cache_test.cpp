@@ -17,9 +17,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <vector>
 
 using strata::program::conv_cache::eviction_victim;
+using strata::program::conv_cache::next_periodic_at;
+using strata::program::conv_cache::periodic_budget;
 using strata::program::conv_cache::restore_fits;
 using strata::program::conv_cache::spread_victim;
 
@@ -53,8 +56,102 @@ int64_t reuse_after_edit(bool spread, int64_t root, int64_t turn, int turns, int
     return reuse;
 }
 
+// the 2026-11-08 shape: a root, turns of `turn` tokens each arriving after it, a periodic rung laid
+// at each multiple of `every` the growth crosses (the absolute grid - the engine lays the rung at
+// the first chunk boundary past the multiple, which a multi-chunk read always has; grid=false lays
+// none - the resume-relative cadence a chat of turns shorter than `every` never reaches), at most
+// `cap` kept (ladder=false: plain least-recent-use, which eats the stale rungs); returns how many
+// tokens a prompt that re-renders `back` tokens before the end reuses - the deepest checkpoint at
+// or below the rewrite
+int64_t reuse_after_rerender(bool grid, bool ladder, int64_t root, int64_t turn, int64_t every,
+                             int64_t end, int64_t cap, int64_t back) {
+    std::vector<int64_t> lens = {root};
+    std::vector<uint64_t> stamps = {1};
+    std::vector<char> rung = {0};
+    uint64_t clock = 1;
+    int64_t next_grid = (root / every + 1) * every;   // next_periodic_at(root, every)
+    for (int64_t at = root + turn; at <= end; at += turn) {
+        while (next_grid <= at) {                      // the growth crossed a grid point: a rung lands
+            if (grid) {
+                lens.push_back(next_grid);
+                stamps.push_back(++clock);
+                rung.push_back(1);
+            }
+            next_grid += every;
+        }
+        lens.push_back(at);                           // the request's turn / end-of-prompt checkpoint
+        stamps.push_back(++clock);
+        rung.push_back(0);
+        while ((int64_t) lens.size() > cap) {
+            std::unique_ptr<bool[]> per(new bool[lens.size()]);
+            for (size_t i = 0; i < lens.size(); ++i) per[i] = rung[i] != 0;
+            const size_t v = ladder
+                ? eviction_victim(stamps.data(), stamps.size(), cap, nullptr, nullptr, per.get(),
+                                  periodic_budget(cap))
+                : eviction_victim(stamps.data(), stamps.size(), cap);
+            lens.erase(lens.begin() + (std::ptrdiff_t) v);
+            stamps.erase(stamps.begin() + (std::ptrdiff_t) v);
+            rung.erase(rung.begin() + (std::ptrdiff_t) v);
+        }
+    }
+    const int64_t edit = end - back;
+    int64_t reuse = 0;
+    for (int64_t l : lens)
+        if (l <= edit) reuse = l;
+    return reuse;
+}
+
 int main() {
     std::printf("conv_cache_test\n");
+    {   // the periodic grid (next_periodic_at): the rungs sit at ABSOLUTE multiples of `every`, so a
+        // conversation that grows in turns shorter than `every` still lays one every `every` tokens
+        check(next_periodic_at(0, 16384) == 16384, "the grid's first rung: 16384 from token 0, as before");
+        check(next_periodic_at(17128, 16384) == 32768, "a resume mid-cell: the next multiple, not resume + every");
+        check(next_periodic_at(70388, 16384) == 81920,
+              "the 2026-11-08 restart restore (resume 70,388): the rung at 81,920, not 86,772");
+        check(next_periodic_at(81107, 16384) == 81920,
+              "an incremental turn's resume (81,107): the rung at 81,920 - the old rule put it at 97,491, past the end");
+        check(next_periodic_at(81920, 16384) == 98304, "a resume ON the grid: the next cell, never the same cell");
+    }
+    {   // the periodic ladder's budget: the resume set's four slots (root, two turns, end-of-prompt)
+        // come first; what is left of the chain protects rungs, one from --prompt-cache 5
+        check(periodic_budget(6) == 2, "the default --prompt-cache 6: two protected rungs");
+        check(periodic_budget(5) == 1 && periodic_budget(7) == 3 && periodic_budget(8) == 4,
+              "one rung from 5, then one more per slot");
+        check(periodic_budget(4) == 0 && periodic_budget(2) == 0 && periodic_budget(0) == 0,
+              "below 5: no ladder, today's plain rotation");
+    }
+    {   // the ladder, within its budget: the rungs act as pinned - a stale turn or end-of-prompt
+        // leaf leaves before a rung does, however staler the rung's own stamp is
+        const std::vector<uint64_t> st = {1, 2, 3, 50, 51, 52, 53};   // root, RUNG(staler), turn, turn, eop, turn, eop
+        const bool rung[7] = {false, true, false, false, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, nullptr, rung, 2) == 2,
+              "within the budget: a stale turn leaves before a staler rung");
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, nullptr, nullptr, 2) == 1,
+              "no periodic flags: the plain policy takes the stale rung first");
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, nullptr, rung, 0) == 1,
+              "a budget of 0: the plain policy, the stale rung leaves");
+    }
+    {   // the ladder, over its budget: it thins from the top - the rung directly below the newest
+        // periodic leaves, never the newest rung (the spill's resume set takes it), never the root
+        const std::vector<uint64_t> st = {1, 2, 3, 4, 60, 61, 62};    // root, 33512, 66280, 81927, turn, turn, eop
+        const bool rung[7] = {false, true, true, true, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, nullptr, rung, 2) == 2,
+              "over the budget: the rung below the newest leaves (33,512 and 81,927 stay)");
+        const bool two[7] = {false, true, false, true, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, nullptr, two, 1) == 1,
+              "over the budget by one rung only: that rung leaves");
+        const bool rootish[7] = {true, false, false, true, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, nullptr, nullptr, rootish, 1) != 0,
+              "a rung at the root's position: never the victim");
+    }
+    {   // the tail item still leaves first, ladder or not (the caller flags it non-periodic)
+        const std::vector<uint64_t> st = {1, 2, 3, 4, 5, 6, 7};
+        const bool tail[7] = {false, false, false, true, false, false, false};
+        const bool rung[7] = {false, true, false, false, false, false, false};
+        check(eviction_victim(st.data(), st.size(), 6, tail, nullptr, rung, 2) == 3,
+              "the tail rule fires before the ladder protects anything");
+    }
     {   // --prompt-cache-spread: 200 turns of 1,000 tokens after a 9,525-token system prompt, 6 checkpoints
         const int64_t end = 9525 + 200 * 1000;
         const int64_t lru6 = reuse_after_edit(false, 9525, 1000, 200, 6, 6000);
@@ -150,6 +247,24 @@ int main() {
         check(restore_fits(nullptr, none, 2, need) && restore_fits(full, nullptr, 2, need) && restore_fits(full, none, 0, need) &&
                   restore_fits(full, none, 2, 0),
               "no sample, no cards, no need: do not refuse");
+    }
+    {   // the 2026-11-08 log, end to end: a 17,128-token system prompt, ~1K-token turns growing the
+        // conversation to ~82K, --prompt-cache 6, and a client that re-renders history 40,273 tokens
+        // before the end (the divergence at 41,918, resume 17,128, 75,105 tokens re-read)
+        const int64_t end = 17128 + 65 * 1000;   // 82,128
+        const int64_t before = reuse_after_rerender(false, false, 17128, 1000, 16384, end, 6, 40273);
+        const int64_t created = reuse_after_rerender(true, false, 17128, 1000, 16384, end, 6, 40273);
+        const int64_t after = reuse_after_rerender(true, true, 17128, 1000, 16384, end, 6, 40273);
+        std::printf("  a rewrite 40,273 before the end of an 82K conversation: %lld before, %lld with the grid "
+                    "alone, %lld with the grid and the ladder, of %lld\n",
+                    (long long) before, (long long) created, (long long) after, (long long) end);
+        check(before == 17128, "before: the deep rewrite falls through to the root (the 2026-11-08 log)");
+        check(created == 17128, "the grid alone is not enough: least-recent-use still eats the stale rungs");
+        check(after == 32768, "grid and ladder: the rewrite mounts the rung below it, 15,640 deeper than the root");
+        check(reuse_after_rerender(true, true, 17128, 1000, 16384, end, 8, 40273) >= 32768,
+              "--prompt-cache 8: a deeper ladder only reuses more");
+        check(reuse_after_rerender(true, true, 17128, 1000, 16384, end, 6, 1000) == end - 1000,
+              "a rewrite inside the last turn still mounts the turn boundary, as before");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

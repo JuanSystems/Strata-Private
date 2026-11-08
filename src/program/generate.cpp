@@ -12577,7 +12577,8 @@ int main(int argc, char** argv) {
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed
         // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
         // the next, so each stage saves its own part when IT reaches a checkpoint position (the same rule as below:
-        // every `prompt_cache_every` tokens from where the request resumed), and the last stage puts them together.
+        // the ABSOLUTE periodic grid - the next multiple of `prompt_cache_every` past the position, a property of the
+        // conversation rather than of where each request resumed), and the last stage puts them together.
         std::mutex part_mu;
         std::map<int64_t, std::vector<ConvCheckpoint>> part_at;   // position -> one part per stage
         std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
@@ -12765,11 +12766,49 @@ int main(int argc, char** argv) {
                     }
                 std::vector<int64_t> lens;
                 for (const ConvCheckpoint& k : checks) lens.push_back((int64_t) k.ids.size());
-                const size_t victim = o.prompt_cache_spread
-                    ? strata::program::conv_cache::spread_victim(lens.data(), stamps.data(), stamps.size(),
-                                                                 o.prompt_cache, tail_flags.get(), pin_flags.get())
-                    : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
-                                                                   tail_flags.get(), pin_flags.get());
+                // the periodic ladder (conv_cache.hpp): the mid-conversation rungs - the checkpoints a deep
+                // re-render falls back to, and the one the spill's resume set persists for a restart - survive
+                // the rotation within periodic_budget(o.prompt_cache) slots. Their stamps go stale the turn
+                // after they are laid (nothing mounts through them while the tail cluster rotates), so without
+                // this the least-recent-use rule ate every rung but the newest and a rewrite of old history
+                // fell through to the root (the 2026-11-08 log: checks 17128..81107 with nothing between).
+                // The --prompt-cache-tail item is kinded periodic but is NOT a rung: it stays first out.
+                std::unique_ptr<bool[]> periodic_flags;
+                size_t n_periodic = 0;
+                const int64_t ladder_budget = strata::program::conv_cache::periodic_budget(o.prompt_cache);
+                if (ladder_budget > 0) {
+                    periodic_flags.reset(new bool[checks.size()]);
+                    for (size_t i = 0; i < checks.size(); ++i) {
+                        periodic_flags[i] = checks[i].kind == strata::core::CheckpointKind::periodic &&
+                                            !is_tail[i];
+                        n_periodic += periodic_flags[i] ? 1 : 0;
+                    }
+                }
+                size_t victim = SIZE_MAX;
+                if ((int64_t) n_periodic > ladder_budget) {
+                    // over the ladder's budget: the rung directly below the newest periodic leaves (the
+                    // kept rungs spread back from the end towards the root); the tail rule still fires first
+                    victim = strata::program::conv_cache::eviction_victim(
+                        stamps.data(), stamps.size(), o.prompt_cache, tail_flags.get(), pin_flags.get(),
+                        periodic_flags.get(), ladder_budget);
+                } else if (n_periodic > 0) {
+                    // within the budget the rungs act as pinned for either policy: the tail item and the
+                    // stale turn/end-of-prompt leaves rotate in front of them
+                    std::unique_ptr<bool[]> pin_eff(new bool[checks.size()]);
+                    for (size_t i = 0; i < checks.size(); ++i)
+                        pin_eff[i] = (pin_flags != nullptr && pin_flags[i]) || periodic_flags[i];
+                    victim = o.prompt_cache_spread
+                        ? strata::program::conv_cache::spread_victim(lens.data(), stamps.data(), stamps.size(),
+                                                                     o.prompt_cache, tail_flags.get(), pin_eff.get())
+                        : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
+                                                                       tail_flags.get(), pin_eff.get());
+                } else {
+                    victim = o.prompt_cache_spread
+                        ? strata::program::conv_cache::spread_victim(lens.data(), stamps.data(), stamps.size(),
+                                                                     o.prompt_cache, tail_flags.get(), pin_flags.get())
+                        : strata::program::conv_cache::eviction_victim(stamps.data(), stamps.size(), o.prompt_cache,
+                                                                       tail_flags.get(), pin_flags.get());
+                }
                 ckpt_pool.give(std::move(checks[victim]));   // (STRATA_CKPT_POOL; else nothing)
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
@@ -12866,7 +12905,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: checkpoint at %lld skipped: its state could not be copied out (see "
                                          "above); the request goes on without it\n", (long long) done);
                 }
-                if (periodic_checkpoint) pp_next_check = done + o.prompt_cache_every;
+                if (periodic_checkpoint)
+                    pp_next_check = strata::program::conv_cache::next_periodic_at(done, o.prompt_cache_every);
                 if (tail_checkpoint) pp_tail_saved = true;
             }
             return true;
@@ -12879,7 +12919,7 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
                     if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
-                    part_next[i] = done + o.prompt_cache_every;
+                    part_next[i] = strata::program::conv_cache::next_periodic_at(done, o.prompt_cache_every);
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
                     if (!checkpoint_save(part, stage_ss, g)) {
@@ -16942,9 +16982,18 @@ int main(int argc, char** argv) {
                     }
                 }
                 const int64_t live_div = live.empty() ? -2 : diverge_at(live);
+                // the periodic rungs the chain holds (the mid-conversation fallback a deep re-render
+                // mounts): the 2026-11-08 log's chain had the slot stuck at 17,128 - periodic=1 with
+                // checks 17128..81107 - and the re-render at 41,918 read 75,105 tokens again
+                size_t n_periodic_diag = 0;
+                for (const ConvCheckpoint& c : checks)
+                    if (c.kind == strata::core::CheckpointKind::periodic &&
+                        !(tail_ckpt_len >= 0 && (int64_t) c.ids.size() == tail_ckpt_len))
+                        ++n_periodic_diag;
                 std::fprintf(stderr, "[strata diag] request: prompt=%lld tok, resume=%lld (%s); live(ok=%d, %zu tok, "
                                      "diverge@%lld); checks=%zu (longest %lld, diverge@%lld, best %lld div@%lld); "
-                                     "ram_parked=%zu (best match %lld); cvec=%d/%d, imgs=%zu, every=%lld tail=%d\n",
+                                     "ram_parked=%zu (best match %lld); cvec=%d/%d, imgs=%zu, every=%lld tail=%d "
+                                     "periodic=%zu\n",
                              (long long) n, (long long) resume,
                              from_live ? "live" : (resume > 0 ? "checkpoint" : "none"),
                              live_ok ? 1 : 0, live.size(), (long long) live_div,
@@ -16952,7 +17001,7 @@ int main(int argc, char** argv) {
                              (long long) best_len, (long long) best_div,
                              conversations.size(), (long long) parked.tokens,
                              (int) want_cvec, (int) cvec_cached, req_imgs.size(),
-                             (long long) o.prompt_cache_every, o.prompt_cache_tail ? 1 : 0);
+                             (long long) o.prompt_cache_every, o.prompt_cache_tail ? 1 : 0, n_periodic_diag);
             }
             if (want_cvec != cvec_cached) {
                 live_ok = false;
@@ -17117,7 +17166,18 @@ int main(int argc, char** argv) {
             pp_reached = read_from;
             pp_exact = true;   // a restore, a checkpoint mount or a zeroed session: the state is exactly at read_from
             pp_t0 = r0;
-            pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
+            // the periodic grid is ABSOLUTE (multiples of `every` of the conversation's own length), not
+            // `resume + k*every`: a chat that grows in turns shorter than `every` never reads `every` tokens
+            // past any resume, so the resume-relative rule created no mid-conversation rung at all - the
+            // deepest periodic stayed where the first long read left it (17,128 in the 2026-11-08 log) while
+            // the conversation grew to 82,191, and a prompt that re-rendered history at 41,918 fell back to
+            // it and re-read 75,105 tokens. On the grid, any read that crosses the next multiple - the first
+            // long prompt, a big paste, a post-divergence re-read - lays a rung at its first chunk boundary
+            // past it (a single-chunk read's boundary is the prompt's end, whose checkpoint the cut path
+            // saves anyway), and the spill's resume set carries the deepest rung instead of a fossil.
+            pp_next_check = reread_to > 0 || !req_ckpt || o.prompt_cache_every <= 0
+                                ? INT64_MAX
+                                : strata::program::conv_cache::next_periodic_at(resume, o.prompt_cache_every);   // ckpt=0: none
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
             {
                 std::lock_guard<std::mutex> lk(part_mu);
