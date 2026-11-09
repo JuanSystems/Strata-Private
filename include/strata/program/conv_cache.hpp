@@ -92,6 +92,20 @@ inline int64_t next_periodic_at(int64_t at, int64_t every) {
     return (at / every + 1) * every;
 }
 
+/// --prompt-cache-before-turn N (opt-in): where a request's extra checkpoint goes - N tokens before its turn
+/// boundary `turn_at`, inside what the request reads (past `read_from`). The turn checkpoint is what the next turn
+/// resumes from, but a client that re-renders the END of its last message on a retry (zoocode refreshes the
+/// environment_details timestamp after a stop or a restart) diverges before it, and the resume fell back to the
+/// previous turn's boundary: the 2026-11-09 log diverged at 47,327 with the turn at 47,437 and read 2,517 tokens
+/// again from 45,010. A point N before the boundary still matches when the rewrite is less than N deep. The engine
+/// keeps one alive, outside the --prompt-cache budget and never the victim, so the rest of the chain rotates as
+/// without it. -1 = none: N <= 0, no turn boundary, or the point is not past `read_from`.
+inline int64_t before_turn_checkpoint_at(int64_t read_from, int64_t turn_at, int64_t distance) {
+    if (distance <= 0 || turn_at <= 0 || read_from < 0) return -1;
+    const int64_t at = turn_at - distance;
+    return at > read_from ? at : -1;
+}
+
 /// The periodic ladder's slot budget: the spill's resume set (spill_resume_checkpoints,
 /// conversation_file.hpp) needs the chain to hold the root, the two deepest `turn` boundaries
 /// and the end-of-prompt checkpoint - four slots - so what is left of `cap` protects the

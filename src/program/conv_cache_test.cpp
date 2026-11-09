@@ -15,6 +15,7 @@
 //   5. the policy is pure: the same stamps, the same victim.
 #include "strata/program/conv_cache.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -99,6 +100,121 @@ int64_t reuse_after_rerender(bool grid, bool ladder, int64_t root, int64_t turn,
     for (int64_t l : lens)
         if (l <= edit) reuse = l;
     return reuse;
+}
+
+// --prompt-cache-before-turn: generate.cpp's checkpoint_at for the cut checkpoints, in miniature. A save at a new
+// length pushes it (the before-turn one replaces the previous request's), then the chain is trimmed to the budget
+// plus the one before-turn checkpoint alive, the victim chosen as the engine's loop chooses it (the ladder over the
+// periodic rungs, the before-turn one flagged like a pin). A request first drops what its prompt no longer starts
+// with and mounts the checkpoint it resumes from.
+struct BeforeTurnChain {
+    struct Item { int64_t len; uint64_t stamp; int kind; };   // kind: 0 periodic rung, 1 turn, 4 end of prompt, 5 message
+    std::vector<Item> items;
+    uint64_t clock = 0;
+    int64_t before_len = -1;
+    int64_t cap = 6;
+    size_t most = 0;   // the most items the chain held
+    bool is_before(const Item& it) const { return before_len >= 0 && it.len == before_len; }
+    void prune_past(int64_t d) {   // the prompt matches [0, d): longer checkpoints are no prefix of it
+        items.erase(std::remove_if(items.begin(), items.end(), [&](const Item& it) { return it.len > d; }), items.end());
+    }
+    void mount(int64_t at) {
+        for (Item& it : items)
+            if (it.len == at) it.stamp = ++clock;
+    }
+    void save(int64_t at, int kind, bool as_before) {
+        for (Item& it : items)
+            if (it.len == at) {
+                it.stamp = ++clock;
+                if (!as_before && kind != 0 && it.kind == 0) it.kind = kind;
+                if (!as_before && at == before_len) before_len = -1;
+                return;
+            }
+        if (as_before) {
+            const int64_t old = before_len;
+            items.erase(std::remove_if(items.begin(), items.end(), [&](const Item& it) { return old >= 0 && it.len == old; }),
+                        items.end());
+            before_len = at;
+        } else if (at == before_len) {
+            before_len = -1;
+        }
+        items.push_back({at, ++clock, kind});
+        if (before_len >= 0 && std::none_of(items.begin(), items.end(), [&](const Item& it) { return is_before(it); }))
+            before_len = -1;
+        const int64_t extra = before_len >= 0 ? 1 : 0;
+        while ((int64_t) items.size() > cap + extra) {
+            const size_t n = items.size();
+            std::vector<uint64_t> stamps;
+            std::unique_ptr<bool[]> tail(new bool[n]);
+            for (size_t i = 0; i < n; ++i) { stamps.push_back(items[i].stamp); tail[i] = false; }
+            std::unique_ptr<bool[]> pin;
+            for (const Item& it : items)
+                if (is_before(it)) {
+                    pin.reset(new bool[n]);
+                    for (size_t i = 0; i < n; ++i) pin[i] = is_before(items[i]);
+                    break;
+                }
+            const int64_t budget = periodic_budget(cap);
+            std::unique_ptr<bool[]> per;
+            size_t n_per = 0;
+            if (budget > 0) {
+                per.reset(new bool[n]);
+                for (size_t i = 0; i < n; ++i) { per[i] = items[i].kind == 0; n_per += per[i] ? 1 : 0; }
+            }
+            size_t v;
+            if ((int64_t) n_per > budget) {
+                v = eviction_victim(stamps.data(), n, cap, tail.get(), pin.get(), per.get(), budget);
+            } else if (n_per > 0) {
+                std::unique_ptr<bool[]> eff(new bool[n]);
+                for (size_t i = 0; i < n; ++i) eff[i] = (pin != nullptr && pin[i]) || per[i];
+                v = eviction_victim(stamps.data(), n, cap, tail.get(), eff.get());
+            } else {
+                v = eviction_victim(stamps.data(), n, cap, tail.get(), pin.get());
+            }
+            items.erase(items.begin() + (std::ptrdiff_t) v);
+        }
+        most = std::max(most, items.size());
+    }
+    std::vector<int64_t> lens(bool with_before) const {
+        std::vector<int64_t> out;
+        for (const Item& it : items)
+            if (with_before || !is_before(it)) out.push_back(it.len);
+        return out;
+    }
+    int64_t resume_for(int64_t d) const {   // the deepest checkpoint a prompt matching [0, d) can mount
+        int64_t r = 0;
+        for (const Item& it : items)
+            if (it.len <= d) r = std::max(r, it.len);
+        return r;
+    }
+};
+
+// The 2026-11-09 log's conversation (conv-...872): every request's resume point, prompt length and turn boundary.
+// The fifth one goes on from the live session (3 tokens past it, no turn boundary among them); the others resume at
+// the previous turn checkpoint, the client having stripped the reply's thinking. Returns the chain after the request
+// that was stopped (prompt 47,468), with `distance` as --prompt-cache-before-turn (0 = off).
+BeforeTurnChain before_turn_log(int64_t distance) {
+    struct Req { int64_t resume, n, turn; bool live; };
+    const Req reqs[] = {{17128, 31355, 31324, false}, {31324, 34421, 34390, false}, {34390, 36049, 36018, false},
+                        {36018, 41379, 41348, false}, {44070, 44073, -1, true},     {41348, 42895, 42864, false},
+                        {42864, 43755, 43724, false}, {43724, 44180, 44149, false}, {44149, 45041, 45010, false},
+                        {45010, 47468, 47437, false}};
+    BeforeTurnChain c;
+    c.save(17128, 1, false);   // what the earlier conversation left that this one starts with
+    int64_t next_grid = next_periodic_at(17128, 16384);
+    for (const Req& r : reqs) {
+        if (!r.live) c.prune_past(r.resume + 1);   // diverge@resume+1: the reply was rendered anew
+        c.mount(r.resume);
+        while (next_grid < r.n - 1) {   // the read crossed a grid point: a rung (at its first chunk boundary past it)
+            if (next_grid > r.resume) c.save(next_grid, 0, false);
+            next_grid += 16384;
+        }
+        const int64_t before = strata::program::conv_cache::before_turn_checkpoint_at(r.resume, r.turn, distance);
+        if (before >= 0) c.save(before, 5, true);
+        if (r.turn >= 0) c.save(r.turn, 1, false);
+        c.save(r.n - 1, 4, false);
+    }
+    return c;
 }
 
 int main() {
@@ -295,6 +411,47 @@ int main() {
             if (!spill_gain_skips(t, disk, 2048)) { disk = t; ++writes; }
         std::printf("  the 2026-11-08 log: %d of 17 backups write with --conversation-spill-gain 2048\n", writes);
         check(writes == 2, "the log's 17 backups shrink to 2 with gain 2048");
+    }
+    // --prompt-cache-before-turn: where the point goes, and the 2026-11-09 log's retry after a stop (the client
+    // re-rendered the end of its last message: the prompt diverged at 47,327, the turn boundary was 47,437)
+    {
+        using strata::program::conv_cache::before_turn_checkpoint_at;
+        check(before_turn_checkpoint_at(45010, 47437, 512) == 46925, "512 before the turn boundary at 47,437: 46,925");
+        check(before_turn_checkpoint_at(45010, 47437, 0) == -1, "distance 0 (the default): none");
+        check(before_turn_checkpoint_at(47000, 47437, 512) == -1, "the point is before what the request reads: none");
+        check(before_turn_checkpoint_at(46925, 47437, 512) == -1, "the point is where the read starts: none");
+        check(before_turn_checkpoint_at(45010, -1, 512) == -1, "no turn boundary (a read from the live session): none");
+        check(before_turn_checkpoint_at(-1, 47437, 512) == -1 && before_turn_checkpoint_at(45010, 47437, -5) == -1,
+              "a negative start or distance: none");
+        const BeforeTurnChain off = before_turn_log(0), on = before_turn_log(512);
+        check(off.lens(true) == on.lens(false), "the rest of the chain is the same with the option as without");
+        check(on.before_len == 46925 && on.lens(true).size() == off.lens(true).size() + 1,
+              "with it, one more checkpoint: at 46,925");
+        check(off.most <= 6 && on.most <= 7, "at most 6 checkpoints without it, 6 + 1 with it");
+        const int64_t d = 47327;
+        const int64_t r_off = off.resume_for(d), r_on = on.resume_for(d);
+        std::printf("  the retry diverging at 47,327 resumes at %lld without it (%lld read), at %lld with 512 (%lld read)\n",
+                    (long long) r_off, (long long) (47527 - r_off), (long long) r_on, (long long) (47527 - r_on));
+        check(r_off == 45010 && 47527 - r_off == 2517, "without it: 45,010 and 2,517 tokens read, as in the log");
+        check(r_on == 46925 && 47527 - r_on == 602, "with 512: 46,925 and 602 tokens read");
+        const int64_t deep = 47437 - 1289;   // the earlier test's rewrite, 1,289 before the turn boundary
+        check(on.resume_for(deep) == off.resume_for(deep) && off.resume_for(deep) == 45010,
+              "a rewrite deeper than 512: the previous turn, as without it");
+        // the retry itself (prompt 47,527, turn boundary 31 before its end): its own point replaces the old one
+        BeforeTurnChain retry = on;
+        retry.prune_past(d);
+        retry.mount(r_on);
+        const int64_t turn2 = 47527 - 31, before2 = before_turn_checkpoint_at(r_on, turn2, 512);
+        if (before2 >= 0) retry.save(before2, 5, true);
+        retry.save(turn2, 1, false);
+        retry.save(47527 - 1, 4, false);
+        const auto has = [&](int64_t l) {
+            const std::vector<int64_t> v = retry.lens(true);
+            return std::find(v.begin(), v.end(), l) != v.end();
+        };
+        check(before2 == turn2 - 512 && retry.before_len == before2 && !has(46925) && has(before2),
+              "the retry's own point replaces the previous one: one alive");
+        check(retry.most <= 7 && has(45010) && has(turn2), "the previous turn and the new turn boundary stay");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

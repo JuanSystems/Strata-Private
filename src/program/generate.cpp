@@ -1010,6 +1010,9 @@ struct Options {
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
+    /// --prompt-cache-before-turn N (opt-in, 0 = off): one more checkpoint N tokens before the turn boundary of a
+    /// request that reads past that point, kept outside the --prompt-cache budget (conv_cache::before_turn_checkpoint_at)
+    int64_t prompt_cache_before_turn = 0;
     bool prompt_cache_spread = false;   ///< --prompt-cache-spread: keep checkpoints spread back from the end, not the latest
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
@@ -1203,6 +1206,9 @@ void usage() {
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
+                 "  --prompt-cache-before-turn N  --serve: one more checkpoint N tokens before the turn boundary, so a\n"
+                 "                       client that rewrites the end of its last message (a retry after a stop) reads\n"
+                 "                       about N again, not the whole turn; one alive, outside --prompt-cache (default 0 = off)\n"
                  "  --prompt-cache-spread  --serve: keep the checkpoints spread back from the conversation's end (dense\n"
                  "                       near it, thinner further back) instead of the most recently used: a client that\n"
                  "                       rewrites its history N tokens back reads about N again, not the whole conversation\n"
@@ -3723,6 +3729,8 @@ int main(int argc, char** argv) {
         else if (a == "--conversation-idle-spill-seconds")
             o.conversation_idle_spill_s = std::atoll(next("--conversation-idle-spill-seconds"));
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+        else if (a == "--prompt-cache-before-turn")
+            o.prompt_cache_before_turn = std::max(0LL, std::atoll(next("--prompt-cache-before-turn")));
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -11909,6 +11917,7 @@ int main(int argc, char** argv) {
         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env(), ckpt_pool_cap_env());
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
+        int64_t before_ckpt_len = -1;   // --prompt-cache-before-turn: the length of the one such checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
         // checkpoints taken inside it
         ConvCheckpoint::PromptPlan seg_plan;
@@ -12791,8 +12800,10 @@ int main(int argc, char** argv) {
             return false;
         };
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
+        // as_before: the --prompt-cache-before-turn checkpoint (one alive, outside the budget, never the victim)
         auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
-                                 strata::core::CheckpointKind kind = strata::core::CheckpointKind::periodic) -> bool {
+                                 strata::core::CheckpointKind kind = strata::core::CheckpointKind::periodic,
+                                 bool as_before = false) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
@@ -12802,13 +12813,15 @@ int main(int argc, char** argv) {
                     // the same length) keeps the specific kind the position already had, and a
                     // `turn` re-touch promotes an end_of_prompt (the position was the last prompt's
                     // end and is now a surviving turn boundary of the re-rendered history — the
-                    // spill's resume set wants it as a turn).
-                    if (kind != strata::core::CheckpointKind::periodic &&
+                    // spill's resume set wants it as a turn). The before-turn cut changes nothing
+                    // here: a periodic rung read up to its position stays a rung of the ladder.
+                    if (!as_before && kind != strata::core::CheckpointKind::periodic &&
                         (c.kind == strata::core::CheckpointKind::periodic ||
                          (c.kind == strata::core::CheckpointKind::end_of_prompt &&
                           kind == strata::core::CheckpointKind::turn)))
                         c.kind = kind;
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
+                    if (!as_before && L == before_ckpt_len) before_ckpt_len = -1;   // another cut lands here: a normal item
                     return true;
                 }
             ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
@@ -12930,10 +12943,29 @@ int main(int argc, char** argv) {
             } else if (L == tail_ckpt_len) {
                 tail_ckpt_len = -1;   // the flagged tail was dropped and a normal checkpoint takes its length
             }
+            if (as_before) {   // --prompt-cache-before-turn: only one stays alive, the previous request's goes
+                const int64_t old_before = before_ckpt_len;
+                auto old = [&](const ConvCheckpoint& k) { return old_before >= 0 && (int64_t) k.ids.size() == old_before; };
+                if (ckpt_pool.on())
+                    ckpt_pool.erase_if(checks, old);
+                else
+                    checks.erase(std::remove_if(checks.begin(), checks.end(), old), checks.end());
+                before_ckpt_len = L;
+            } else if (L == before_ckpt_len) {
+                before_ckpt_len = -1;   // the flagged one was dropped and a normal checkpoint takes its length
+            }
             checks.push_back(std::move(c));
             const Clock::time_point te0 = Clock::now();
             const size_t before_evict = checks.size();
-            while ((int) checks.size() > o.prompt_cache) {
+            // --prompt-cache-before-turn: the one alive is outside the budget and never the victim, so the rest of the
+            // chain rotates exactly as without it (conv_cache_test walks that). Gone from the chain (a prune, a prompt
+            // that diverged before it): nothing is flagged any more.
+            auto is_before = [&](const ConvCheckpoint& k) {
+                return before_ckpt_len >= 0 && (int64_t) k.ids.size() == before_ckpt_len;
+            };
+            if (before_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), is_before)) before_ckpt_len = -1;
+            const int before_extra = before_ckpt_len >= 0 ? 1 : 0;
+            while ((int) checks.size() > o.prompt_cache + before_extra) {
                 std::vector<uint64_t> stamps;
                 std::vector<char> is_tail;
                 stamps.reserve(checks.size());
@@ -12944,12 +12976,13 @@ int main(int argc, char** argv) {
                 // the tail checkpoint serves only a branch of the last request: it leaves before a periodic one
                 std::unique_ptr<bool[]> tail_flags(new bool[is_tail.size()]);
                 for (size_t i = 0; i < is_tail.size(); ++i) tail_flags[i] = is_tail[i] != 0;
-                // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without)
+                // the pin=N prefix is never the victim (flags only when one is pinned: nothing changes without); the
+                // before-turn checkpoint is flagged the same way
                 std::unique_ptr<bool[]> pin_flags;
                 for (const ConvCheckpoint& k : checks)
-                    if (k.pinned) {
+                    if (k.pinned || is_before(k)) {
                         pin_flags.reset(new bool[checks.size()]);
-                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned;
+                        for (size_t i = 0; i < checks.size(); ++i) pin_flags[i] = checks[i].pinned || is_before(checks[i]);
                         break;
                     }
                 std::vector<int64_t> lens;
@@ -16009,6 +16042,9 @@ int main(int argc, char** argv) {
                                 if (tail_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
                                         return int64_t(c.ids.size()) == tail_ckpt_len;
                                     })) tail_ckpt_len = -1;
+                                if (before_ckpt_len >= 0 && std::none_of(checks.begin(), checks.end(), [&](const auto& c) {
+                                        return int64_t(c.ids.size()) == before_ckpt_len;
+                                    })) before_ckpt_len = -1;
                                 std::fprintf(stderr, "strata serve: save reclaimed %zu checkpoints, %zu parked, "
                                                      "%zu host bytes; checking RAM again\n",
                                              freed.checkpoints, freed.parked, freed.bytes);
@@ -16521,6 +16557,7 @@ int main(int argc, char** argv) {
                 live_ok = false;
                 checks.clear();
                 tail_ckpt_len = -1;
+                before_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
@@ -18607,9 +18644,30 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // --prompt-cache-before-turn N (opt-in): one more cut N tokens before the turn boundary.  A client that
+            // re-renders the end of its last message on a retry (a refreshed timestamp after a stop or a restart)
+            // diverges before the turn checkpoint; this one still matches, so the retry reads about N tokens again
+            // instead of everything since the previous turn.  A cut like the others, so a layer split saves every
+            // stage's part at the same token.  Where another cut already lands there is nothing to add.
+            int64_t before_at = o.prompt_cache > 0
+                ? strata::program::conv_cache::before_turn_checkpoint_at(read_from, turn_at, o.prompt_cache_before_turn)
+                : -1;
+            if (before_at >= 0 && (before_at == reread_to || before_at == root_at || before_at == message_at ||
+                                   before_at == pin_at || before_at >= n - 1))
+                before_at = -1;
+            if (before_at >= 0) {
+                static bool said_before = false;
+                if (!said_before) {
+                    said_before = true;
+                    std::fprintf(stderr, "strata serve: --prompt-cache-before-turn %lld: one more checkpoint at %lld, "
+                                         "before the turn boundary at %lld (said once)\n",
+                                 (long long) o.prompt_cache_before_turn, (long long) before_at, (long long) turn_at);
+                }
+            }
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
-            if (pin_at >= 0) {
-                cuts.push_back(pin_at);
+            if (pin_at >= 0 || before_at >= 0) {
+                if (pin_at >= 0) cuts.push_back(pin_at);
+                if (before_at >= 0) cuts.push_back(before_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
             }
             int64_t at = read_from;
@@ -18710,14 +18768,18 @@ int main(int argc, char** argv) {
                 // n - 1 is end_of_prompt — under --tail-role-token that one carries the
                 // effort-tail system turn the next prompt does NOT re-send (never a prefix),
                 // which is exactly the distinction the spill's resume-set selection reads.
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at || (req_ckpt && to == n - 1)) &&
+                // before_at is kinded `message` (a point inside the history, not a turn boundary): the spill's
+                // resume set takes it only as the deepest checkpoint below a --conversation-spill-states turns cut.
+                if ((to == turn_at || to == root_at || to == message_at || to == pin_at || to == before_at ||
+                     (req_ckpt && to == n - 1)) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at &&
                                    to != n - 1,
                                    to == n - 1 ? strata::core::CheckpointKind::end_of_prompt
                                    : to == turn_at ? strata::core::CheckpointKind::turn
                                    : to == root_at ? strata::core::CheckpointKind::root
                                    : to == pin_at ? strata::core::CheckpointKind::pin
-                                   : strata::core::CheckpointKind::message)) {   // the tail kind leaves first
+                                   : strata::core::CheckpointKind::message,   // the tail kind leaves first
+                                   to == before_at)) {
                     if (!ckpt_why.empty() || !checkpoint_failure_is_survivable()) {   // #3350: only an unwell GPU ends the request
                         std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                         return 1;
