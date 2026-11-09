@@ -58,6 +58,46 @@ static bool is_prefix_entry(const DiskEntry& e) {
     return e.prefix || prefix_snapshot(e);
 }
 
+// A CONVERSATION image never lands with the prefix shape. The turns cut (--conversation-spill-states
+// turns) captures a conversation at its deepest turn checkpoint: the live state IS that checkpoint,
+// and the chain kept it as well, so the entry looked exactly like a pinned shared prefix and every
+// protection above took it for one — take() looked for its stage files under the pfx- name (a
+// layer split restored 0 stages, the image was discarded and the prompt re-read from token 0),
+// find_delta_base skipped it as a base and counted its length as the pinned root (every later park
+// of every conversation wrote whole), and the LRU spared it. A checkpoint as long as the live state
+// holds the live's own ids and running state: dropping it loses no resume point (best() and the
+// engine match the live ids as a prefix the same way) and the file carries one running state less
+// per image. Only the cut has a TURN checkpoint at the live end — an ordinary park's turn
+// checkpoint sits before the prompt's effort tail and the reply, so the default path writes what
+// it always wrote, and a prefix written under the conv- name keeps its shape. The stage images'
+// chains are index-aligned with the main's: the same lengths go. Returns how many of the main
+// image's checkpoints went.
+static size_t drop_live_checkpoints(SavedConversation& image) {
+    const size_t n = image.live.ids.size();
+    const ConversationCheckpoint* deepest = spill_resume_checkpoint(image.checkpoints);
+    if (n == 0 || deepest == nullptr || deepest->ids.size() != n) return 0;
+    bool turn_cut = false;
+    for (const auto& c : image.checkpoints)
+        if (c.kind == CheckpointKind::turn && c.ids.size() == n && c.ids == image.live.ids) { turn_cut = true; break; }
+    if (!turn_cut) return 0;
+    auto drop = [n](std::vector<ConversationCheckpoint>& chain) {
+        const size_t before = chain.size();
+        chain.erase(std::remove_if(chain.begin(), chain.end(),
+                                   [n](const ConversationCheckpoint& c) { return c.ids.size() >= n; }),
+                    chain.end());
+        return before - chain.size();
+    };
+    const size_t dropped = drop(image.checkpoints);
+    for (auto& st : image.stage_images) drop(st.checkpoints);
+    if (dropped > 0) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            std::fprintf(stderr, "strata serve: conversation spill: a backup cut at its turn checkpoint keeps that "
+                                 "state once, as the live state (the duplicate checkpoint is not written)\n");
+    }
+    return dropped;
+}
+
 // ── Delta-base lineage: the identity guard of the common-prefix cut ────────────────────────
 // The client's re-render between parks rewrites the region around the old capture's last turn
 // boundary, so the common prefix of two successive parks of ONE conversation ends just below
@@ -256,6 +296,7 @@ bool ConversationDiskStore::put_async(SavedConversation&& image, uint64_t serial
                                       const SessionFileIdentity& id, const SessionWriteOptions& options,
                                       bool prefix) {
     if (!enabled()) return false;
+    if (!prefix) drop_live_checkpoints(image);   // before the nowait view and the delta selection see it
     PendingWrite p;
     p.serial = serial;
     p.id = id;
@@ -1072,6 +1113,7 @@ bool ConversationDiskStore::put(SavedConversation&& image, uint64_t serial,
                                 bool prefix) {
     if (!enabled()) return false;
     flush_pending();   // never two writers at once; the sync path writes on the calling thread
+    if (!prefix) drop_live_checkpoints(image);
     return put_impl(std::move(image), serial, id, options, prefix);
 }
 
@@ -1393,7 +1435,12 @@ std::optional<SavedConversation> ConversationDiskStore::take(const ConversationC
     // read fails the whole take — a partial image would restore as fewer stages than the engine
     // has and be discarded by its stage count check anyway; keep the files (same policy as a
     // failed main read) and let the engine recompute.
-    const bool entry_pfx = is_prefix_entry(*e);
+    // The FILE NAMES follow the name the entry was written under (e->prefix: pfx- or conv-, the
+    // same flag reload derives from the name), never the prefix SHAPE: a conv- entry with the
+    // shape (a turns cut written before drop_live_checkpoints, or a prefix an older build wrote
+    // under the conv- name) keeps its stage files as conv-<serial>.stage<k>.bin. Looking them up
+    // under pfx- restored 0 stages and the layer split discarded the image.
+    const bool entry_pfx = e->prefix;
     for (size_t k = 0; ; ++k) {
         std::error_code ec;
         const std::string spath = path_for_stage(m.serial, k, entry_pfx);

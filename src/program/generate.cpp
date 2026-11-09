@@ -16792,9 +16792,10 @@ int main(int argc, char** argv) {
                                      "engine has %zu)\n",
                              incoming->stage_images.size(), stages.size());
                 if (incoming_from_disk && incoming->stage_images.empty() && !stages.empty())
-                    std::fprintf(stderr, "[strata diag]   the spill file predates per-stage spill files "
-                                         "(written by an older build without conv-*.stage<k>.bin); it "
-                                         "cannot restore under this layer split and will be superseded\n");
+                    std::fprintf(stderr, "[strata diag]   no stage file was read with the spill (an older "
+                                         "build that wrote no conv-*.stage<k>.bin, or a stage file that is "
+                                         "gone); it cannot restore under this layer split and will be "
+                                         "superseded\n");
                 std::fprintf(stderr, "strata serve: conversation cache: discard snapshot (stage count)\n");
                 incoming.reset();
             }

@@ -3079,6 +3079,107 @@ int main() {
         junsetenv("STRATA_SPILL_JOURNAL");
     }
 
+    // ── 61. The turns cut (--conversation-spill-states turns) on a layer split. A backup cut at its
+    // turn checkpoint has live == that checkpoint: the shape of a pinned shared prefix. The store
+    // keeps that state once (as the live), so the entry stays a conversation — not a pinned root,
+    // its stage file restores, the next turn's backup appends to it, and all of it survives a
+    // restart. A cut file written the old way (the duplicate on disk: the prefix shape under the
+    // conv- name) still restores its stage file ──────────────────────────────────────────────────
+    {
+        jsetenv("STRATA_SPILL_JOURNAL", "1");
+        auto cut_of = [](SavedConversation s) {   // what conversation_snapshot_save_spill's cut returns
+            ConversationCheckpoint t = s.live;
+            t.kind = CheckpointKind::turn;
+            s.checkpoints.push_back(t);
+            for (auto& st : s.stage_images) {
+                st.live = s.live;
+                st.checkpoints = s.checkpoints;
+            }
+            return s;
+        };
+        auto prompt_after = [](const SavedConversation& s, int32_t next) {
+            std::vector<int32_t> p = s.live.ids;
+            p.push_back(next);
+            return p;
+        };
+        const auto rdir = dir / "turns_cut";
+        SavedConversation a = cut_of(conv_stage_of(1000, 1));
+        const std::vector<int32_t> pin_ids(a.live.ids.begin(), a.live.ids.begin() + 400);
+        const size_t a_chain = a.checkpoints.size();
+        SavedConversation b = cut_of(conv_stage_grow(a, 48, 2));
+        {
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.put(pin_image(pin_ids), 1, id, {}, true), "61: the pinned root lands");
+            check(store.put_async(SavedConversation(a), 2000, id), "61: the cut backup queues");
+            store.flush_pending();
+            check(fs::exists(rdir / "conv-2000.bin") && fs::exists(rdir / "conv-2000.stage0.bin"),
+                  "61: it lands as conv-2000.bin + conv-2000.stage0.bin");
+            auto pins = store.prefix_pin_lengths();
+            check(pins.size() == 1 && pins[0] == 400, "61: the cut backup is not taken for a pinned root");
+            const auto m = store.best(prompt_after(a, 4242), a.live.imgs, false);
+            check(m.serial == 2000 && m.tokens == 1000, "61: best() resumes at the cut (the live state)");
+            auto back = store.take(m, id);
+            check(back.has_value() && back->stage_images.size() == 1, "61: the take restores the stage image");
+            check(back->live.ids == a.live.ids && back->live.gdn == a.live.gdn &&
+                      back->checkpoints.size() == a_chain - 1 &&
+                      back->stage_images[0].checkpoints.size() == a_chain - 1 &&
+                      back->stage_images[0].live.ids == a.live.ids,
+                  "61: the cut's state is kept once, as the live, in the main and the stage");
+            // the next turn, cut again: one journal record onto conv-2000, no .bin, no stage file
+            const auto before = store.bytes_written();
+            check(store.put_async(SavedConversation(b), 2001, id), "61: the next cut backup queues");
+            store.flush_pending();
+            const auto after = store.bytes_written();
+            check(fs::exists(rdir / "conv-2000.dlt") && !fs::exists(rdir / "conv-2001.bin"),
+                  "61: the next turn appends a journal record to the cut backup");
+            check(after.bin == before.bin && after.stage == before.stage && after.dlt > before.dlt,
+                  "61: ...writing only the journal (no .bin, no stage file)");
+            // the sync put() keeps the same rule (another conversation, no layer split)
+            std::vector<int32_t> other_ids;
+            for (int32_t i = 0; i < 600; ++i) other_ids.push_back(70000 + i);
+            check(store.put(cut_of(ids_conv_image(other_ids, 5)), 2100, id), "61: a sync cut backup lands");
+            pins = store.prefix_pin_lengths();
+            check(pins.size() == 1 && pins[0] == 400, "61: the sync cut backup is not a pinned root either");
+        }
+        {
+            // a restart: the reload finds the same three entries, and the newest turn restores through
+            // the journal with its stage image
+            ConversationDiskStore store(rdir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 3, "61: reload loads the pin and both conversations");
+            const auto pins = store.prefix_pin_lengths();
+            check(pins.size() == 1 && pins[0] == 400, "61: after the restart only the pin is a pinned root");
+            const auto m = store.best(prompt_after(b, 4243), b.live.imgs, false);
+            check(m.serial == 2000 && m.tokens == (int64_t) b.live.ids.size(),
+                  "61: after the restart best() resumes at the newest cut");
+            auto back = store.take(m, id);
+            check(back.has_value() && back->stage_images.size() == 1 && back->live.ids == b.live.ids &&
+                      back->live.gdn == b.live.gdn && back->stage_images[0].live.ids == b.live.ids,
+                  "61: after the restart the newest cut restores with its stage image");
+        }
+        {
+            // a cut file written the old way: main + stage with the duplicate checkpoint (the prefix
+            // shape) under the conv- name, as the build before this fix left them on disk
+            const auto odir = dir / "turns_cut_old";
+            fs::create_directories(odir);
+            SessionWriteOptions opts;
+            size_t written = 0;
+            std::string error;
+            SessionStatus status;
+            check(session_file_write((odir / "conv-3000.stage0.bin").string(), a.stage_images[0], id, written, error,
+                                     opts, &status) &&
+                      session_file_write((odir / "conv-3000.bin").string(), a, id, written, error, opts, &status),
+                  "61: an old cut file is on disk");
+            ConversationDiskStore store(odir.string(), 1ull << 30, &id);
+            check(store.reload_from_disk(id) == 1, "61: the old cut file reloads");
+            const auto m = store.best(prompt_after(a, 4244), a.live.imgs, false);
+            check(m.serial == 3000 && m.tokens == 1000, "61: best() finds the old cut file");
+            auto back = store.take(m, id);
+            check(back.has_value() && back->stage_images.size() == 1 && back->live.ids == a.live.ids,
+                  "61: the old cut file restores its conv- stage file (not looked up as pfx-)");
+        }
+        junsetenv("STRATA_SPILL_JOURNAL");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_disk_store_test: %d checks passed\n", checks);
     return 0;
