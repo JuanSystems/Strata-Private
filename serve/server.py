@@ -65,6 +65,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthro
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
+from serve import prompt_diff  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from strata_control import engine_component  # noqa: E402
 from strata_control import tls  # noqa: E402
@@ -4958,6 +4959,9 @@ class Service:
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
         # encode in full.
         self.prompts = None
+        # opt-in diagnostic (serve/prompt_diff.py): where a prompt rewrites a recent one, with the text; None when
+        # STRATA_PROMPT_DIFF is unset
+        self.prompt_diff = prompt_diff.from_env()
         if hasattr(tokenizer, "encode_marked") and hasattr(tokenizer, "max_special_len"):
             from strata_tokenizer import PromptEncoder
             # one kept prompt per conversation the engine's cache can hold (--conversation-cache-slots); the
@@ -5936,9 +5940,13 @@ class Service:
         if changed:
             prompt, plain = unmark_think_literals(prompt, self.literals)
         if self.prompts is not None:            # #567: only what follows the last special shared with a recent prompt
-            return self.prompts.encode(prompt, plain, store)
-        return self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
-            self.tok.encode(prompt, parse_special=True)
+            ids = self.prompts.encode(prompt, plain, store)
+        else:
+            ids = self.tok.encode(prompt, parse_special=True, plain=plain) if plain else \
+                self.tok.encode(prompt, parse_special=True)
+        if store and self.prompt_diff is not None:      # opt-in (STRATA_PROMPT_DIFF): a rewrite of earlier text
+            self.prompt_diff.check(prompt, len(ids))
+        return ids
 
     @contextlib.contextmanager
     def _turn(self, cancel=None):
@@ -10392,6 +10400,11 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    if svc.prompt_diff is None:                         # STRATA_PROMPT_DIFF in the config's "env" (which the engine gets)
+        svc.prompt_diff = prompt_diff.from_env(cfg.get("env"))
+    if svc.prompt_diff is not None:
+        where = "the server's output" if svc.prompt_diff.target == "1" else svc.prompt_diff.target
+        print(f"[strata] {prompt_diff.ENV}: a prompt that rewrites a recent one is shown in {where}", flush=True)
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
         # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
         # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.
