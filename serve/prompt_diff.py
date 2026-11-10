@@ -9,12 +9,14 @@ answer turn, prints the position and the text on both sides.
 A new turn is not reported: the previous prompt's answer turn (``<|im_start|>assistant``, and with
 "effort_position": "end" the short system turn in front of it) is where every next request is expected to differ.
 
-STRATA_PROMPT_DIFF=1 prints to the server's output; any other value is a file the lines are appended to.
-Off (unset): nothing is kept and nothing changes.
+STRATA_PROMPT_DIFF=1 prints to the server's output; any other value is a file the lines are appended to. With a
+file, the kept prompts are also saved next to it (<file>.prompts.json), so the first request after a server restart
+is compared with the prompts from before it.  Off (unset): nothing is kept and nothing changes.
 """
 from __future__ import annotations
 
 import collections
+import json
 import os
 import sys
 import threading
@@ -82,6 +84,14 @@ class PromptDiff:
         self.context = context
         self.recent: collections.deque[str] = collections.deque(maxlen=keep)
         self.lock = threading.Lock()
+        self.saved = None if target == "1" else target + ".prompts.json"
+        if self.saved:
+            try:
+                with open(self.saved, encoding="utf-8") as f:
+                    kept = json.load(f)
+                self.recent.extend(p for p in kept if isinstance(p, str))
+            except (OSError, ValueError):
+                pass                                  # none yet, or unreadable: start empty
 
     def check(self, prompt: str, tokens: int | None = None) -> list[str] | None:
         """Compare `prompt` with the most similar recent prompt; report and return the lines when it rewrites text
@@ -95,11 +105,24 @@ class PromptDiff:
             if best is not None and best == prompt:
                 return None                       # the same prompt again (a retry): nothing new to keep
             self.recent.append(prompt)
+            self.save()
         if best is None or at >= answer_start(best):
             return None
         lines = describe(best, prompt, at, tokens, self.context)
         self.write(lines)
         return lines
+
+    def save(self) -> None:
+        """The kept prompts to <file>.prompts.json (written aside, then renamed), for a restart."""
+        if not self.saved:
+            return
+        tmp = self.saved + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(list(self.recent), f, ensure_ascii=False)
+            os.replace(tmp, self.saved)
+        except OSError as e:
+            print(f"[strata] {ENV}: cannot write {self.saved}: {e}", flush=True)
 
     def write(self, lines: list[str]) -> None:
         text = "\n".join(lines) + "\n"

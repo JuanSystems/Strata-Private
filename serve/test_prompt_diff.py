@@ -101,6 +101,30 @@ class Check(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), "\n".join(lines) + "\n")
 
+    def test_a_restart_compares_with_the_prompts_from_before_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "diff.log")
+            before = pd.PromptDiff(path)
+            before.check(SYSTEM + user("a") + ANSWER)
+            self.assertTrue(os.path.exists(path + ".prompts.json"))
+            after = pd.PromptDiff(path)                          # a new server process
+            self.assertEqual(list(after.recent), list(before.recent))
+            lines = after.check(SYSTEM + user("b") + ANSWER)
+            self.assertIsNotNone(lines)
+            self.assertIn("was: a\\n<environment_details>", lines[2])
+            with open(path + ".prompts.json", "w", encoding="utf-8") as f:
+                f.write("{broken")
+            self.assertEqual(len(pd.PromptDiff(path).recent), 0, "an unreadable file starts empty")
+            self.assertFalse(os.path.exists(os.path.join(d, "1.prompts.json")))
+        with tempfile.TemporaryDirectory() as d, contextlib.redirect_stdout(io.StringIO()):
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                pd.PromptDiff("1").check(SYSTEM + ANSWER)
+                self.assertEqual(os.listdir(d), [], "printing to the output saves nothing")
+            finally:
+                os.chdir(cwd)
+
     def test_off_by_default(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(pd.from_env())
